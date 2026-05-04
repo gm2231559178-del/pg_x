@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::collections::HashMap;
@@ -8,8 +8,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
 
-/// Wait for SIGINT (Ctrl-C) or SIGTERM (kill / container stop).
-/// Returns when either signal is received.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -39,6 +37,20 @@ pub struct ListenArgs {
     /// NOTIFY channel(s) to subscribe to (repeatable: -C orders -C inventory)
     #[arg(short = 'C', long = "channel", required = true)]
     pub channels: Vec<String>,
+
+    /// Maximum consecutive reconnect attempts before giving up (0 = infinite).
+    /// In containerized environments, set to a small number (e.g. 5) and rely
+    /// on your restart policy, OR set to 0 to retry forever inside the process.
+    #[arg(long, env = "PGX_MAX_RECONNECT_ATTEMPTS", default_value_t = 0)]
+    pub max_reconnect_attempts: u32,
+
+    /// Base reconnect delay in milliseconds (doubles each attempt).
+    #[arg(long, env = "PGX_RECONNECT_BASE_MS", default_value_t = 1_000)]
+    pub reconnect_base_ms: u64,
+
+    /// Maximum reconnect delay cap in milliseconds.
+    #[arg(long, env = "PGX_RECONNECT_MAX_MS", default_value_t = 60_000)]
+    pub reconnect_max_ms: u64,
 
     #[command(subcommand)]
     pub downstream: DownstreamCommand,
@@ -103,8 +115,6 @@ pub struct WebhookArgs {
 
 #[derive(Args)]
 pub struct ShellArgs {
-    /// Command executed via `sh -c`. Env vars: PGX_CHANNEL, PGX_PID,
-    /// PGX_PAYLOAD (+ PGX_EVENT_TYPE, PGX_SCHEMA_VERSION in contract mode)
     #[arg(long)]
     pub command: String,
     #[arg(long = "env", value_parser = parse_key_val)]
@@ -115,9 +125,7 @@ pub struct ShellArgs {
 
 #[derive(Clone, ValueEnum)]
 pub enum ForwardMode {
-    /// Pass the raw NOTIFY payload as the message body.
     Simple,
-    /// Parse the payload as a ContractMessage and use embedded routing hints.
     Contract,
 }
 
@@ -127,50 +135,65 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("Expected KEY=VALUE, got '{s}'"))
 }
 
+/// Exponential backoff with ±20% jitter. Shift is clamped to avoid u64 overflow.
+fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> std::time::Duration {
+    let shift = (attempt - 1).min(62);
+    let base = (base_ms.saturating_mul(1u64 << shift)).min(max_ms);
+    let jitter = base / 5;
+    let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));
+    std::time::Duration::from_millis(delay_ms)
+}
+
 pub async fn run(url: String, args: ListenArgs) -> Result<()> {
     let sink: Arc<dyn Downstream> = build_downstream(&args.downstream).await?;
 
-    // Backoff parameters for reconnection.
-    const BASE_DELAY_MS: u64 = 1_000;
-    const MAX_DELAY_MS: u64 = 60_000;
-    const MAX_ATTEMPTS: u32 = 10;
-
-    // Pin the shutdown future outside the retry loop so a signal cancels
-    // both the event loop and any in-progress backoff sleep.
     tokio::pin!(let shutdown = shutdown_signal(););
 
-    let mut attempt: u32 = 0;
+    // Counts *consecutive* failures only — resets to 0 after each successful
+    // session so a brief drop after hours of healthy operation doesn't exhaust
+    // a stale retry budget.
+    let mut consecutive_failures: u32 = 0;
 
     loop {
-        // ── Backoff sleep (skipped on first attempt) ──────────────────────────
-        if attempt > 0 {
-            // Exponential backoff: 1s, 2s, 4s, … capped at 60s, ±20% jitter.
-            let base = (BASE_DELAY_MS * (1u64 << (attempt - 1).min(6))).min(MAX_DELAY_MS);
-            let jitter = base / 5;
-            let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));
-            let delay = std::time::Duration::from_millis(delay_ms);
+        // ── Backoff (skipped on first attempt) ────────────────────────────────
+        if consecutive_failures > 0 {
+            let infinite = args.max_reconnect_attempts == 0;
+
+            if !infinite && consecutive_failures >= args.max_reconnect_attempts {
+                error!(
+                    consecutive_failures,
+                    max = args.max_reconnect_attempts,
+                    "Max reconnect attempts reached — exiting with code 1 \
+                     so the container restart policy can take over."
+                );
+                std::process::exit(1);
+            }
+
+            let delay = backoff_delay(
+                consecutive_failures,
+                args.reconnect_base_ms,
+                args.reconnect_max_ms,
+            );
 
             warn!(
-                attempt,
-                max_attempts = MAX_ATTEMPTS,
+                consecutive_failures,
                 delay_secs = delay.as_secs_f32(),
+                max_attempts = if infinite {
+                    "∞".to_string()
+                } else {
+                    args.max_reconnect_attempts.to_string()
+                },
                 "Connection lost, reconnecting…"
             );
 
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
-                    info!("Signal received, shutting down");
+                    info!("Signal received during backoff, shutting down cleanly");
                     return Ok(());
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
-        }
-
-        if attempt >= MAX_ATTEMPTS {
-            return Err(anyhow::anyhow!(
-                "Giving up after {MAX_ATTEMPTS} consecutive connection failures"
-            ));
         }
 
         // ── Connect ───────────────────────────────────────────────────────────
@@ -180,63 +203,68 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
             Ok(pair) => pair,
             Err(e) => {
                 error!(error = %e, "Connection failed");
-                attempt += 1;
+                consecutive_failures += 1;
                 continue;
             }
         };
 
-        // ── Spawn Drainer task ────────────────────────────────────────────────
-        // The Drainer bridges the tokio-postgres connection future into an mpsc
-        // channel we can select! on. A fresh channel is created each reconnect
-        // so there is no risk of stale notifications from a previous session.
+        // ── Drainer task ──────────────────────────────────────────────────────
+        // THE BUG FIX: do NOT clone tx before spawning. Move the only sender
+        // into the Drainer. When the Drainer exits (connection dies), the sole
+        // tx is dropped, rx.recv() returns None, and the event loop breaks.
+        //
+        // The original code did `let tx = tx.clone()` inside spawn while keeping
+        // the original tx alive in this scope. That left a live sender dangling
+        // so rx.recv() would hang forever after the Drainer exited.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio_postgres::Notification>();
 
-        tokio::spawn({
-            let tx = tx.clone();
-            async move {
-                use std::future::Future;
-                use std::pin::Pin;
-                use std::task::{Context as Cx, Poll};
+        tokio::spawn(async move {
+            use std::future::Future;
+            use std::pin::Pin;
+            use std::task::{Context as Cx, Poll};
 
-                struct Drainer {
-                    conn: tokio_postgres::Connection<
-                        tokio_postgres::Socket,
-                        tokio_postgres::tls::NoTlsStream,
-                    >,
-                    tx: tokio::sync::mpsc::UnboundedSender<tokio_postgres::Notification>,
-                }
+            struct Drainer {
+                conn: tokio_postgres::Connection<
+                    tokio_postgres::Socket,
+                    tokio_postgres::tls::NoTlsStream,
+                >,
+                // Sole owner of tx — when Drainer is dropped, tx is dropped,
+                // closing the channel and unblocking rx.recv() with None.
+                tx: tokio::sync::mpsc::UnboundedSender<tokio_postgres::Notification>,
+            }
 
-                impl Future for Drainer {
-                    type Output = ();
-                    fn poll(mut self: Pin<&mut Self>, cx: &mut Cx<'_>) -> Poll<()> {
-                        loop {
-                            match self.conn.poll_message(cx) {
-                                Poll::Pending => return Poll::Pending,
-                                Poll::Ready(None) => return Poll::Ready(()),
-                                Poll::Ready(Some(Ok(
-                                    tokio_postgres::AsyncMessage::Notification(n),
-                                ))) => {
-                                    let _ = self.tx.send(n);
-                                }
-                                Poll::Ready(Some(Ok(_))) => {}
-                                Poll::Ready(Some(Err(e))) => {
-                                    error!(error = %e, "PostgreSQL connection error");
-                                    return Poll::Ready(());
-                                }
+            impl Future for Drainer {
+                type Output = ();
+                fn poll(mut self: Pin<&mut Self>, cx: &mut Cx<'_>) -> Poll<()> {
+                    loop {
+                        match self.conn.poll_message(cx) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(None) => return Poll::Ready(()),
+                            Poll::Ready(Some(Ok(tokio_postgres::AsyncMessage::Notification(
+                                n,
+                            )))) => {
+                                let _ = self.tx.send(n);
+                            }
+                            Poll::Ready(Some(Ok(_))) => {}
+                            Poll::Ready(Some(Err(e))) => {
+                                error!(error = %e, "PostgreSQL connection error");
+                                return Poll::Ready(());
+                                // Drainer drops here -> tx dropped -> rx.recv() = None
                             }
                         }
                     }
                 }
-
-                Drainer {
-                    conn: connection,
-                    tx,
-                }
-                .await;
             }
-        });
 
-        // ── LISTEN on each channel ────────────────────────────────────────────
+            Drainer {
+                conn: connection,
+                tx,
+            }
+            .await
+        });
+        // tx is fully moved into spawn — no copy remains in this scope.
+
+        // ── LISTEN ────────────────────────────────────────────────────────────
         let mut listen_ok = true;
         for ch in &args.channels {
             match client.execute(&format!("LISTEN \"{ch}\""), &[]).await {
@@ -249,63 +277,64 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
             }
         }
         if !listen_ok {
-            attempt += 1;
+            consecutive_failures += 1;
             continue;
         }
 
-        info!(sink = sink.name(), "Forwarding events — Ctrl-C to stop");
+        // ── Successful session — reset failure counter ────────────────────────
+        consecutive_failures = 0;
+        info!(
+            sink = sink.name(),
+            "Forwarding events — Ctrl-C / SIGTERM to stop"
+        );
 
-        // ── Event loop for this connection ────────────────────────────────────
-        // Returns true if the disconnect was unplanned (should reconnect).
-        let disconnected = loop {
+        // ── Event loop ────────────────────────────────────────────────────────
+        let session_dropped = loop {
             tokio::select! {
                 biased;
 
                 _ = &mut shutdown => {
-                    info!("Signal received, shutting down");
+                    info!("Signal received, shutting down cleanly");
                     return Ok(());
                 }
 
                 maybe_n = rx.recv() => {
-                    let Some(n) = maybe_n else {
-                        // Drainer exited — connection dropped.
-                        break true;
-                    };
+                    match maybe_n {
+                        None => {
+                            // tx was dropped (Drainer exited) — connection is dead.
+                            warn!("Drainer channel closed — connection lost");
+                            break true;
+                        }
+                        Some(n) => {
+                            let event = NotifyEvent {
+                                channel: n.channel().to_string(),
+                                payload: n.payload().to_string(),
+                                pid: n.process_id() as i32,
+                            };
 
-                    let event = NotifyEvent {
-                        channel: n.channel().to_string(),
-                        payload: n.payload().to_string(),
-                        pid: n.process_id() as i32,
-                    };
+                            debug!(
+                                channel = %event.channel,
+                                pid = event.pid,
+                                payload = %event.payload,
+                                "NOTIFY received"
+                            );
 
-                    // Per-event record at debug level.
-                    // - Text mode (default): set RUST_LOG=debug to see it.
-                    // - JSON mode (--log-json): becomes a structured record
-                    //   parseable by log aggregators.
-                    debug!(
-                        channel = %event.channel,
-                        pid = event.pid,
-                        payload = %event.payload,
-                        "NOTIFY received"
-                    );
-
-                    if let Err(e) = sink.send(&event).await {
-                        error!(sink = sink.name(), error = %e, "Downstream send failed");
+                            if let Err(e) = sink.send(&event).await {
+                                error!(sink = sink.name(), error = %e, "Downstream send failed");
+                                // Downstream errors don't trigger PG reconnect by default.
+                                // To also exit on sink failure, uncomment:
+                                // std::process::exit(1);
+                            }
+                        }
                     }
                 }
             }
         };
 
-        if disconnected {
-            warn!("Connection dropped unexpectedly");
-            attempt += 1;
-        } else {
-            break;
+        if session_dropped {
+            consecutive_failures += 1;
         }
     }
-
-    info!("Stopped");
-    Ok(())
 }
 
 async fn build_downstream(cmd: &DownstreamCommand) -> Result<Arc<dyn Downstream>> {

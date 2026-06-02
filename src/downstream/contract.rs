@@ -17,6 +17,7 @@ pub struct NotifyEvent {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Used when the downstream just wants the raw payload forwarded verbatim.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimpleMessage {
     pub channel: String,

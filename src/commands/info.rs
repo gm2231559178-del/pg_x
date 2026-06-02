@@ -30,6 +30,10 @@ pub struct InfoArgs {
     /// Show publications and their tables
     #[arg(long)]
     pub publications: bool,
+
+    /// Show installed extensions
+    #[arg(long)]
+    pub extensions: bool,
 }
 
 pub async fn run(url: String, args: InfoArgs, use_tls: bool) -> Result<()> {
@@ -158,6 +162,33 @@ pub async fn run(url: String, args: InfoArgs, use_tls: bool) -> Result<()> {
                     "(no tables)".dimmed().to_string()
                 };
                 println!("  {:<30}  {}", name.yellow(), info);
+            }
+        }
+    }
+
+    if args.extensions {
+        println!("\n{}", "── Extensions ──".cyan().bold());
+        let rows = client
+            .query(
+                "SELECT extname, extversion, n.nspname \
+                 FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace \
+                 ORDER BY extname",
+                &[],
+            )
+            .await?;
+        if rows.is_empty() {
+            println!("  {}", "(no extensions)".dimmed());
+        } else {
+            for r in &rows {
+                let name: String = r.get(0);
+                let version: String = r.get(1);
+                let schema: String = r.get(2);
+                println!(
+                    "  {:<30}  v{:<12}  schema: {}",
+                    name.yellow(),
+                    version,
+                    schema.dimmed(),
+                );
             }
         }
     }

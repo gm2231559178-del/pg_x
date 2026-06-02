@@ -5,7 +5,7 @@ mod utils;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use commands::{export, info, listen, query, replicate};
+use commands::{export, info, listen, psql, query, replicate};
 use utils::config::Config;
 
 /// pgx — PostgreSQL power CLI (beyond psql & pg_*)
@@ -62,6 +62,9 @@ enum Commands {
 
     /// Stream WAL changes via PostgreSQL logical replication (INSERT/UPDATE/DELETE)
     Replicate(replicate::ReplicateArgs),
+
+    /// Open an interactive psql session (or run a command via psql)
+    Psql(psql::PsqlArgs),
 }
 
 #[tokio::main]
@@ -100,5 +103,6 @@ async fn main() -> Result<()> {
         Commands::Info(args) => info::run(url, args, cli.tls).await,
         Commands::Listen(args) => listen::run(url, args, conn, cli.tls).await,
         Commands::Replicate(args) => replicate::run(url, args, conn, cli.tls).await,
+        Commands::Psql(args) => psql::run(url, args),
     }
 }

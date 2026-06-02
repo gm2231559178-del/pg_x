@@ -51,7 +51,7 @@ pub fn write_excel(
     let base_sheet_name = sanitize_sheet_name(sheet_name);
 
     let total_rows = rowset.rows.len();
-    let sheet_count = (total_rows + DATA_ROWS_PER_SHEET - 1) / DATA_ROWS_PER_SHEET;
+    let sheet_count = total_rows.div_ceil(DATA_ROWS_PER_SHEET);
 
     // ─────────────────────────────────────────────────────────────────────────
     // Formats

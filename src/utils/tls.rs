@@ -44,5 +44,3 @@ pub fn build_tls(use_tls: bool) -> anyhow::Result<TlsConnector> {
         Ok(tokio_postgres::NoTls)
     }
 }
-
-

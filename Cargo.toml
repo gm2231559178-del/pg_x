@@ -21,8 +21,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-postgres-rustls = { version = "0.10", optional = true }
 rustls = { version = "0.21", optional = true }
 
-# Excel output
-rust_xlsxwriter = "0.64"
+# Excel output (optional, enabled by default)
+rust_xlsxwriter = { version = "0.64", optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -69,7 +69,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing = "0.1.44"
 
 [features]
-default = ["rabbitmq", "webhook"]
+default = ["rabbitmq", "webhook", "excel"]
+excel = ["rust_xlsxwriter"]
 tls = ["tokio-postgres-rustls", "rustls"]
 rabbitmq = ["lapin"]
 kafka = ["rdkafka"]

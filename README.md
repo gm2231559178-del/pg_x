@@ -17,14 +17,17 @@ A feature-rich PostgreSQL CLI tool — beyond psql.
 ## Installation
 
 ```bash
-# Default build (RabbitMQ + Webhook enabled)
+# Default build (Excel + RabbitMQ + Webhook enabled)
 cargo build --release
 
 # With Kafka support (requires librdkafka system library)
 cargo build --release --features kafka
 
-# Minimal build (shell downstream only)
+# Minimal build (shell downstream only, no Excel)
 cargo build --release --no-default-features
+
+# Without Excel export
+cargo build --release --no-default-features --features rabbitmq,webhook
 ```
 
 The binary is placed at `target/release/pgx`.
@@ -471,7 +474,8 @@ stdout / shell / webhook / rabbitmq / kafka
 ## Cargo features
 
 | Feature | Default | Enables |
-|---|---|---|
+|---|---|---|---|
+| `excel` | ✅ | Excel (.xlsx) export via `rust_xlsxwriter` |
 | `rabbitmq` | ✅ | RabbitMQ downstream via `lapin` |
 | `webhook` | ✅ | HTTP webhook downstream via `reqwest` |
 | `kafka` | ❌ | Kafka downstream via `rdkafka` (requires librdkafka) |

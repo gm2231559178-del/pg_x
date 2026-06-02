@@ -292,7 +292,7 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
                             let event = NotifyEvent {
                                 channel: n.channel().to_string(),
                                 payload: n.payload().to_string(),
-                                pid: n.process_id() as i32,
+                                pid: n.process_id(),
                             };
 
                             debug!(

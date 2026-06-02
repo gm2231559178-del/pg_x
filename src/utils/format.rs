@@ -50,7 +50,10 @@ impl RowSet {
                 col_is_numeric = (0..columns.len())
                     .map(|i| {
                         let ct = row.columns()[i].type_().name();
-                        matches!(ct, "int2" | "int4" | "int8" | "oid" | "float4" | "float8" | "numeric")
+                        matches!(
+                            ct,
+                            "int2" | "int4" | "int8" | "oid" | "float4" | "float8" | "numeric"
+                        )
                     })
                     .collect();
             }
@@ -136,13 +139,11 @@ fn pg_cell_to_string(row: &Row, idx: usize) -> String {
         "text" | "varchar" | "char" | "bpchar" | "name" | "citext" => {
             try_get!(String);
         }
-        "json" | "jsonb" => {
-            match row.try_get::<_, Option<serde_json::Value>>(idx) {
-                Ok(Some(v)) => return v.to_string(),
-                Ok(None) => return "null".to_owned(),
-                Err(e) => tracing::debug!(error = %e, col_type, "try_get failed"),
-            }
-        }
+        "json" | "jsonb" => match row.try_get::<_, Option<serde_json::Value>>(idx) {
+            Ok(Some(v)) => return v.to_string(),
+            Ok(None) => return "null".to_owned(),
+            Err(e) => tracing::debug!(error = %e, col_type, "try_get failed"),
+        },
         "uuid" => {
             try_get!(uuid::Uuid);
         }
@@ -158,13 +159,11 @@ fn pg_cell_to_string(row: &Row, idx: usize) -> String {
                 Err(e) => tracing::debug!(error = %e, col_type, "try_get failed for timestamp"),
             }
         }
-        "date" => {
-            match row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
-                Ok(Some(v)) => return v.to_string(),
-                Ok(None) => return NULL_SENTINEL.to_owned(),
-                Err(e) => tracing::debug!(error = %e, col_type, "try_get failed"),
-            }
-        }
+        "date" => match row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
+            Ok(Some(v)) => return v.to_string(),
+            Ok(None) => return NULL_SENTINEL.to_owned(),
+            Err(e) => tracing::debug!(error = %e, col_type, "try_get failed"),
+        },
         _ => {}
     }
 

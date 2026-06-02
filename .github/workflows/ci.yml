@@ -48,3 +48,71 @@ jobs:
 
       - name: Check (no release)
         run: cargo check ${{ matrix.features }}
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Configure PostgreSQL for replication
+        run: |
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -d postgres \
+            -c "ALTER SYSTEM SET wal_level = logical;"
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -d postgres \
+            -c "ALTER USER postgres REPLICATION;"
+          docker restart ${{ job.services.postgres.id }}
+          for i in $(seq 1 15); do
+            docker exec ${{ job.services.postgres.id }} pg_isready -U postgres -d postgres 2>/dev/null && break
+            sleep 2
+          done
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -d postgres \
+            -c "SHOW wal_level;" | grep logical
+
+      - name: Setup test schema
+        run: |
+          printf '%s\n' \
+            'CREATE TABLE IF NOT EXISTS users (' \
+            '  id SERIAL PRIMARY KEY,' \
+            '  username VARCHAR(50) NOT NULL,' \
+            '  email VARCHAR(100) NOT NULL' \
+            ');' \
+            'CREATE OR REPLACE FUNCTION notify_user_changes()' \
+            'RETURNS TRIGGER AS $$' \
+            'BEGIN' \
+            '  PERFORM pg_notify('"'"'user_updates'"'"',' \
+            '    json_build_object('"'"'action'"'"', TG_OP, '"'"'data'"'"', row_to_json(NEW))::text);' \
+            '  RETURN NEW;' \
+            'END;' \
+            '$$ LANGUAGE plpgsql;' \
+            'CREATE OR REPLACE TRIGGER trigger_user_changes' \
+            '  AFTER INSERT OR UPDATE ON users' \
+            '  FOR EACH ROW EXECUTE FUNCTION notify_user_changes();' \
+            'CREATE PUBLICATION pgx_pub FOR TABLE users;' \
+            | docker exec -i ${{ job.services.postgres.id }} psql -U postgres -d postgres
+
+      - name: Test listen command
+        run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_listen.sh
+
+      - name: Test replicate command
+        run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_replicate.sh

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod csv;
 pub mod db;
+#[cfg(feature = "excel")]
 pub mod excel;
 pub mod format;
 pub mod json;

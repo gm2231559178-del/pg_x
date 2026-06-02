@@ -5,15 +5,16 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::utils::{
-    csv::write_csv, db::connect, excel::write_excel, format::RowSet, json::write_json,
-};
+#[cfg(feature = "excel")]
+use crate::utils::excel::write_excel;
+use crate::utils::{csv::write_csv, db::connect, format::RowSet, json::write_json};
 
 /// Output format
 #[derive(Clone, ValueEnum, Debug, Default)]
 pub enum OutputFormat {
-    #[default]
+    #[cfg(feature = "excel")]
     Excel,
+    #[default]
     Csv,
     Json,
 }
@@ -120,6 +121,7 @@ pub async fn run(url: String, args: ExportArgs) -> Result<()> {
     let out_path = resolve_output_path(&args)?;
 
     match args.format {
+        #[cfg(feature = "excel")]
         OutputFormat::Excel => {
             write_excel(
                 &rowset,
@@ -167,6 +169,7 @@ fn resolve_output_path(args: &ExportArgs) -> Result<PathBuf> {
     }
 
     let ext = match args.format {
+        #[cfg(feature = "excel")]
         OutputFormat::Excel => "xlsx",
         OutputFormat::Csv => "csv",
         OutputFormat::Json => "json",

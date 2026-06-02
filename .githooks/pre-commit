@@ -3,6 +3,9 @@
 # Exit immediately if any command fails
 set -e
 
+export CARGO_TERM_COLOR=always
+export RUSTFLAGS="-D warnings"
+
 echo "🦀 Running Rust Quality Gate..."
 
 # 3. Clippy Lints

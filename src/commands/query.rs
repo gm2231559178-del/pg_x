@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use colored::Colorize;
 use comfy_table::{
     presets::UTF8_FULL_CONDENSED, Attribute, Cell, Color, ContentArrangement, Table,
 };
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::utils::{db::connect, format::RowSet};
@@ -12,8 +13,12 @@ use crate::utils::{db::connect, format::RowSet};
 #[derive(Args, Debug)]
 pub struct QueryArgs {
     /// SQL to execute
-    #[arg(short = 'q', long)]
-    pub query: String,
+    #[arg(short = 'q', long, required_unless_present = "file")]
+    pub query: Option<String>,
+
+    /// Read SQL from a file
+    #[arg(short = 'f', long, conflicts_with = "query")]
+    pub file: Option<PathBuf>,
 
     /// Max rows to display (0 = unlimited)
     #[arg(short = 'n', long, default_value_t = 500)]
@@ -23,17 +28,23 @@ pub struct QueryArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Output as CSV instead of table
+    #[arg(long)]
+    pub csv: bool,
+
     /// Watch mode: re-run the query every N seconds (like `watch -n N`)
     #[arg(short = 'w', long, default_value_t = 0)]
     pub watch: u64,
 }
 
 pub async fn run(url: String, args: QueryArgs, use_tls: bool) -> Result<()> {
+    let sql = resolve_sql(&args)?;
+
     loop {
         let client = connect(&url, use_tls).await?;
 
         let t0 = Instant::now();
-        let rows = client.query(args.query.as_str(), &[]).await?;
+        let rows = client.query(sql.as_str(), &[]).await?;
         let elapsed = t0.elapsed();
 
         if args.watch > 0 {
@@ -42,7 +53,7 @@ pub async fn run(url: String, args: QueryArgs, use_tls: bool) -> Result<()> {
             println!(
                 "{} {}  (every {}s)  {}",
                 "⟳".cyan().bold(),
-                args.query.dimmed(),
+                sql.dimmed(),
                 args.watch,
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
             );
@@ -54,7 +65,15 @@ pub async fn run(url: String, args: QueryArgs, use_tls: bool) -> Result<()> {
         } else {
             let rowset = RowSet::from_pg_rows(&rows, args.limit)?;
 
-            if args.json {
+            if args.csv {
+                let mut wtr = csv::Writer::from_writer(std::io::stdout());
+                wtr.write_record(&rowset.columns)
+                    .context("Write CSV header")?;
+                for row in &rowset.rows {
+                    wtr.write_record(row).context("Write CSV row")?;
+                }
+                wtr.flush().context("Flush CSV")?;
+            } else if args.json {
                 let out = serde_json::to_string_pretty(&rowset.to_json_value())?;
                 println!("{out}");
             } else {
@@ -62,12 +81,18 @@ pub async fn run(url: String, args: QueryArgs, use_tls: bool) -> Result<()> {
             }
 
             if args.watch == 0 {
-                println!(
-                    "\n{} {} row(s) in {:.3}s",
+                let summary = format!(
+                    "\n{} {} {} in {:.3}s",
                     "✔".green().bold(),
                     rows.len().to_string().yellow(),
+                    "rows",
                     elapsed.as_secs_f64(),
                 );
+                if args.csv {
+                    eprintln!("{summary}");
+                } else {
+                    println!("{summary}");
+                }
             }
         }
 
@@ -77,6 +102,17 @@ pub async fn run(url: String, args: QueryArgs, use_tls: bool) -> Result<()> {
 
         tokio::time::sleep(Duration::from_secs(args.watch)).await;
     }
+}
+
+fn resolve_sql(args: &QueryArgs) -> Result<String> {
+    if let Some(ref q) = args.query {
+        return Ok(q.clone());
+    }
+    if let Some(ref path) = args.file {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("Cannot read SQL file: {}", path.display()));
+    }
+    anyhow::bail!("Provide --query or --file");
 }
 
 fn print_table(rowset: &RowSet) {

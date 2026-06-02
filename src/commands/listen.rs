@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
-use crate::utils::config::Connection;
+use crate::utils::config::{Connection, DownstreamSinkKind};
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 use crate::utils::tls;
 
@@ -83,8 +83,9 @@ pub struct KafkaArgs {
 #[cfg(feature = "webhook")]
 #[derive(Args)]
 pub struct WebhookArgs {
+    /// Webhook URL. Required unless provided via config or WEBHOOK_URL env.
     #[arg(long, env = "WEBHOOK_URL")]
-    pub url: String,
+    pub url: Option<String>,
     #[arg(long = "header", value_parser = parse_key_val)]
     pub headers: Vec<(String, String)>,
     #[arg(long, value_enum, default_value_t = ForwardMode::Simple)]
@@ -93,8 +94,9 @@ pub struct WebhookArgs {
 
 #[derive(Args)]
 pub struct ShellArgs {
+    /// Shell command to execute. Required unless provided via config.
     #[arg(long)]
-    pub command: String,
+    pub command: Option<String>,
     #[arg(long = "env", value_parser = parse_key_val)]
     pub envs: Vec<(String, String)>,
     #[arg(long, value_enum, default_value_t = ForwardMode::Simple)]
@@ -105,6 +107,17 @@ pub struct ShellArgs {
 pub enum ForwardMode {
     Simple,
     Contract,
+}
+
+impl std::str::FromStr for ForwardMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "simple" => Ok(Self::Simple),
+            "contract" => Ok(Self::Contract),
+            other => Err(format!("unknown forward mode '{other}'; expected simple|contract")),
+        }
+    }
 }
 
 /// Exponential backoff with ±20% jitter. Shift is clamped to avoid u64 overflow.
@@ -140,6 +153,66 @@ pub async fn run(
         }
         if args.reconnect_max_ms == 60000 && cfg.reconnect_max_ms.unwrap_or(0) > 0 {
             args.reconnect_max_ms = cfg.reconnect_max_ms.unwrap();
+        }
+
+        // Merge downstream sink defaults from config into CLI subcommand args.
+        if let Some(sink_cfg) = &cfg.sink {
+            match (&mut args.downstream, sink_cfg) {
+                (DownstreamCommand::Shell(a), DownstreamSinkKind::Shell { command, mode, .. }) => {
+                    if a.command.is_none() {
+                        a.command = Some(command.clone());
+                    }
+                    if let Some(m) = mode {
+                        if let Ok(fm) = m.parse::<ForwardMode>() {
+                            a.mode = fm;
+                        }
+                    }
+                }
+                #[cfg(feature = "webhook")]
+                (DownstreamCommand::Webhook(a), DownstreamSinkKind::Webhook { url, mode, .. }) => {
+                    if a.url.is_none() {
+                        a.url = Some(url.clone());
+                    }
+                    if let Some(m) = mode {
+                        if let Ok(fm) = m.parse::<ForwardMode>() {
+                            a.mode = fm;
+                        }
+                    }
+                }
+                #[cfg(feature = "rabbitmq")]
+                (DownstreamCommand::Rabbitmq(a), DownstreamSinkKind::Rabbitmq { amqp_url, exchange, routing_key, mode }) => {
+                    if let Some(u) = amqp_url {
+                        a.amqp_url = u.clone();
+                    }
+                    if let Some(e) = exchange {
+                        a.exchange = e.clone();
+                    }
+                    if let Some(r) = routing_key {
+                        a.routing_key = r.clone();
+                    }
+                    if let Some(m) = mode {
+                        if let Ok(fm) = m.parse::<ForwardMode>() {
+                            a.mode = fm;
+                        }
+                    }
+                }
+                #[cfg(feature = "kafka")]
+                (DownstreamCommand::Kafka(a), DownstreamSinkKind::Kafka { brokers, topic, mode }) => {
+                    if let Some(b) = brokers {
+                        a.brokers = b.clone();
+                    }
+                    if let Some(t) = topic {
+                        a.topic = t.clone();
+                    }
+                    if let Some(m) = mode {
+                        if let Ok(fm) = m.parse::<ForwardMode>() {
+                            a.mode = fm;
+                        }
+                    }
+                }
+                // Mismatch — CLI subcommand doesn't match config sink type; CLI wins.
+                _ => {}
+            }
         }
     }
 
@@ -379,21 +452,29 @@ async fn build_downstream(cmd: &DownstreamCommand) -> Result<Arc<dyn Downstream>
             use crate::downstream::webhook::webhook::{
                 ContractWebhookDownstream, SimpleWebhookDownstream,
             };
+            let url = a.url.as_deref().unwrap_or_default();
+            if url.is_empty() {
+                anyhow::bail!("Webhook URL is required — provide --url, set WEBHOOK_URL env, or add sink.url in config");
+            }
             let headers: HashMap<String, String> = a.headers.iter().cloned().collect();
             match a.mode {
-                ForwardMode::Simple => Ok(Arc::new(SimpleWebhookDownstream::new(&a.url))),
+                ForwardMode::Simple => Ok(Arc::new(SimpleWebhookDownstream::new(url))),
                 ForwardMode::Contract => {
-                    Ok(Arc::new(ContractWebhookDownstream::new(&a.url, headers)))
+                    Ok(Arc::new(ContractWebhookDownstream::new(url, headers)))
                 }
             }
         }
 
         DownstreamCommand::Shell(a) => {
             use crate::downstream::shell::shell::ShellDownstream;
+            let command = a.command.as_deref().unwrap_or_default();
+            if command.is_empty() {
+                anyhow::bail!("Shell command is required — provide --command or add sink.command in config");
+            }
             let base_env: HashMap<String, String> = a.envs.iter().cloned().collect();
             let contract_mode = matches!(a.mode, ForwardMode::Contract);
             Ok(Arc::new(ShellDownstream::new(
-                &a.command,
+                command,
                 base_env,
                 contract_mode,
             )))

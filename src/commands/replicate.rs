@@ -33,7 +33,7 @@ use crate::replication::{
     lsn::Lsn,
     slot,
 };
-use crate::utils::config::Connection;
+use crate::utils::config::{Connection, DownstreamSinkKind};
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 use crate::utils::tls;
 
@@ -155,8 +155,10 @@ pub struct ShellArgs {
     ///   PGX_NEW      — JSON of new row values (INSERT / UPDATE)
     ///   PGX_OLD      — JSON of old row values (UPDATE / DELETE)
     ///   PGX_PAYLOAD  — full event JSON
+    ///
+    /// Required unless provided via config.
     #[arg(long)]
-    pub command: String,
+    pub command: Option<String>,
 
     /// Extra environment variables to inject (KEY=VALUE, repeatable).
     #[arg(long = "env", value_parser = parse_key_val)]
@@ -166,8 +168,9 @@ pub struct ShellArgs {
 #[cfg(feature = "webhook")]
 #[derive(Args)]
 pub struct WebhookArgs {
+    /// Webhook URL. Required unless provided via config or WEBHOOK_URL env.
     #[arg(long, env = "WEBHOOK_URL")]
-    pub url: String,
+    pub url: Option<String>,
     #[arg(long = "header", value_parser = parse_key_val)]
     pub headers: Vec<(String, String)>,
 }
@@ -398,17 +401,29 @@ async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<Arc<dyn WalS
     match cmd {
         ReplicateDownstreamCommand::Stdout(a) => Ok(Arc::new(StdoutSink { pretty: a.pretty })),
 
-        ReplicateDownstreamCommand::Shell(a) => Ok(Arc::new(ShellWalSink {
-            command: a.command.clone(),
-            base_env: a.envs.iter().cloned().collect(),
-        })),
+        ReplicateDownstreamCommand::Shell(a) => {
+            let command = a.command.as_deref().unwrap_or_default();
+            if command.is_empty() {
+                anyhow::bail!("Shell command is required — provide --command or add sink.command in config");
+            }
+            Ok(Arc::new(ShellWalSink {
+                command: command.to_string(),
+                base_env: a.envs.iter().cloned().collect(),
+            }))
+        }
 
         #[cfg(feature = "webhook")]
-        ReplicateDownstreamCommand::Webhook(a) => Ok(Arc::new(WebhookWalSink {
-            client: reqwest::Client::new(),
-            url: a.url.clone(),
-            default_headers: a.headers.iter().cloned().collect(),
-        })),
+        ReplicateDownstreamCommand::Webhook(a) => {
+            let url = a.url.as_deref().unwrap_or_default();
+            if url.is_empty() {
+                anyhow::bail!("Webhook URL is required — provide --url, set WEBHOOK_URL env, or add sink.url in config");
+            }
+            Ok(Arc::new(WebhookWalSink {
+                client: reqwest::Client::new(),
+                url: url.to_string(),
+                default_headers: a.headers.iter().cloned().collect(),
+            }))
+        }
 
         #[cfg(feature = "rabbitmq")]
         ReplicateDownstreamCommand::Rabbitmq(a) => {
@@ -642,6 +657,49 @@ pub async fn run(
         }
         if !args.emit_schema && cfg.emit_schema.unwrap_or(false) {
             args.emit_schema = true;
+        }
+
+        // Merge downstream sink defaults from config into CLI subcommand args.
+        if let Some(sink_cfg) = &cfg.sink {
+            match (&mut args.downstream, sink_cfg) {
+                (ReplicateDownstreamCommand::Stdout(a), DownstreamSinkKind::Stdout { pretty: Some(p) }) => {
+                    a.pretty = *p;
+                }
+                (ReplicateDownstreamCommand::Stdout(_), DownstreamSinkKind::Stdout { pretty: None }) => {}
+                (ReplicateDownstreamCommand::Shell(a), DownstreamSinkKind::Shell { command, .. }) => {
+                    if a.command.is_none() {
+                        a.command = Some(command.clone());
+                    }
+                }
+                #[cfg(feature = "webhook")]
+                (ReplicateDownstreamCommand::Webhook(a), DownstreamSinkKind::Webhook { url, .. }) => {
+                    if a.url.is_none() {
+                        a.url = Some(url.clone());
+                    }
+                }
+                #[cfg(feature = "rabbitmq")]
+                (ReplicateDownstreamCommand::Rabbitmq(a), DownstreamSinkKind::Rabbitmq { amqp_url, exchange, routing_key, .. }) => {
+                    if let Some(u) = amqp_url {
+                        a.amqp_url = u.clone();
+                    }
+                    if let Some(e) = exchange {
+                        a.exchange = e.clone();
+                    }
+                    if let Some(r) = routing_key {
+                        a.routing_key = r.clone();
+                    }
+                }
+                #[cfg(feature = "kafka")]
+                (ReplicateDownstreamCommand::Kafka(a), DownstreamSinkKind::Kafka { brokers, topic, .. }) => {
+                    if let Some(b) = brokers {
+                        a.brokers = b.clone();
+                    }
+                    if let Some(t) = topic {
+                        a.topic = t.clone();
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

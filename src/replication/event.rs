@@ -190,3 +190,93 @@ impl WalEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ColVal ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn colval_is_unchanged() {
+        assert!(ColVal::Unchanged.is_unchanged());
+        assert!(!ColVal::Text("x".into()).is_unchanged());
+        assert!(!ColVal::Null.is_unchanged());
+    }
+
+    #[test]
+    fn colval_as_str() {
+        assert_eq!(ColVal::Text("hello".into()).as_str(), Some("hello"));
+        assert_eq!(ColVal::Null.as_str(), None);
+        assert_eq!(ColVal::Unchanged.as_str(), None);
+    }
+
+    #[test]
+    fn colval_serialize_text() {
+        let v = serde_json::to_value(&ColVal::Text("foo".into())).unwrap();
+        assert_eq!(v, serde_json::json!("foo"));
+    }
+
+    #[test]
+    fn colval_serialize_null() {
+        let v = serde_json::to_value(&ColVal::Null).unwrap();
+        assert_eq!(v, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn colval_serialize_unchanged() {
+        let v = serde_json::to_value(&ColVal::Unchanged).unwrap();
+        assert_eq!(v, serde_json::json!("__pgx_unchanged"));
+    }
+
+    // ── WalEvent ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn op_label_all_variants() {
+        assert_eq!(WalEvent::Begin { lsn: "0/0".into(), commit_time: 0, xid: 0 }.op_label(), "BEGIN");
+        assert_eq!(WalEvent::Commit { lsn: "0/0".into(), end_lsn: "0/0".into(), commit_time: 0 }.op_label(), "COMMIT");
+        assert_eq!(WalEvent::Relation { rel_id: 0, schema: "s".into(), table: "t".into(), columns: vec![] }.op_label(), "RELATION");
+        assert_eq!(WalEvent::Insert { rel_id: 0, schema: "s".into(), table: "t".into(), new: Row::new() }.op_label(), "INSERT");
+        assert_eq!(WalEvent::Update { rel_id: 0, schema: "s".into(), table: "t".into(), old: None, new: Row::new() }.op_label(), "UPDATE");
+        assert_eq!(WalEvent::Delete { rel_id: 0, schema: "s".into(), table: "t".into(), old: Row::new() }.op_label(), "DELETE");
+        assert_eq!(WalEvent::Truncate { rel_ids: vec![], tables: vec![], cascade: false, restart_seqs: false }.op_label(), "TRUNCATE");
+        assert_eq!(WalEvent::Keepalive { wal_end: "0/0".into(), reply_requested: false }.op_label(), "KEEPALIVE");
+    }
+
+    #[test]
+    fn table_name_insert_update_delete() {
+        let insert = WalEvent::Insert { rel_id: 1, schema: "public".into(), table: "users".into(), new: Row::new() };
+        assert_eq!(insert.table_name(), Some(("public", "users")));
+
+        let update = WalEvent::Update { rel_id: 1, schema: "public".into(), table: "users".into(), old: None, new: Row::new() };
+        assert_eq!(update.table_name(), Some(("public", "users")));
+
+        let delete = WalEvent::Delete { rel_id: 1, schema: "public".into(), table: "users".into(), old: Row::new() };
+        assert_eq!(delete.table_name(), Some(("public", "users")));
+    }
+
+    #[test]
+    fn table_name_other_variants() {
+        assert_eq!(WalEvent::Begin { lsn: "0/0".into(), commit_time: 0, xid: 0 }.table_name(), None);
+        assert_eq!(WalEvent::Commit { lsn: "0/0".into(), end_lsn: "0/0".into(), commit_time: 0 }.table_name(), None);
+    }
+
+    #[test]
+    fn to_json_insert() {
+        let event = WalEvent::Insert {
+            rel_id: 42,
+            schema: "public".into(),
+            table: "users".into(),
+            new: {
+                let mut r = Row::new();
+                r.insert("name".into(), ColVal::Text("Alice".into()));
+                r
+            },
+        };
+        let json = event.to_json();
+        assert!(json.contains("insert"), "JSON: {json}");
+        assert!(json.contains("Alice"), "JSON: {json}");
+        assert!(json.contains("public"), "JSON: {json}");
+        assert!(json.contains("users"), "JSON: {json}");
+    }
+}

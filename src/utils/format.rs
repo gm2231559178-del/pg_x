@@ -176,3 +176,57 @@ fn pg_cell_to_string(row: &Row, idx: usize) -> String {
 
     format!("<{col_type}>")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_json_value_empty() {
+        let rs = RowSet { columns: vec![], rows: vec![], col_is_numeric: vec![] };
+        assert_eq!(rs.to_json_value(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn to_json_value_string_columns() {
+        let rs = RowSet {
+            columns: vec!["name".into(), "email".into()],
+            rows: vec![
+                vec!["Alice".into(), "a@test.com".into()],
+                vec!["Bob".into(), "b@test.com".into()],
+            ],
+            col_is_numeric: vec![false, false],
+        };
+        let expected = serde_json::json!([
+            {"name": "Alice", "email": "a@test.com"},
+            {"name": "Bob", "email": "b@test.com"},
+        ]);
+        assert_eq!(rs.to_json_value(), expected);
+    }
+
+    #[test]
+    fn to_json_value_numeric_columns() {
+        let rs = RowSet {
+            columns: vec!["id".into(), "score".into()],
+            rows: vec![
+                vec!["1".into(), "95.5".into()],
+                vec!["2".into(), "87.0".into()],
+            ],
+            col_is_numeric: vec![true, true],
+        };
+        let v = rs.to_json_value();
+        assert_eq!(v[0]["id"], serde_json::json!(1.0));
+        assert_eq!(v[0]["score"], serde_json::json!(95.5));
+    }
+
+    #[test]
+    fn to_json_value_null_sentinel() {
+        let rs = RowSet {
+            columns: vec!["val".into()],
+            rows: vec![vec!["\0NULL".into()]],
+            col_is_numeric: vec![false],
+        };
+        let v = rs.to_json_value();
+        assert_eq!(v[0]["val"], serde_json::Value::Null);
+    }
+}

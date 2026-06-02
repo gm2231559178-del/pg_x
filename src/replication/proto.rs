@@ -154,7 +154,7 @@ pub fn parse_pgoutput_boundary(data: &Bytes) -> ReplResult<Option<PgOutputBounda
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PgOutputBoundary {
     Begin {
         final_lsn: Lsn,
@@ -166,4 +166,136 @@ pub enum PgOutputBoundary {
         end_lsn: Lsn,
         commit_time: i64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_copy_data ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_copy_data_empty() {
+        let err = parse_copy_data(Bytes::new()).unwrap_err();
+        assert!(matches!(err, ReplError::Protocol(_)));
+    }
+
+    #[test]
+    fn parse_xlog_data() {
+        // 'w' + wal_start(8) + wal_end(8) + server_time(8) + payload
+        let mut buf = Vec::with_capacity(25);
+        buf.push(b'w');
+        buf.extend_from_slice(&0u64.to_be_bytes());   // wal_start
+        buf.extend_from_slice(&1u64.to_be_bytes());   // wal_end
+        buf.extend_from_slice(&100i64.to_be_bytes()); // server_time
+        buf.push(b'X');                                // one byte payload
+        let result = parse_copy_data(Bytes::from(buf)).unwrap();
+        match result {
+            ReplicationCopyData::XLogData { wal_start, wal_end, data, .. } => {
+                assert_eq!(wal_start, Lsn(0));
+                assert_eq!(wal_end, Lsn(1));
+                assert_eq!(data.as_ref(), b"X");
+            }
+            other => panic!("expected XLogData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_keepalive() {
+        // 'k' + wal_end(8) + server_time(8) + reply_requested(1)
+        let mut buf = Vec::with_capacity(17);
+        buf.push(b'k');
+        buf.extend_from_slice(&0xDEAD_BEEFu64.to_be_bytes());
+        buf.extend_from_slice(&500i64.to_be_bytes());
+        buf.push(1u8);
+        let result = parse_copy_data(Bytes::from(buf)).unwrap();
+        match result {
+            ReplicationCopyData::KeepAlive { wal_end, reply_requested, .. } => {
+                assert_eq!(wal_end, Lsn(0xDEAD_BEEF));
+                assert!(reply_requested);
+            }
+            other => panic!("expected KeepAlive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_kind() {
+        let buf = vec![b'?'];
+        let err = parse_copy_data(Bytes::from(buf)).unwrap_err();
+        assert!(matches!(err, ReplError::Protocol(_)));
+    }
+
+    #[test]
+    fn parse_copy_data_too_short() {
+        // 'w' with only 1 byte of payload (needs 24)
+        let buf = vec![b'w', 0u8];
+        let err = parse_copy_data(Bytes::from(buf)).unwrap_err();
+        assert!(matches!(err, ReplError::Protocol(_)));
+    }
+
+    // ── encode_standby_status_update ─────────────────────────────────────────
+
+    #[test]
+    fn encode_standby_status_update_len() {
+        let out = encode_standby_status_update(Lsn(0xABCD), 1_000_000, true);
+        assert_eq!(out.len(), 34); // 'r' + 3*8 + 8 + 1
+        assert_eq!(out[0], b'r');
+    }
+
+    #[test]
+    fn encode_standby_status_update_reply_flag() {
+        let yes = encode_standby_status_update(Lsn(0), 0, true);
+        let no = encode_standby_status_update(Lsn(0), 0, false);
+        assert_eq!(yes.last(), Some(&1u8));
+        assert_eq!(no.last(), Some(&0u8));
+    }
+
+    // ── parse_pgoutput_boundary ──────────────────────────────────────────────
+
+    #[test]
+    fn boundary_empty() {
+        assert!(parse_pgoutput_boundary(&Bytes::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn boundary_begin() {
+        let mut buf = Vec::new();
+        buf.push(b'B');
+        buf.extend_from_slice(&0u64.to_be_bytes());   // final_lsn
+        buf.extend_from_slice(&1234i64.to_be_bytes()); // commit_time
+        buf.extend_from_slice(&42i32.to_be_bytes());   // xid
+        let result = parse_pgoutput_boundary(&Bytes::from(buf)).unwrap();
+        match result {
+            Some(PgOutputBoundary::Begin { commit_time, xid, .. }) => {
+                assert_eq!(commit_time, 1234);
+                assert_eq!(xid, 42);
+            }
+            other => panic!("expected Begin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boundary_commit() {
+        let mut buf = Vec::new();
+        buf.push(b'C');
+        buf.push(0u8);                                  // flags
+        buf.extend_from_slice(&1u64.to_be_bytes());    // lsn
+        buf.extend_from_slice(&2u64.to_be_bytes());    // end_lsn
+        buf.extend_from_slice(&5678i64.to_be_bytes()); // commit_time
+        let result = parse_pgoutput_boundary(&Bytes::from(buf)).unwrap();
+        match result {
+            Some(PgOutputBoundary::Commit { lsn, end_lsn, commit_time }) => {
+                assert_eq!(lsn, Lsn(1));
+                assert_eq!(end_lsn, Lsn(2));
+                assert_eq!(commit_time, 5678);
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boundary_other_tag() {
+        let buf = vec![b'I']; // Insert — not a boundary
+        assert!(parse_pgoutput_boundary(&Bytes::from(buf)).unwrap().is_none());
+    }
 }

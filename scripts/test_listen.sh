@@ -15,7 +15,7 @@ LISTEN_PID=$!
 sleep 2
 
 echo "==> listen: inserting test rows to trigger NOTIFY"
-docker compose exec -T postgres psql -U postgres -d postgres \
+psql "$PGURL" \
   -c "INSERT INTO users (username, email) VALUES ('test_a', 'a@test.com'), ('test_b', 'b@test.com');"
 
 sleep 1

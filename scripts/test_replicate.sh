@@ -21,7 +21,7 @@ REPL_PID=$!
 sleep 3
 
 echo "==> replicate: inserting, updating, deleting rows"
-docker compose exec -T postgres psql -U postgres -d postgres \
+psql "$PGURL" \
   -c "INSERT INTO users (username, email) VALUES ('rep_test', 'rep@test.com');" \
   -c "UPDATE users SET email = 'updated@test.com' WHERE username = 'rep_test';" \
   -c "DELETE FROM users WHERE username = 'test_a';"

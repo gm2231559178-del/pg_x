@@ -121,7 +121,12 @@ fn escape_channel(ch: &str) -> String {
     ch.replace('"', "\"\"")
 }
 
-pub async fn run(url: String, mut args: ListenArgs, conn: Option<&Connection>, use_tls: bool) -> Result<()> {
+pub async fn run(
+    url: String,
+    mut args: ListenArgs,
+    conn: Option<&Connection>,
+    use_tls: bool,
+) -> Result<()> {
     // Merge connection-level defaults into CLI args (CLI wins).
     if let Some(cfg) = conn.and_then(|c| c.listen.as_ref()) {
         if args.channels.is_empty() && !cfg.channels.is_empty() {

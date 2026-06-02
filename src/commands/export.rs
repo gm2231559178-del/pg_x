@@ -9,6 +9,12 @@ use std::time::Instant;
 use crate::utils::excel::write_excel;
 use crate::utils::{csv::write_csv, db::connect, format::RowSet, json::write_json};
 
+/// A parsed query block with an optional sheet name.
+struct QueryBlock {
+    sheet: String,
+    sql: String,
+}
+
 /// Output format
 #[derive(Clone, ValueEnum, Debug, Default)]
 pub enum OutputFormat {
@@ -63,86 +69,106 @@ pub struct ExportArgs {
 }
 
 pub async fn run(url: String, args: ExportArgs) -> Result<()> {
-    // ── 1. Read SQL ──────────────────────────────────────────────────────────
-    let sql = read_sql(&args)?;
-    println!("{} {}", "▶ SQL:".cyan().bold(), sql.trim().dimmed());
+    // ── 1. Read query blocks ─────────────────────────────────────────────────
+    let blocks = read_queries(&args)?;
+    let multi = blocks.len() > 1;
+
+    for (i, block) in blocks.iter().enumerate() {
+        if multi {
+            println!("{} {} «{}»", "▶ Query".cyan().bold(), i + 1, &block.sheet);
+        }
+        println!("{} {}", "▶ SQL:".cyan().bold(), block.sql.trim().dimmed());
+    }
 
     // ── 2. Connect ───────────────────────────────────────────────────────────
     let client = connect(&url).await?;
 
-    // ── 3. Execute ───────────────────────────────────────────────────────────
-    let spinner = if args.progress {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    // ── 3. Execute all queries ───────────────────────────────────────────────
+    let mut results: Vec<(String, RowSet)> = Vec::with_capacity(blocks.len());
+
+    for block in &blocks {
+        let spinner = if args.progress {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                    .unwrap()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            pb.set_message(format!("Executing «{}»…", block.sheet));
+            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            Some(pb)
+        } else {
+            None
+        };
+
+        let t0 = Instant::now();
+        let rows = client
+            .query(block.sql.as_str(), &[])
+            .await
+            .with_context(|| format!("Query «{}» failed", block.sheet))?;
+
+        let elapsed = t0.elapsed();
+
+        if let Some(pb) = &spinner {
+            pb.finish_and_clear();
+        }
+
+        if rows.is_empty() {
+            println!(
+                "  {} «{}» — no rows returned",
+                "⚠".yellow(),
+                block.sheet
+            );
+            continue;
+        }
+
+        let rowset = RowSet::from_pg_rows(&rows, args.limit)?;
+        println!(
+            "  {} {} rows in {:.3}s  columns: {}",
+            "✔ Fetched".green().bold(),
+            rowset.rows.len().to_string().yellow(),
+            elapsed.as_secs_f64(),
+            rowset.columns.len().to_string().cyan(),
         );
-        pb.set_message("Executing query…");
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
-        Some(pb)
-    } else {
-        None
-    };
 
-    let t0 = Instant::now();
-    let rows = client
-        .query(sql.as_str(), &[])
-        .await
-        .context("Query execution failed")?;
-
-    let elapsed = t0.elapsed();
-
-    if let Some(pb) = &spinner {
-        pb.finish_and_clear();
+        results.push((block.sheet.clone(), rowset));
     }
 
-    println!(
-        "{} {} rows in {:.3}s",
-        "✔ Fetched".green().bold(),
-        rows.len().to_string().yellow(),
-        elapsed.as_secs_f64(),
-    );
-
-    if rows.is_empty() {
-        println!("{}", "No rows returned — nothing to export.".yellow());
+    if results.is_empty() {
+        println!("{}", "No data returned — nothing to export.".yellow());
         return Ok(());
     }
 
-    // ── 4. Convert to RowSet ─────────────────────────────────────────────────
-    let rowset = RowSet::from_pg_rows(&rows, args.limit)?;
-    println!(
-        "  columns: {}  rows exported: {}",
-        rowset.columns.len().to_string().cyan(),
-        rowset.rows.len().to_string().cyan(),
-    );
-
-    // ── 5. Output ────────────────────────────────────────────────────────────
+    // ── 4. Output ────────────────────────────────────────────────────────────
     let out_path = resolve_output_path(&args)?;
 
     match args.format {
         #[cfg(feature = "excel")]
         OutputFormat::Excel => {
-            write_excel(
-                &rowset,
-                &out_path,
-                &args.sheet,
-                args.freeze_header,
-                args.autofit,
-                args.stripe,
-            )?;
+            let refs: Vec<(&str, &RowSet)> =
+                results.iter().map(|(n, r)| (n.as_str(), r)).collect();
+            write_excel(&refs, &out_path, args.freeze_header, args.autofit, args.stripe)?;
         }
         OutputFormat::Csv => {
-            write_csv(&rowset, &out_path)?;
+            let (_, rowset) = &results[0];
+            write_csv(rowset, &out_path)?;
         }
         OutputFormat::Json => {
-            write_json(&rowset, &out_path)?;
+            let (_, rowset) = &results[0];
+            write_json(rowset, &out_path)?;
         }
     }
 
+    if multi && results.len() > 1 {
+        println!(
+            "{} {} queries, {} sheets",
+            "✔ Saved:".green().bold(),
+            results.len(),
+            results.len(),
+        );
+    }
     println!(
-        "{} {}",
-        "✔ Saved:".green().bold(),
+        "  {}",
         out_path.display().to_string().underline()
     );
 
@@ -151,16 +177,61 @@ pub async fn run(url: String, args: ExportArgs) -> Result<()> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn read_sql(args: &ExportArgs) -> Result<String> {
+/// Parse `--query` or `--file` into a list of `(sheet_name, sql)` blocks.
+fn read_queries(args: &ExportArgs) -> Result<Vec<QueryBlock>> {
     if let Some(ref q) = args.query {
-        return Ok(q.clone());
+        return Ok(vec![QueryBlock {
+            sheet: args.sheet.clone(),
+            sql: q.clone(),
+        }]);
     }
     if let Some(ref path) = args.file {
-        let sql = std::fs::read_to_string(path)
+        let content = std::fs::read_to_string(path)
             .with_context(|| format!("Cannot read SQL file: {}", path.display()))?;
-        return Ok(sql);
+        return Ok(parse_sql_file(&content, &args.sheet));
     }
     anyhow::bail!("Provide --query or --file");
+}
+
+/// Split SQL file content by `-- sheet:` annotation lines.
+/// Lines matching `-- sheet: Name` start a new query block.
+/// Content before the first annotation uses the default sheet name.
+fn parse_sql_file(content: &str, default_sheet: &str) -> Vec<QueryBlock> {
+    let mut blocks: Vec<QueryBlock> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("-- sheet:") {
+            let name = rest.trim();
+            let sheet = if name.is_empty() {
+                default_sheet.to_owned()
+            } else {
+                name.to_owned()
+            };
+            blocks.push(QueryBlock {
+                sheet,
+                sql: String::new(),
+            });
+        } else if let Some(last) = blocks.last_mut() {
+            if !last.sql.is_empty() {
+                last.sql.push('\n');
+            }
+            last.sql.push_str(line);
+        }
+    }
+
+    // If no annotation was found, treat the whole file as one block
+    if blocks.is_empty() {
+        blocks.push(QueryBlock {
+            sheet: default_sheet.to_owned(),
+            sql: content.to_owned(),
+        });
+    }
+
+    // Discard empty blocks
+    blocks.retain(|b| !b.sql.trim().is_empty());
+
+    blocks
 }
 
 fn resolve_output_path(args: &ExportArgs) -> Result<PathBuf> {

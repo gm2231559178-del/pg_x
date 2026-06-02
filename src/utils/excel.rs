@@ -26,32 +26,20 @@ fn sanitize_sheet_name(name: &str) -> String {
     clean
 }
 
-/// Write a `RowSet` to an Excel file with rich formatting.
-/// Automatically splits into multiple worksheets if limits are exceeded.
+/// Write one or more `RowSet`s to an Excel file, each as its own worksheet.
+/// Automatically splits oversize data across multiple worksheets.
 pub fn write_excel(
-    rowset: &RowSet,
+    sheets: &[(&str, &RowSet)],
     path: &Path,
-    sheet_name: &str,
     freeze_header: bool,
     autofit: bool,
     stripe: bool,
 ) -> Result<()> {
-    // ─────────────────────────────────────────────────────────────────────────
-    // Safety checks
-    // ─────────────────────────────────────────────────────────────────────────
-    if rowset.columns.len() > EXCEL_MAX_COLS {
-        anyhow::bail!(
-            "Too many columns: {} (Excel limit: {})",
-            rowset.columns.len(),
-            EXCEL_MAX_COLS
-        );
+    if sheets.is_empty() {
+        anyhow::bail!("No data to export");
     }
 
     let mut wb = Workbook::new();
-    let base_sheet_name = sanitize_sheet_name(sheet_name);
-
-    let total_rows = rowset.rows.len();
-    let sheet_count = total_rows.div_ceil(DATA_ROWS_PER_SHEET);
 
     // ─────────────────────────────────────────────────────────────────────────
     // Formats
@@ -66,109 +54,116 @@ pub fn write_excel(
     let fmt_even = Format::new().set_background_color(Color::RGB(0xDD_EA_F1));
     let fmt_odd = Format::new();
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Sheets
-    // ─────────────────────────────────────────────────────────────────────────
-    for sheet_idx in 0..sheet_count {
-        let ws = wb.add_worksheet();
-
-        let name = if sheet_idx == 0 {
-            base_sheet_name.clone()
-        } else {
-            format!("{} ({})", base_sheet_name, sheet_idx + 1)
-        };
-
-        ws.set_name(&name).context("Invalid sheet name")?;
-
-        // ---- Header ---------------------------------------------------------
-        for (col, column_name) in rowset.columns.iter().enumerate() {
-            ws.write_with_format(0, col as u16, column_name, &fmt_header)
-                .context("Write header cell")?;
+    for (sheet_name, rowset) in sheets {
+        // ── Safety checks ────────────────────────────────────────────────────
+        if rowset.columns.len() > EXCEL_MAX_COLS {
+            anyhow::bail!(
+                "Too many columns in sheet '{sheet_name}': {} (Excel limit: {})",
+                rowset.columns.len(),
+                EXCEL_MAX_COLS
+            );
         }
-        ws.set_row_height(0, 22.0).ok();
 
-        // Track column widths per sheet
-        let mut col_widths: Vec<f64> = rowset
-            .columns
-            .iter()
-            .map(|c| c.chars().count() as f64)
-            .collect();
+        let base_sheet_name = sanitize_sheet_name(sheet_name);
+        let total_rows = rowset.rows.len();
+        let sheet_count = total_rows.div_ceil(DATA_ROWS_PER_SHEET);
 
-        // ---- Data -----------------------------------------------------------
-        let start = sheet_idx * DATA_ROWS_PER_SHEET;
-        let end = (start + DATA_ROWS_PER_SHEET).min(total_rows);
+        for sheet_idx in 0..sheet_count.max(1) {
+            let ws = wb.add_worksheet();
 
-        for (local_row_idx, row) in rowset.rows[start..end].iter().enumerate() {
-            let excel_row = (local_row_idx + 1) as u32;
-
-            let row_fmt = if stripe && local_row_idx % 2 == 1 {
-                Some(&fmt_even)
+            let name = if sheet_idx == 0 {
+                base_sheet_name.clone()
             } else {
-                Some(&fmt_odd)
+                format!("{} ({})", base_sheet_name, sheet_idx + 1)
             };
 
-            for (col_idx, cell) in row.iter().enumerate().take(EXCEL_MAX_COLS) {
-                let col = col_idx as u16;
+            ws.set_name(&name).context("Invalid sheet name")?;
 
-                // Track column width
-                let len = cell.chars().count() as f64;
-                if len > col_widths[col_idx] {
-                    col_widths[col_idx] = len;
-                }
+            // ---- Header -----------------------------------------------------
+            for (col, column_name) in rowset.columns.iter().enumerate() {
+                ws.write_with_format(0, col as u16, column_name, &fmt_header)
+                    .context("Write header cell")?;
+            }
+            ws.set_row_height(0, 22.0).ok();
 
-                if cell == "\0NULL" {
-                    // SQL NULL — write blank cell
-                    ws.write(excel_row, col, "")?;
-                } else if let Ok(n) = cell.parse::<f64>() {
-                    if let Some(fmt) = row_fmt {
-                        ws.write_number_with_format(excel_row, col, n, fmt)?;
-                    } else {
-                        ws.write_number(excel_row, col, n)?;
-                    }
-                } else if cell == "true" || cell == "false" {
-                    let b = cell == "true";
-                    if let Some(fmt) = row_fmt {
-                        ws.write_boolean_with_format(excel_row, col, b, fmt)?;
-                    } else {
-                        ws.write_boolean(excel_row, col, b)?;
-                    }
+            // Track column widths per sheet
+            let mut col_widths: Vec<f64> = rowset
+                .columns
+                .iter()
+                .map(|c| c.chars().count() as f64)
+                .collect();
+
+            // ---- Data -------------------------------------------------------
+            let start = sheet_idx * DATA_ROWS_PER_SHEET;
+            let end = (start + DATA_ROWS_PER_SHEET).min(total_rows);
+
+            for (local_row_idx, row) in rowset.rows[start..end].iter().enumerate() {
+                let excel_row = (local_row_idx + 1) as u32;
+
+                let row_fmt = if stripe && local_row_idx % 2 == 1 {
+                    Some(&fmt_even)
                 } else {
-                    if let Some(fmt) = row_fmt {
-                        ws.write_with_format(excel_row, col, cell.as_str(), fmt)?;
+                    Some(&fmt_odd)
+                };
+
+                for (col_idx, cell) in row.iter().enumerate().take(EXCEL_MAX_COLS) {
+                    let col = col_idx as u16;
+
+                    let len = cell.chars().count() as f64;
+                    if len > col_widths[col_idx] {
+                        col_widths[col_idx] = len;
+                    }
+
+                    if cell == "\0NULL" {
+                        ws.write(excel_row, col, "")?;
+                    } else if let Ok(n) = cell.parse::<f64>() {
+                        if let Some(fmt) = row_fmt {
+                            ws.write_number_with_format(excel_row, col, n, fmt)?;
+                        } else {
+                            ws.write_number(excel_row, col, n)?;
+                        }
+                    } else if cell == "true" || cell == "false" {
+                        let b = cell == "true";
+                        if let Some(fmt) = row_fmt {
+                            ws.write_boolean_with_format(excel_row, col, b, fmt)?;
+                        } else {
+                            ws.write_boolean(excel_row, col, b)?;
+                        }
                     } else {
-                        ws.write(excel_row, col, cell.as_str())?;
+                        if let Some(fmt) = row_fmt {
+                            ws.write_with_format(excel_row, col, cell.as_str(), fmt)?;
+                        } else {
+                            ws.write(excel_row, col, cell.as_str())?;
+                        }
                     }
                 }
             }
-        }
 
-        // ---- Autofit --------------------------------------------------------
-        if autofit {
-            for (col_idx, &width) in col_widths.iter().enumerate() {
-                let w = width.clamp(6.0, 60.0) + 2.0;
-                ws.set_column_width(col_idx as u16, w)?;
+            // ---- Autofit ----------------------------------------------------
+            if autofit {
+                for (col_idx, &width) in col_widths.iter().enumerate() {
+                    let w = width.clamp(6.0, 60.0) + 2.0;
+                    ws.set_column_width(col_idx as u16, w)?;
+                }
             }
-        }
 
-        // ---- Freeze header --------------------------------------------------
-        if freeze_header {
-            ws.set_freeze_panes(1, 0)?;
-        }
+            // ---- Freeze header ----------------------------------------------
+            if freeze_header {
+                ws.set_freeze_panes(1, 0)?;
+            }
 
-        // ---- Autofilter -----------------------------------------------------
-        if !rowset.columns.is_empty() {
-            ws.autofilter(
-                0,
-                0,
-                (end - start) as u32,
-                (rowset.columns.len() - 1) as u16,
-            )?;
+            // ---- Autofilter -------------------------------------------------
+            if !rowset.columns.is_empty() {
+                ws.autofilter(
+                    0,
+                    0,
+                    (end - start) as u32,
+                    (rowset.columns.len() - 1) as u16,
+                )?;
+            }
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Save
-    // ─────────────────────────────────────────────────────────────────────────
     wb.save(path)
         .with_context(|| format!("Cannot save Excel file: {}", path.display()))?;
 

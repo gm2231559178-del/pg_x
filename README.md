@@ -407,6 +407,14 @@ pgx -U $DATABASE_URL export -q "SELECT * FROM orders" -o orders.xlsx
 # Export to CSV
 pgx -U $DATABASE_URL export -q "SELECT * FROM orders" -m csv -o orders.csv
 
+# Multi-sheet Excel from a .sql file (each `-- sheet:` starts a new sheet)
+pgx -U $DATABASE_URL export -f reports.sql -o report.xlsx
+# reports.sql:
+#   -- sheet: Users
+#   SELECT id, username, email FROM users;
+#   -- sheet: Orders
+#   SELECT id, total, status FROM orders;
+
 # Server info
 pgx -U $DATABASE_URL info --version --databases --tables
 ```

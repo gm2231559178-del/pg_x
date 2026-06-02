@@ -4,7 +4,8 @@ use colored::Colorize;
 use comfy_table::{
     presets::UTF8_FULL_CONDENSED, Attribute, Cell, Color, ContentArrangement, Table,
 };
-use std::time::Instant;
+use std::io::Write;
+use std::time::{Duration, Instant};
 
 use crate::utils::{db::connect, format::RowSet};
 
@@ -21,37 +22,61 @@ pub struct QueryArgs {
     /// Output as JSON instead of table
     #[arg(long)]
     pub json: bool,
+
+    /// Watch mode: re-run the query every N seconds (like `watch -n N`)
+    #[arg(short = 'w', long, default_value_t = 0)]
+    pub watch: u64,
 }
 
 pub async fn run(url: String, args: QueryArgs, use_tls: bool) -> Result<()> {
-    let client = connect(&url, use_tls).await?;
+    loop {
+        let client = connect(&url, use_tls).await?;
 
-    let t0 = Instant::now();
-    let rows = client.query(args.query.as_str(), &[]).await?;
-    let elapsed = t0.elapsed();
+        let t0 = Instant::now();
+        let rows = client.query(args.query.as_str(), &[]).await?;
+        let elapsed = t0.elapsed();
 
-    if rows.is_empty() {
-        println!("{}", "(no rows)".dimmed());
-        return Ok(());
+        if args.watch > 0 {
+            print!("\u{1b}[2J\u{1b}[H"); // clear screen
+            std::io::stdout().flush()?;
+            println!(
+                "{} {}  (every {}s)  {}",
+                "⟳".cyan().bold(),
+                args.query.dimmed(),
+                args.watch,
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            );
+            println!();
+        }
+
+        if rows.is_empty() {
+            println!("{}", "(no rows)".dimmed());
+        } else {
+            let rowset = RowSet::from_pg_rows(&rows, args.limit)?;
+
+            if args.json {
+                let out = serde_json::to_string_pretty(&rowset.to_json_value())?;
+                println!("{out}");
+            } else {
+                print_table(&rowset);
+            }
+
+            if args.watch == 0 {
+                println!(
+                    "\n{} {} row(s) in {:.3}s",
+                    "✔".green().bold(),
+                    rows.len().to_string().yellow(),
+                    elapsed.as_secs_f64(),
+                );
+            }
+        }
+
+        if args.watch == 0 {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_secs(args.watch)).await;
     }
-
-    let rowset = RowSet::from_pg_rows(&rows, args.limit)?;
-
-    if args.json {
-        let out = serde_json::to_string_pretty(&rowset.to_json_value())?;
-        println!("{out}");
-    } else {
-        print_table(&rowset);
-    }
-
-    println!(
-        "\n{} {} row(s) in {:.3}s",
-        "✔".green().bold(),
-        rows.len().to_string().yellow(),
-        elapsed.as_secs_f64(),
-    );
-
-    Ok(())
 }
 
 fn print_table(rowset: &RowSet) {

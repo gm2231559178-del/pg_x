@@ -23,8 +23,8 @@ pub struct QueryArgs {
     pub json: bool,
 }
 
-pub async fn run(url: String, args: QueryArgs) -> Result<()> {
-    let client = connect(&url).await?;
+pub async fn run(url: String, args: QueryArgs, use_tls: bool) -> Result<()> {
+    let client = connect(&url, use_tls).await?;
 
     let t0 = Instant::now();
     let rows = client.query(args.query.as_str(), &[]).await?;

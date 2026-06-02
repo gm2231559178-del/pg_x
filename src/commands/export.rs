@@ -68,7 +68,7 @@ pub struct ExportArgs {
     pub progress: bool,
 }
 
-pub async fn run(url: String, args: ExportArgs) -> Result<()> {
+pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
     // ── 1. Read query blocks ─────────────────────────────────────────────────
     let blocks = read_queries(&args)?;
     let multi = blocks.len() > 1;
@@ -81,7 +81,7 @@ pub async fn run(url: String, args: ExportArgs) -> Result<()> {
     }
 
     // ── 2. Connect ───────────────────────────────────────────────────────────
-    let client = connect(&url).await?;
+    let client = connect(&url, use_tls).await?;
 
     // ── 3. Execute all queries ───────────────────────────────────────────────
     let mut results: Vec<(String, RowSet)> = Vec::with_capacity(blocks.len());

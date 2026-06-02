@@ -24,7 +24,6 @@ use clap::{Args, Subcommand, ValueEnum};
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
 
 use crate::replication::{
@@ -36,6 +35,7 @@ use crate::replication::{
 };
 use crate::utils::config::Connection;
 use crate::utils::signal::{parse_key_val, shutdown_signal};
+use crate::utils::tls;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI argument structs
@@ -656,7 +656,8 @@ pub async fn run(
     // harmless but noisy.
     info!("Connecting to PostgreSQL…");
 
-    let (mgmt_client, mgmt_conn) = tokio_postgres::connect(&base_url, NoTls)
+    let mgmt_connector = tls::build_tls(use_tls)?;
+    let (mgmt_client, mgmt_conn) = tokio_postgres::connect(&base_url, mgmt_connector)
         .await
         .context("Failed to connect to PostgreSQL")?;
     tokio::spawn(async move {

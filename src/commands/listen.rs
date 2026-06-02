@@ -3,12 +3,12 @@ use clap::{Args, Subcommand, ValueEnum};
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
 use crate::utils::config::Connection;
 use crate::utils::signal::{parse_key_val, shutdown_signal};
+use crate::utils::tls;
 
 #[derive(Args)]
 pub struct ListenArgs {
@@ -121,7 +121,7 @@ fn escape_channel(ch: &str) -> String {
     ch.replace('"', "\"\"")
 }
 
-pub async fn run(url: String, mut args: ListenArgs, conn: Option<&Connection>) -> Result<()> {
+pub async fn run(url: String, mut args: ListenArgs, conn: Option<&Connection>, use_tls: bool) -> Result<()> {
     // Merge connection-level defaults into CLI args (CLI wins).
     if let Some(cfg) = conn.and_then(|c| c.listen.as_ref()) {
         if args.channels.is_empty() && !cfg.channels.is_empty() {
@@ -194,7 +194,8 @@ pub async fn run(url: String, mut args: ListenArgs, conn: Option<&Connection>) -
         // ── Connect ───────────────────────────────────────────────────────────
         info!("Connecting to PostgreSQL…");
 
-        let (client, connection) = match tokio_postgres::connect(&url, NoTls).await {
+        let connector = tls::build_tls(use_tls)?;
+        let (client, connection) = match tokio_postgres::connect(&url, connector).await {
             Ok(pair) => pair,
             Err(e) => {
                 error!(error = %e, "Connection failed");
@@ -219,17 +220,12 @@ pub async fn run(url: String, mut args: ListenArgs, conn: Option<&Connection>) -
             use std::pin::Pin;
             use std::task::{Context as Cx, Poll};
 
-            struct Drainer {
-                conn: tokio_postgres::Connection<
-                    tokio_postgres::Socket,
-                    tokio_postgres::tls::NoTlsStream,
-                >,
-                // Sole owner of tx — when Drainer is dropped, tx is dropped,
-                // closing the channel and unblocking rx.recv() with None.
+            struct Drainer<S> {
+                conn: tokio_postgres::Connection<tokio_postgres::Socket, S>,
                 tx: tokio::sync::mpsc::Sender<tokio_postgres::Notification>,
             }
 
-            impl Future for Drainer {
+            impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Future for Drainer<S> {
                 type Output = ();
                 fn poll(mut self: Pin<&mut Self>, cx: &mut Cx<'_>) -> Poll<()> {
                     loop {

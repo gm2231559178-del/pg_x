@@ -94,14 +94,11 @@ async fn main() -> Result<()> {
     let (url, conn_name) = cfg.resolve_from(cli.url, cli.connection)?;
     let conn = conn_name.as_ref().and_then(|name| cfg.get(name));
 
-    // Build TLS connector if requested
-    let _tls = utils::tls::build_tls(cli.tls)?;
-
     match cli.command {
-        Commands::Export(args) => export::run(url, args).await,
-        Commands::Query(args) => query::run(url, args).await,
-        Commands::Info(args) => info::run(url, args).await,
-        Commands::Listen(args) => listen::run(url, args, conn).await,
+        Commands::Export(args) => export::run(url, args, cli.tls).await,
+        Commands::Query(args) => query::run(url, args, cli.tls).await,
+        Commands::Info(args) => info::run(url, args, cli.tls).await,
+        Commands::Listen(args) => listen::run(url, args, conn, cli.tls).await,
         Commands::Replicate(args) => replicate::run(url, args, conn, cli.tls).await,
     }
 }

@@ -28,8 +28,8 @@ pub struct InfoArgs {
     pub slots: bool,
 }
 
-pub async fn run(url: String, args: InfoArgs) -> Result<()> {
-    let client = connect(&url).await?;
+pub async fn run(url: String, args: InfoArgs, use_tls: bool) -> Result<()> {
+    let client = connect(&url, use_tls).await?;
 
     if args.version {
         let row = client.query_one("SELECT version()", &[]).await?;

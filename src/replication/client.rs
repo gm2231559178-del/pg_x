@@ -736,5 +736,3 @@ impl Worker {
         write_copy_data(stream, &payload).await
     }
 }
-
-

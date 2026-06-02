@@ -101,8 +101,8 @@ mod tests {
         let back: u64 = l.into();
         assert_eq!(back, 42);
 
-        assert_eq!(Lsn::from_u64(0).is_zero(), true);
-        assert_eq!(Lsn::from_u64(1).is_zero(), false);
+        assert!(Lsn::from_u64(0).is_zero());
+        assert!(!Lsn::from_u64(1).is_zero());
     }
 
     #[test]

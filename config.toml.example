@@ -4,6 +4,26 @@ default = "local"
 url = "postgres://postgres:secret@localhost:5432/mydb"
 description = "Local dev database"
 
+[connections.local.listen]
+channels = ["user_updates"]
+max_reconnect_attempts = 5
+reconnect_base_ms = 2000
+reconnect_max_ms = 60000
+
+[connections.local.listen.sink]
+type = "shell"
+command = "echo [$PGX_CHANNEL] $PGX_PAYLOAD"
+mode = "simple"
+
+[connections.local.replicate]
+slot = "my_slot"
+publications = ["my_pub"]
+temporary = true
+
+[connections.local.replicate.sink]
+type = "stdout"
+pretty = true
+
 [connections.staging]
 url = "postgres://user:pass@staging.host:5432/stagingdb"
 description = "Staging"
@@ -15,3 +35,23 @@ description = "Staging"
 # [connections.prod]
 # url = "postgres://readonly:pass@prod.host:5432/proddb"
 # description = "Production (read-only replica)"
+#
+# [connections.prod.listen]
+# channels = ["admin_alerts"]
+#
+# [connections.prod.listen.sink]
+# type = "webhook"
+# url = "https://hooks.example.com/pgx"
+# mode = "contract"
+#
+# [connections.prod.replicate]
+# slot = "prod_slot"
+# publications = ["prod_pub"]
+# tables = ["public.orders"]
+# ops = ["insert", "update"]
+#
+# [connections.prod.replicate.sink]
+# type = "kafka"
+# brokers = "kafka-prod:9092"
+# topic = "pgx-wal"
+# mode = "contract"

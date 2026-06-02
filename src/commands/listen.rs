@@ -7,6 +7,7 @@ use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
+use crate::utils::config::Connection;
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 
 #[derive(Args)]
@@ -120,7 +121,23 @@ fn escape_channel(ch: &str) -> String {
     ch.replace('"', "\"\"")
 }
 
-pub async fn run(url: String, args: ListenArgs) -> Result<()> {
+pub async fn run(url: String, mut args: ListenArgs, conn: Option<&Connection>) -> Result<()> {
+    // Merge connection-level defaults into CLI args (CLI wins).
+    if let Some(cfg) = conn.and_then(|c| c.listen.as_ref()) {
+        if args.channels.is_empty() && !cfg.channels.is_empty() {
+            args.channels = cfg.channels.clone();
+        }
+        if args.max_reconnect_attempts == 0 && cfg.max_reconnect_attempts.unwrap_or(0) > 0 {
+            args.max_reconnect_attempts = cfg.max_reconnect_attempts.unwrap();
+        }
+        if args.reconnect_base_ms == 1000 && cfg.reconnect_base_ms.unwrap_or(0) > 0 {
+            args.reconnect_base_ms = cfg.reconnect_base_ms.unwrap();
+        }
+        if args.reconnect_max_ms == 60000 && cfg.reconnect_max_ms.unwrap_or(0) > 0 {
+            args.reconnect_max_ms = cfg.reconnect_max_ms.unwrap();
+        }
+    }
+
     let sink: Arc<dyn Downstream> = build_downstream(&args.downstream).await?;
 
     tokio::pin!(let shutdown = shutdown_signal(););

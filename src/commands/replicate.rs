@@ -34,6 +34,7 @@ use crate::replication::{
     lsn::Lsn,
     slot,
 };
+use crate::utils::config::Connection;
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,6 +93,19 @@ pub enum OpFilter {
     Update,
     Delete,
     Truncate,
+}
+
+impl std::str::FromStr for OpFilter {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "insert" => Ok(Self::Insert),
+            "update" => Ok(Self::Update),
+            "delete" => Ok(Self::Delete),
+            "truncate" => Ok(Self::Truncate),
+            other => Err(format!("unknown op filter '{other}'; expected insert|update|delete|truncate")),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -598,7 +612,32 @@ fn log_event(event: &WalEvent, lsn_str: &str) {
 // Main entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
+pub async fn run(base_url: String, mut args: ReplicateArgs, conn: Option<&Connection>) -> Result<()> {
+    // Merge connection-level defaults into CLI args (CLI wins).
+    if let Some(cfg) = conn.and_then(|c| c.replicate.as_ref()) {
+        if args.slot == "pgx_slot" && cfg.slot.is_some() {
+            args.slot = cfg.slot.clone().unwrap();
+        }
+        if args.publications.is_empty() && !cfg.publications.is_empty() {
+            args.publications = cfg.publications.clone();
+        }
+        if args.tables.is_empty() && !cfg.tables.is_empty() {
+            args.tables = cfg.tables.clone();
+        }
+        if args.ops.is_empty() && !cfg.ops.is_empty() {
+            args.ops = cfg.ops.iter().filter_map(|o| o.parse().ok()).collect();
+        }
+        if !args.temporary && cfg.temporary.unwrap_or(false) {
+            args.temporary = true;
+        }
+        if !args.emit_txn_boundaries && cfg.emit_txn_boundaries.unwrap_or(false) {
+            args.emit_txn_boundaries = true;
+        }
+        if !args.emit_schema && cfg.emit_schema.unwrap_or(false) {
+            args.emit_schema = true;
+        }
+    }
+
     let sink = build_wal_sink(&args.downstream).await?;
 
     // ── 1. Parse connection URL ───────────────────────────────────────────────

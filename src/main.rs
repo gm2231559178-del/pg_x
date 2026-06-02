@@ -88,8 +88,11 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    // Resolve connection URL: flag > named connection > config default
-    let url = resolve_url(cli.url, cli.connection)?;
+    // Resolve connection URL: flag > named connection > config default.
+    // The (optional) connection name is used to look up sink defaults.
+    let cfg = Config::load()?;
+    let (url, conn_name) = cfg.resolve_from(cli.url, cli.connection)?;
+    let conn = conn_name.as_ref().and_then(|name| cfg.get(name));
 
     // Build TLS connector if requested
     let _tls = utils::tls::build_tls(cli.tls)?;
@@ -98,28 +101,7 @@ async fn main() -> Result<()> {
         Commands::Export(args) => export::run(url, args).await,
         Commands::Query(args) => query::run(url, args).await,
         Commands::Info(args) => info::run(url, args).await,
-        Commands::Listen(args) => listen::run(url, args).await,
-        Commands::Replicate(args) => replicate::run(url, args).await,
+        Commands::Listen(args) => listen::run(url, args, conn).await,
+        Commands::Replicate(args) => replicate::run(url, args, conn).await,
     }
-}
-
-fn resolve_url(flag: Option<String>, conn_name: Option<String>) -> Result<String> {
-    if let Some(u) = flag {
-        return Ok(u);
-    }
-
-    let cfg = Config::load()?;
-
-    if let Some(name) = conn_name {
-        return cfg
-            .connection(&name)
-            .ok_or_else(|| anyhow::anyhow!("No connection named '{}' in config", name));
-    }
-
-    cfg.default_url().ok_or_else(|| {
-        anyhow::anyhow!(
-            "No database URL supplied.\n\
-             Use -U <url>, set DATABASE_URL, or add a default in ~/.pgx/config.toml"
-        )
-    })
 }

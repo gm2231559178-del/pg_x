@@ -99,32 +99,6 @@ pub async fn drop_slot(client: &Client, slot_name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_slot_name_ok() {
-        assert!(validate_slot_name("my_slot").is_ok());
-        assert!(validate_slot_name("_pgx_slot_1").is_ok());
-        assert!(validate_slot_name("a").is_ok());
-    }
-
-    #[test]
-    fn validate_slot_name_invalid() {
-        assert!(validate_slot_name("").is_err());
-        assert!(validate_slot_name("123abc").is_err());
-        assert!(validate_slot_name("has-hyphen").is_err());
-        assert!(validate_slot_name("has.dot").is_err());
-        assert!(validate_slot_name("").is_err());
-    }
-
-    #[test]
-    fn validate_slot_name_unicode() {
-        assert!(validate_slot_name("über_slot").is_err());
-    }
-}
-
 /// List all logical replication slots on the server.
 pub async fn list_slots(client: &Client) -> Result<Vec<SlotInfo>> {
     let rows = client
@@ -150,4 +124,30 @@ pub async fn list_slots(client: &Client) -> Result<Vec<SlotInfo>> {
             restart_lsn: row.get("restart_lsn"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_slot_name_ok() {
+        assert!(validate_slot_name("my_slot").is_ok());
+        assert!(validate_slot_name("_pgx_slot_1").is_ok());
+        assert!(validate_slot_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_slot_name_invalid() {
+        assert!(validate_slot_name("").is_err());
+        assert!(validate_slot_name("123abc").is_err());
+        assert!(validate_slot_name("has-hyphen").is_err());
+        assert!(validate_slot_name("has.dot").is_err());
+        assert!(validate_slot_name("").is_err());
+    }
+
+    #[test]
+    fn validate_slot_name_unicode() {
+        assert!(validate_slot_name("über_slot").is_err());
+    }
 }

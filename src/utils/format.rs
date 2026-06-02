@@ -183,7 +183,11 @@ mod tests {
 
     #[test]
     fn to_json_value_empty() {
-        let rs = RowSet { columns: vec![], rows: vec![], col_is_numeric: vec![] };
+        let rs = RowSet {
+            columns: vec![],
+            rows: vec![],
+            col_is_numeric: vec![],
+        };
         assert_eq!(rs.to_json_value(), serde_json::json!([]));
     }
 

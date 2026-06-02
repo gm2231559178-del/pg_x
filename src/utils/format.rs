@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio_postgres::Row;
 
 /// A serializable, format-agnostic result set.
@@ -7,6 +7,8 @@ use tokio_postgres::Row;
 pub struct RowSet {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// Whether each column is numeric (for JSON type preservation).
+    pub col_is_numeric: Vec<bool>,
 }
 
 impl RowSet {
@@ -17,6 +19,7 @@ impl RowSet {
             return Ok(RowSet {
                 columns: vec![],
                 rows: vec![],
+                col_is_numeric: vec![],
             });
         }
 
@@ -33,22 +36,33 @@ impl RowSet {
             limit.min(rows.len())
         };
 
+        let mut col_is_numeric: Vec<bool> = Vec::with_capacity(columns.len());
         let mut result_rows: Vec<Vec<String>> = Vec::with_capacity(take);
 
-        for row in rows.iter().take(take) {
+        for (ri, row) in rows.iter().enumerate() {
             let cells: Vec<String> = (0..columns.len())
                 .map(|i| pg_cell_to_string(row, i))
                 .collect();
+            if ri == 0 {
+                col_is_numeric = (0..columns.len())
+                    .map(|i| {
+                        let ct = row.columns()[i].type_().name();
+                        matches!(ct, "int2" | "int4" | "int8" | "oid" | "float4" | "float8" | "numeric")
+                    })
+                    .collect();
+            }
             result_rows.push(cells);
         }
 
         Ok(RowSet {
             columns,
             rows: result_rows,
+            col_is_numeric,
         })
     }
 
     /// Convert to a `serde_json::Value` array of objects.
+    /// Numeric columns are serialized as JSON numbers, not strings.
     pub fn to_json_value(&self) -> Value {
         let objects: Vec<Value> = self
             .rows
@@ -58,7 +72,19 @@ impl RowSet {
                     .columns
                     .iter()
                     .zip(row.iter())
-                    .map(|(k, v)| (k.clone(), json!(v)))
+                    .enumerate()
+                    .map(|(ci, (k, v))| {
+                        let val = if v == "\0NULL" {
+                            Value::Null
+                        } else if self.col_is_numeric.get(ci).copied().unwrap_or(false) {
+                            v.parse::<f64>()
+                                .map(Value::from)
+                                .unwrap_or_else(|_| Value::String(v.clone()))
+                        } else {
+                            Value::String(v.clone())
+                        };
+                        (k.clone(), val)
+                    })
                     .collect();
                 Value::Object(obj)
             })
@@ -71,13 +97,16 @@ impl RowSet {
 fn pg_cell_to_string(row: &Row, idx: usize) -> String {
     let col_type = row.columns()[idx].type_().name();
 
+    // Sentinel used to distinguish SQL NULL from the literal string "NULL".
+    // The leading NUL character (\0) cannot appear in a real Postgres text value.
+    const NULL_SENTINEL: &str = "\0NULL";
+
     macro_rules! try_get {
         ($t:ty) => {
-            if let Ok(Some(v)) = row.try_get::<_, Option<$t>>(idx) {
-                return v.to_string();
-            }
-            if let Ok(None::<$t>) = row.try_get(idx) {
-                return "NULL".to_owned();
+            match row.try_get::<_, Option<$t>>(idx) {
+                Ok(Some(v)) => return v.to_string(),
+                Ok(None) => return NULL_SENTINEL.to_owned(),
+                Err(e) => tracing::debug!(error = %e, col_type, "try_get failed"),
             }
         };
     }
@@ -105,38 +134,42 @@ fn pg_cell_to_string(row: &Row, idx: usize) -> String {
             try_get!(String);
         }
         "json" | "jsonb" => {
-            if let Ok(Some(v)) = row.try_get::<_, Option<serde_json::Value>>(idx) {
-                return v.to_string();
+            match row.try_get::<_, Option<serde_json::Value>>(idx) {
+                Ok(Some(v)) => return v.to_string(),
+                Ok(None) => return "null".to_owned(),
+                Err(e) => tracing::debug!(error = %e, col_type, "try_get failed"),
             }
-            return "NULL".to_owned();
         }
         "uuid" => {
             try_get!(uuid::Uuid);
         }
         "timestamp" | "timestamptz" => {
-            if let Ok(Some(v)) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
-                return v.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+            match row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
+                Ok(Some(v)) => return v.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                Ok(None) => return NULL_SENTINEL.to_owned(),
+                Err(e) => tracing::debug!(error = %e, col_type, "try_get failed for timestamptz"),
             }
-            if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
-                return v.format("%Y-%m-%d %H:%M:%S").to_string();
+            match row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
+                Ok(Some(v)) => return v.format("%Y-%m-%d %H:%M:%S").to_string(),
+                Ok(None) => return NULL_SENTINEL.to_owned(),
+                Err(e) => tracing::debug!(error = %e, col_type, "try_get failed for timestamp"),
             }
-            return "NULL".to_owned();
         }
         "date" => {
-            if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
-                return v.to_string();
+            match row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
+                Ok(Some(v)) => return v.to_string(),
+                Ok(None) => return NULL_SENTINEL.to_owned(),
+                Err(e) => tracing::debug!(error = %e, col_type, "try_get failed"),
             }
-            return "NULL".to_owned();
         }
         _ => {}
     }
 
     // Generic fallback: try String first, then format unknown
-    if let Ok(Some(v)) = row.try_get::<_, Option<String>>(idx) {
-        return v;
-    }
-    if row.try_get::<_, Option<String>>(idx).is_ok() {
-        return "NULL".to_owned();
+    match row.try_get::<_, Option<String>>(idx) {
+        Ok(Some(v)) => return v,
+        Ok(None) => return NULL_SENTINEL.to_owned(),
+        Err(e) => tracing::debug!(error = %e, col_type, "try_get failed for String fallback"),
     }
 
     format!("<{col_type}>")

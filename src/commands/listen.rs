@@ -1,36 +1,13 @@
 use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
-use colored::Colorize;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-}
+use crate::utils::signal::{parse_key_val, shutdown_signal};
 
 #[derive(Args)]
 pub struct ListenArgs {
@@ -129,12 +106,6 @@ pub enum ForwardMode {
     Contract,
 }
 
-fn parse_key_val(s: &str) -> Result<(String, String), String> {
-    s.split_once('=')
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .ok_or_else(|| format!("Expected KEY=VALUE, got '{s}'"))
-}
-
 /// Exponential backoff with ±20% jitter. Shift is clamped to avoid u64 overflow.
 fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> std::time::Duration {
     let shift = (attempt - 1).min(62);
@@ -142,6 +113,11 @@ fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> std::time::Duration
     let jitter = base / 5;
     let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));
     std::time::Duration::from_millis(delay_ms)
+}
+
+/// Escape a channel name so it can be safely used in LISTEN "..."
+fn escape_channel(ch: &str) -> String {
+    ch.replace('"', "\"\"")
 }
 
 pub async fn run(url: String, args: ListenArgs) -> Result<()> {
@@ -163,10 +139,12 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
                 error!(
                     consecutive_failures,
                     max = args.max_reconnect_attempts,
-                    "Max reconnect attempts reached — exiting with code 1 \
-                     so the container restart policy can take over."
+                    "Max reconnect attempts reached"
                 );
-                std::process::exit(1);
+                return Err(anyhow::anyhow!(
+                    "Max reconnect attempts ({}) reached",
+                    args.max_reconnect_attempts
+                ));
             }
 
             let delay = backoff_delay(
@@ -216,9 +194,10 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
         // The original code did `let tx = tx.clone()` inside spawn while keeping
         // the original tx alive in this scope. That left a live sender dangling
         // so rx.recv() would hang forever after the Drainer exited.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio_postgres::Notification>();
+        // Using a bounded channel to prevent unbounded memory growth.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio_postgres::Notification>(1024);
 
-        tokio::spawn(async move {
+        let drain_handle = tokio::spawn(async move {
             use std::future::Future;
             use std::pin::Pin;
             use std::task::{Context as Cx, Poll};
@@ -230,7 +209,7 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
                 >,
                 // Sole owner of tx — when Drainer is dropped, tx is dropped,
                 // closing the channel and unblocking rx.recv() with None.
-                tx: tokio::sync::mpsc::UnboundedSender<tokio_postgres::Notification>,
+                tx: tokio::sync::mpsc::Sender<tokio_postgres::Notification>,
             }
 
             impl Future for Drainer {
@@ -243,7 +222,10 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
                             Poll::Ready(Some(Ok(tokio_postgres::AsyncMessage::Notification(
                                 n,
                             )))) => {
-                                let _ = self.tx.send(n);
+                                if self.tx.try_send(n).is_err() {
+                                    // Channel full — downstream is slow, drop oldest to
+                                    // apply backpressure rather than blocking.
+                                }
                             }
                             Poll::Ready(Some(Ok(_))) => {}
                             Poll::Ready(Some(Err(e))) => {
@@ -267,7 +249,8 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
         // ── LISTEN ────────────────────────────────────────────────────────────
         let mut listen_ok = true;
         for ch in &args.channels {
-            match client.execute(&format!("LISTEN \"{ch}\""), &[]).await {
+            let escaped = escape_channel(ch);
+            match client.execute(&format!("LISTEN \"{escaped}\""), &[]).await {
                 Ok(_) => info!(channel = %ch, "Listening on channel"),
                 Err(e) => {
                     error!(channel = %ch, error = %e, "LISTEN failed");
@@ -321,9 +304,6 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
 
                             if let Err(e) = sink.send(&event).await {
                                 error!(sink = sink.name(), error = %e, "Downstream send failed");
-                                // Downstream errors don't trigger PG reconnect by default.
-                                // To also exit on sink failure, uncomment:
-                                // std::process::exit(1);
                             }
                         }
                     }
@@ -333,6 +313,13 @@ pub async fn run(url: String, args: ListenArgs) -> Result<()> {
 
         if session_dropped {
             consecutive_failures += 1;
+        }
+
+        // Drainer task completed — check for panics
+        if drain_handle.is_finished() {
+            if let Err(e) = drain_handle.await {
+                error!("Drainer task panicked: {e}");
+            }
         }
     }
 }

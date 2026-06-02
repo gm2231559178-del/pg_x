@@ -8,6 +8,10 @@ description = "Local dev database"
 url = "postgres://user:pass@staging.host:5432/stagingdb"
 description = "Staging"
 
-[connections.prod]
-url = "postgres://readonly:pass@prod.host:5432/proddb"
-description = "Production (read-only replica)"
+# NOTE: Production credentials should be provided via DATABASE_URL env var or
+# ~/.pgx/config.toml (which is excluded from version control). Do not commit
+# real passwords to this file. Example:
+#
+# [connections.prod]
+# url = "postgres://readonly:pass@prod.host:5432/proddb"
+# description = "Production (read-only replica)"

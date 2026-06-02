@@ -66,6 +66,7 @@ pub fn write_excel(
     let fmt_even = Format::new().set_background_color(Color::RGB(0xDD_EA_F1));
     let fmt_odd = Format::new();
 
+    #[allow(unused)]
     let fmt_null = Format::new()
         .set_font_color(Color::RGB(0xAA_AA_AA))
         .set_italic();
@@ -120,8 +121,9 @@ pub fn write_excel(
                     col_widths[col_idx] = len;
                 }
 
-                if cell == "NULL" {
-                    ws.write_with_format(excel_row, col, "NULL", &fmt_null)?;
+                if cell == "\0NULL" {
+                    // SQL NULL — write blank cell
+                    ws.write(excel_row, col, "")?;
                 } else if let Ok(n) = cell.parse::<f64>() {
                     if let Some(fmt) = row_fmt {
                         ws.write_number_with_format(excel_row, col, n, fmt)?;

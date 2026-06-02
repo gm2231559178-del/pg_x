@@ -172,6 +172,6 @@ fn resolve_output_path(args: &ExportArgs) -> Result<PathBuf> {
         OutputFormat::Json => "json",
     };
 
-    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     Ok(PathBuf::from(format!("export_{ts}.{ext}")))
 }

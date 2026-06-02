@@ -37,7 +37,7 @@ use super::{
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReplicationConfig {
     pub host: String,
     pub port: u16,
@@ -50,6 +50,24 @@ pub struct ReplicationConfig {
     pub status_interval_secs: u64,
     pub idle_wakeup_secs: u64,
     pub buffer_events: usize,
+}
+
+impl std::fmt::Debug for ReplicationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("database", &self.database)
+            .field("slot", &self.slot)
+            .field("publication", &self.publication)
+            .field("start_lsn", &self.start_lsn)
+            .field("status_interval_secs", &self.status_interval_secs)
+            .field("idle_wakeup_secs", &self.idle_wakeup_secs)
+            .field("buffer_events", &self.buffer_events)
+            .finish()
+    }
 }
 
 impl Default for ReplicationConfig {
@@ -223,14 +241,14 @@ impl Drop for ReplicationClient {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(true);
         if let Some(join) = self.join.take() {
-            match tokio::runtime::Handle::try_current() {
-                Ok(h) => {
-                    h.spawn(async move {
-                        let _ = join.await;
-                    });
-                }
-                Err(_) => join.abort(),
+            if tokio::runtime::Handle::try_current().is_err() {
+                // No runtime active — abort the worker task.
+                join.abort();
             }
+            // With a runtime active, the worker task runs until it notices the
+            // stop signal and terminates cleanly. We cannot block here in an
+            // async context, so we detach. The recv() caller will pick up the
+            // result via collect_worker_result().
         }
     }
 }
@@ -404,11 +422,12 @@ impl Worker {
         &self,
         stream: &mut S,
     ) -> ReplResult<()> {
+        let slot_escaped = self.cfg.slot.replace('"', "\"\"");
         let pub_escaped = self.cfg.publication.replace('\'', "''");
         let sql = format!(
-            "START_REPLICATION SLOT {} LOGICAL {} \
-             (proto_version '1', publication_names '{}', messages 'true')",
-            self.cfg.slot, self.cfg.start_lsn, pub_escaped
+            "START_REPLICATION SLOT \"{slot_escaped}\" LOGICAL {} \
+             (proto_version '1', publication_names '{pub_escaped}', messages 'true')",
+            self.cfg.start_lsn
         );
         write_query(stream, &sql).await?;
 

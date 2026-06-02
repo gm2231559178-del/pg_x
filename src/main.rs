@@ -37,6 +37,11 @@ struct Cli {
     )]
     log_json: bool,
 
+    /// Enable TLS for the PostgreSQL connection.
+    /// Requires building with --features tls.
+    #[arg(long = "tls", global = true, default_value_t = false)]
+    tls: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -85,6 +90,9 @@ async fn main() -> Result<()> {
 
     // Resolve connection URL: flag > named connection > config default
     let url = resolve_url(cli.url, cli.connection)?;
+
+    // Build TLS connector if requested
+    let _tls = utils::tls::build_tls(cli.tls)?;
 
     match cli.command {
         Commands::Export(args) => export::run(url, args).await,

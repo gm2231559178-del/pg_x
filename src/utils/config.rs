@@ -29,6 +29,7 @@ impl Config {
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
+            tracing::debug!(path = %path.display(), "No config file found, using defaults");
             return Ok(Config::default());
         }
         let raw = std::fs::read_to_string(&path)

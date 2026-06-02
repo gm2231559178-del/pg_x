@@ -21,7 +21,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use colored::Colorize;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
@@ -34,32 +34,7 @@ use crate::replication::{
     lsn::Lsn,
     slot,
 };
-
-/// Wait for SIGINT (Ctrl-C) or SIGTERM (kill / container stop).
-/// Returns when either signal is received.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-}
+use crate::utils::signal::{parse_key_val, shutdown_signal};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI argument structs
@@ -203,12 +178,6 @@ pub struct KafkaArgs {
     pub brokers: String,
     #[arg(long, default_value = "pgx-wal")]
     pub topic: String,
-}
-
-fn parse_key_val(s: &str) -> Result<(String, String), String> {
-    s.split_once('=')
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .ok_or_else(|| format!("Expected KEY=VALUE, got '{s}'"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

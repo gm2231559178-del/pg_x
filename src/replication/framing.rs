@@ -3,7 +3,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::error::{ReplError, ReplResult};
 
-pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024;
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
 #[derive(Debug, Clone)]
 pub struct BackendMessage {

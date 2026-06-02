@@ -179,6 +179,12 @@ impl WalEvent {
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+        match serde_json::to_string(self) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to serialize WAL event to JSON");
+                "{}".to_string()
+            }
+        }
     }
 }

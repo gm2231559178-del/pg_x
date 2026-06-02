@@ -27,5 +27,6 @@ EXECUTE FUNCTION notify_user_changes();
 
 
 -- INSERT INTO users (username, email) VALUES ('alice', 'alice@example.com');
--- DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres target/debug/pgx listen   -C user_updates   shell   --command 'echo "[$PGX_CHANNEL] $PGX_PAYLOAD" >> pg_notify.log'   --mode simple
--- docker compose exec -it postgres psql -U postgres -d postgres -c "NOTIFY user_updates, 'optional_payload';"
+-- Usage example:
+--   DATABASE_URL=$DATABASE_URL pgx listen -C user_updates shell --command 'echo "[$PGX_CHANNEL] $PGX_PAYLOAD" >> pg_notify.log' --mode simple
+--   docker compose exec -it postgres psql -U postgres -d postgres -c "NOTIFY user_updates, 'optional_payload';"

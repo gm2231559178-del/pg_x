@@ -632,12 +632,15 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
         );
     }
 
-    // Slot lifecycle (once, before the retry loop)
+    // Slot lifecycle (once, before the retry loop).
+    // Temporary slots are created by the replication client itself.
     if args.reset_slot {
         warn!(slot = %args.slot, "Dropping slot (--reset-slot)");
         slot::drop_slot(&mgmt_client, &args.slot).await?;
     }
-    slot::ensure_slot(&mgmt_client, &args.slot, args.temporary).await?;
+    if !args.temporary {
+        slot::ensure_slot(&mgmt_client, &args.slot, false).await?;
+    }
     info!(slot = %args.slot, "Slot ready");
 
     // ── 3. Build the base ReplicationConfig (cloned per attempt) ─────────────
@@ -659,6 +662,7 @@ pub async fn run(base_url: String, args: ReplicateArgs) -> Result<()> {
         slot: args.slot.clone(),
         publication: pub_names.clone(),
         start_lsn: initial_lsn,
+        temporary: args.temporary,
         ..Default::default()
     };
 

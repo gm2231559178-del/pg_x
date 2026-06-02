@@ -11,11 +11,6 @@ pub struct BackendMessage {
     pub payload: Bytes,
 }
 
-#[allow(dead_code)]
-pub async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> ReplResult<BackendMessage> {
-    read_backend_message_into(rd, &mut BytesMut::new()).await
-}
-
 pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
     rd: &mut R,
     buf: &mut BytesMut,

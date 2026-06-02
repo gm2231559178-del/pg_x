@@ -66,11 +66,6 @@ pub fn write_excel(
     let fmt_even = Format::new().set_background_color(Color::RGB(0xDD_EA_F1));
     let fmt_odd = Format::new();
 
-    #[allow(unused)]
-    let fmt_null = Format::new()
-        .set_font_color(Color::RGB(0xAA_AA_AA))
-        .set_italic();
-
     // ─────────────────────────────────────────────────────────────────────────
     // Sheets
     // ─────────────────────────────────────────────────────────────────────────

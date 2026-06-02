@@ -108,7 +108,7 @@ pub enum ForwardMode {
 
 /// Exponential backoff with ±20% jitter. Shift is clamped to avoid u64 overflow.
 fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> std::time::Duration {
-    let shift = (attempt - 1).min(62);
+    let shift = attempt.saturating_sub(1).min(62);
     let base = (base_ms.saturating_mul(1u64 << shift)).min(max_ms);
     let jitter = base / 5;
     let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));

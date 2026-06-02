@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-features -- -D warnings
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        features:
+          - ""
+          - "--no-default-features"
+        include:
+          - os: ubuntu-latest
+            features: "--all-features"
+            deps: sudo apt-get update && sudo apt-get install -y librdkafka-dev
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install system dependencies
+        if: matrix.deps
+        run: ${{ matrix.deps }}
+
+      - name: Build
+        run: cargo build --release ${{ matrix.features }}
+
+      - name: Check (no release)
+        run: cargo check ${{ matrix.features }}

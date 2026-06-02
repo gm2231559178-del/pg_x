@@ -62,17 +62,15 @@ pub async fn ensure_slot(client: &Client, slot_name: &str, temporary: bool) -> R
         return Ok(());
     }
 
-    // Create the slot using simple_query with the slot name validated and
-    // identifier-quoted to prevent SQL injection.
-    let escaped = sql_ident(slot_name);
+    // Use the SQL function (works from any connection).
     let sql = if temporary {
-        format!("CREATE_REPLICATION_SLOT {escaped} TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT")
+        "SELECT pg_create_logical_replication_slot($1, 'pgoutput', true)"
     } else {
-        format!("CREATE_REPLICATION_SLOT {escaped} LOGICAL pgoutput NOEXPORT_SNAPSHOT")
+        "SELECT pg_create_logical_replication_slot($1, 'pgoutput', false)"
     };
 
     client
-        .simple_query(&sql)
+        .query(sql, &[&slot_name])
         .await
         .with_context(|| format!("Failed to create replication slot '{slot_name}'"))?;
 
@@ -95,19 +93,12 @@ pub async fn drop_slot(client: &Client, slot_name: &str) -> Result<()> {
         return Ok(());
     }
 
-    let escaped = sql_ident(slot_name);
     client
-        .simple_query(&format!("DROP_REPLICATION_SLOT {escaped}"))
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot_name])
         .await
         .with_context(|| format!("Failed to drop replication slot '{slot_name}'"))?;
 
     Ok(())
-}
-
-/// Quote a PostgreSQL identifier safely.
-/// Doubles any embedded double-quote characters and wraps in double quotes.
-fn sql_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// List all logical replication slots on the server.

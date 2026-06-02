@@ -53,9 +53,6 @@ impl<'a> Buf<'a> {
         self.pos += 1;
         Ok(b)
     }
-    fn read_i8(&mut self) -> Result<i8> {
-        Ok(self.read_u8()? as i8)
-    }
     fn read_u16(&mut self) -> Result<u16> {
         self.ensure(2)?;
         let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
@@ -188,7 +185,7 @@ fn decode_begin(buf: &mut Buf<'_>) -> Result<Option<WalEvent>> {
 // ── Commit ─────────────────────────────────────────────────────────────────
 
 fn decode_commit(buf: &mut Buf<'_>) -> Result<Option<WalEvent>> {
-    let _flags = buf.read_i8()?;
+    let _flags = buf.read_u8()? as i8;
     let lsn = buf.read_u64()?;
     let end_lsn = buf.read_u64()?;
     let commit_time = buf.read_i64()?;

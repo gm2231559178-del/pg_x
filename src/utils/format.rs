@@ -40,6 +40,9 @@ impl RowSet {
         let mut result_rows: Vec<Vec<String>> = Vec::with_capacity(take);
 
         for (ri, row) in rows.iter().enumerate() {
+            if result_rows.len() >= take {
+                break;
+            }
             let cells: Vec<String> = (0..columns.len())
                 .map(|i| pg_cell_to_string(row, i))
                 .collect();

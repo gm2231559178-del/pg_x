@@ -47,6 +47,7 @@ pub struct ReplicationConfig {
     pub slot: String,
     pub publication: String,
     pub start_lsn: Lsn,
+    pub temporary: bool,
     pub status_interval_secs: u64,
     pub idle_wakeup_secs: u64,
     pub buffer_events: usize,
@@ -63,6 +64,7 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("slot", &self.slot)
             .field("publication", &self.publication)
             .field("start_lsn", &self.start_lsn)
+            .field("temporary", &self.temporary)
             .field("status_interval_secs", &self.status_interval_secs)
             .field("idle_wakeup_secs", &self.idle_wakeup_secs)
             .field("buffer_events", &self.buffer_events)
@@ -81,6 +83,7 @@ impl Default for ReplicationConfig {
             slot: "pgx_slot".into(),
             publication: "pgx_pub".into(),
             start_lsn: Lsn::ZERO,
+            temporary: false,
             status_interval_secs: 10,
             idle_wakeup_secs: 10,
             buffer_events: 8192,
@@ -293,6 +296,9 @@ impl Worker {
         let mut stream = BufReader::with_capacity(128 * 1024, stream);
         self.startup(&mut stream).await?;
         self.authenticate(&mut stream).await?;
+        if self.cfg.temporary {
+            self.create_temp_slot(&mut stream).await?;
+        }
         self.start_replication(&mut stream).await?;
         self.stream_loop(&mut stream).await
     }
@@ -438,6 +444,27 @@ impl Worker {
                 b'W' => return Ok(()), // CopyBothResponse — streaming begins
                 b'E' => return Err(ReplError::Server(parse_error_response(&msg.payload))),
                 b'N' | b'S' | b'K' => {} // Notice, ParameterStatus, BackendKeyData
+                _ => {}
+            }
+        }
+    }
+
+    // ── Temporary slot creation ───────────────────────────────────────────────
+
+    async fn create_temp_slot<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+    ) -> ReplResult<()> {
+        let escaped = self.cfg.slot.replace('"', "\"\"");
+        let sql = format!(
+            "CREATE_REPLICATION_SLOT \"{escaped}\" TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT"
+        );
+        write_query(stream, &sql).await?;
+        loop {
+            let msg = read_backend_message_into(stream, &mut BytesMut::new()).await?;
+            match msg.tag {
+                b'Z' => return Ok(()),
+                b'E' => return Err(ReplError::Server(parse_error_response(&msg.payload))),
                 _ => {}
             }
         }

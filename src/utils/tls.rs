@@ -45,21 +45,4 @@ pub fn build_tls(use_tls: bool) -> anyhow::Result<TlsConnector> {
     }
 }
 
-/// Connect to Postgres using the provided TLS connector.
-#[allow(dead_code)]
-pub async fn connect_with_tls(
-    url: &str,
-    tls: TlsConnector,
-) -> anyhow::Result<tokio_postgres::Client> {
-    let (client, connection) = tokio_postgres::connect(url, tls)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {url}: {e}"))?;
 
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::error!(error = %e, "postgres connection error");
-        }
-    });
-
-    Ok(client)
-}

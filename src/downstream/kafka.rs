@@ -1,4 +1,5 @@
 #[cfg(feature = "kafka")]
+#[allow(clippy::module_inception)]
 pub mod kafka {
     use anyhow::{Context, Result};
     use async_trait::async_trait;

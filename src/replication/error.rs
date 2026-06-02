@@ -11,6 +11,7 @@ pub enum ReplError {
     Server(String),
     #[error("authentication error: {0}")]
     Auth(String),
+    #[allow(dead_code)]
     #[error("task error: {0}")]
     Task(String),
 }

@@ -11,11 +11,13 @@ pub enum ReplicationCopyData {
     XLogData {
         wal_start: Lsn,
         wal_end: Lsn,
+        #[allow(dead_code)]
         server_time_micros: i64,
         data: Bytes,
     },
     KeepAlive {
         wal_end: Lsn,
+        #[allow(dead_code)]
         server_time_micros: i64,
         reply_requested: bool,
     },

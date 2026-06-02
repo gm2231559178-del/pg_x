@@ -31,6 +31,7 @@ pub enum ColVal {
     Unchanged,
 }
 
+#[allow(dead_code)]
 impl ColVal {
     /// Returns `true` if the column was not sent by the server.
     pub fn is_unchanged(&self) -> bool {
@@ -155,6 +156,7 @@ pub struct ColumnDef {
     pub type_modifier: i32,
 }
 
+#[allow(dead_code)]
 impl WalEvent {
     pub fn op_label(&self) -> &'static str {
         match self {

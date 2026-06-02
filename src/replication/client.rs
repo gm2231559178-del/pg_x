@@ -107,6 +107,7 @@ pub enum ReplicationEvent {
     },
     /// Raw WAL data (pgoutput bytes for Insert/Update/Delete/Relation/etc.).
     XLogData {
+        #[allow(dead_code)]
         wal_start: Lsn,
         wal_end: Lsn,
         data: bytes::Bytes,

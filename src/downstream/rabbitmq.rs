@@ -1,4 +1,5 @@
 #[cfg(feature = "rabbitmq")]
+#[allow(clippy::module_inception)]
 pub mod rabbitmq {
     use anyhow::{Context, Result};
     use async_trait::async_trait;
@@ -163,7 +164,7 @@ pub mod rabbitmq {
 
                 for (k, v) in &r.rabbitmq_headers {
                     fields.insert(
-                        ShortString::try_from(k.clone()).context("AMQP header key too long")?,
+                        ShortString::from(k.clone()),
                         AMQPValue::LongString(v.clone().into()),
                     );
                 }

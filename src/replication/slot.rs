@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use tokio_postgres::Client;
 
 /// Information about an existing replication slot.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SlotInfo {
     pub name: String,
@@ -19,14 +20,10 @@ pub struct SlotInfo {
 fn validate_slot_name(name: &str) -> Result<()> {
     let first = name.chars().next().unwrap_or('\0');
     if !first.is_ascii_alphabetic() && first != '_' {
-        bail!(
-            "Invalid slot name '{name}': must start with a letter or underscore"
-        );
+        bail!("Invalid slot name '{name}': must start with a letter or underscore");
     }
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        bail!(
-            "Invalid slot name '{name}': only letters, digits, and underscores are allowed"
-        );
+        bail!("Invalid slot name '{name}': only letters, digits, and underscores are allowed");
     }
     Ok(())
 }
@@ -102,6 +99,7 @@ pub async fn drop_slot(client: &Client, slot_name: &str) -> Result<()> {
 }
 
 /// List all logical replication slots on the server.
+#[allow(dead_code)]
 pub async fn list_slots(client: &Client) -> Result<Vec<SlotInfo>> {
     let rows = client
         .query(

@@ -5,7 +5,7 @@ mod utils;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use commands::{doctor, export, info, listen, psql, query, replicate};
+use commands::{doctor, export, info, listen, profiles, psql, query, replicate};
 use utils::config::Config;
 
 /// pgx — PostgreSQL power CLI (beyond psql & pg_*)
@@ -68,6 +68,9 @@ enum Commands {
 
     /// Diagnose your pgx installation and environment
     Doctor(doctor::DoctorArgs),
+
+    /// Manage pgx connection profiles
+    Profiles(profiles::ProfilesArgs),
 }
 
 #[tokio::main]
@@ -99,9 +102,11 @@ async fn main() -> Result<()> {
     // Doctor handles its own URL internally (no URL required for diagnosis).
     let cfg = Config::load()?;
 
-    // ── Doctor: handle separately (no URL required, uses cli flags directly) ─
-    if let Commands::Doctor(args) = &cli.command {
-        return doctor::run(args, cli.url.clone(), cli.connection.clone()).await;
+    // ── Commands that don't need a URL ──────────────────────────────────────
+    match &cli.command {
+        Commands::Doctor(d) => return doctor::run(d, cli.url.clone(), cli.connection.clone()).await,
+        Commands::Profiles(p) => return profiles::run(p),
+        _ => {}
     }
 
     // ── Resolve connection URL and dispatch ──────────────────────────────────
@@ -115,6 +120,6 @@ async fn main() -> Result<()> {
         Commands::Listen(args) => listen::run(url, args, conn, cli.tls).await,
         Commands::Replicate(args) => replicate::run(url, args, conn, cli.tls).await,
         Commands::Psql(args) => psql::run(url, args),
-        Commands::Doctor(_) => unreachable!(),
+        _ => unreachable!(),
     }
 }

@@ -404,7 +404,9 @@ async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<Arc<dyn WalS
         ReplicateDownstreamCommand::Shell(a) => {
             let command = a.command.as_deref().unwrap_or_default();
             if command.is_empty() {
-                anyhow::bail!("Shell command is required — provide --command or add sink.command in config");
+                anyhow::bail!(
+                    "Shell command is required — provide --command or add sink.command in config"
+                );
             }
             Ok(Arc::new(ShellWalSink {
                 command: command.to_string(),
@@ -662,23 +664,43 @@ pub async fn run(
         // Merge downstream sink defaults from config into CLI subcommand args.
         if let Some(sink_cfg) = &cfg.sink {
             match (&mut args.downstream, sink_cfg) {
-                (ReplicateDownstreamCommand::Stdout(a), DownstreamSinkKind::Stdout { pretty: Some(p) }) => {
+                (
+                    ReplicateDownstreamCommand::Stdout(a),
+                    DownstreamSinkKind::Stdout { pretty: Some(p) },
+                ) => {
                     a.pretty = *p;
                 }
-                (ReplicateDownstreamCommand::Stdout(_), DownstreamSinkKind::Stdout { pretty: None }) => {}
-                (ReplicateDownstreamCommand::Shell(a), DownstreamSinkKind::Shell { command, .. }) => {
+                (
+                    ReplicateDownstreamCommand::Stdout(_),
+                    DownstreamSinkKind::Stdout { pretty: None },
+                ) => {}
+                (
+                    ReplicateDownstreamCommand::Shell(a),
+                    DownstreamSinkKind::Shell { command, .. },
+                ) => {
                     if a.command.is_none() {
                         a.command = Some(command.clone());
                     }
                 }
                 #[cfg(feature = "webhook")]
-                (ReplicateDownstreamCommand::Webhook(a), DownstreamSinkKind::Webhook { url, .. }) => {
+                (
+                    ReplicateDownstreamCommand::Webhook(a),
+                    DownstreamSinkKind::Webhook { url, .. },
+                ) => {
                     if a.url.is_none() {
                         a.url = Some(url.clone());
                     }
                 }
                 #[cfg(feature = "rabbitmq")]
-                (ReplicateDownstreamCommand::Rabbitmq(a), DownstreamSinkKind::Rabbitmq { amqp_url, exchange, routing_key, .. }) => {
+                (
+                    ReplicateDownstreamCommand::Rabbitmq(a),
+                    DownstreamSinkKind::Rabbitmq {
+                        amqp_url,
+                        exchange,
+                        routing_key,
+                        ..
+                    },
+                ) => {
                     if let Some(u) = amqp_url {
                         a.amqp_url = u.clone();
                     }
@@ -690,7 +712,10 @@ pub async fn run(
                     }
                 }
                 #[cfg(feature = "kafka")]
-                (ReplicateDownstreamCommand::Kafka(a), DownstreamSinkKind::Kafka { brokers, topic, .. }) => {
+                (
+                    ReplicateDownstreamCommand::Kafka(a),
+                    DownstreamSinkKind::Kafka { brokers, topic, .. },
+                ) => {
                     if let Some(b) = brokers {
                         a.brokers = b.clone();
                     }

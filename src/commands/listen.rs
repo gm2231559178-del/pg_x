@@ -115,7 +115,9 @@ impl std::str::FromStr for ForwardMode {
         match s.to_lowercase().as_str() {
             "simple" => Ok(Self::Simple),
             "contract" => Ok(Self::Contract),
-            other => Err(format!("unknown forward mode '{other}'; expected simple|contract")),
+            other => Err(format!(
+                "unknown forward mode '{other}'; expected simple|contract"
+            )),
         }
     }
 }
@@ -180,7 +182,15 @@ pub async fn run(
                     }
                 }
                 #[cfg(feature = "rabbitmq")]
-                (DownstreamCommand::Rabbitmq(a), DownstreamSinkKind::Rabbitmq { amqp_url, exchange, routing_key, mode }) => {
+                (
+                    DownstreamCommand::Rabbitmq(a),
+                    DownstreamSinkKind::Rabbitmq {
+                        amqp_url,
+                        exchange,
+                        routing_key,
+                        mode,
+                    },
+                ) => {
                     if let Some(u) = amqp_url {
                         a.amqp_url = u.clone();
                     }
@@ -197,7 +207,14 @@ pub async fn run(
                     }
                 }
                 #[cfg(feature = "kafka")]
-                (DownstreamCommand::Kafka(a), DownstreamSinkKind::Kafka { brokers, topic, mode }) => {
+                (
+                    DownstreamCommand::Kafka(a),
+                    DownstreamSinkKind::Kafka {
+                        brokers,
+                        topic,
+                        mode,
+                    },
+                ) => {
                     if let Some(b) = brokers {
                         a.brokers = b.clone();
                     }
@@ -459,9 +476,7 @@ async fn build_downstream(cmd: &DownstreamCommand) -> Result<Arc<dyn Downstream>
             let headers: HashMap<String, String> = a.headers.iter().cloned().collect();
             match a.mode {
                 ForwardMode::Simple => Ok(Arc::new(SimpleWebhookDownstream::new(url))),
-                ForwardMode::Contract => {
-                    Ok(Arc::new(ContractWebhookDownstream::new(url, headers)))
-                }
+                ForwardMode::Contract => Ok(Arc::new(ContractWebhookDownstream::new(url, headers))),
             }
         }
 
@@ -469,7 +484,9 @@ async fn build_downstream(cmd: &DownstreamCommand) -> Result<Arc<dyn Downstream>
             use crate::downstream::shell::shell::ShellDownstream;
             let command = a.command.as_deref().unwrap_or_default();
             if command.is_empty() {
-                anyhow::bail!("Shell command is required — provide --command or add sink.command in config");
+                anyhow::bail!(
+                    "Shell command is required — provide --command or add sink.command in config"
+                );
             }
             let base_env: HashMap<String, String> = a.envs.iter().cloned().collect();
             let contract_mode = matches!(a.mode, ForwardMode::Contract);

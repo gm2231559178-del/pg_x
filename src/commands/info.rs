@@ -26,6 +26,10 @@ pub struct InfoArgs {
     /// Show logical replication slots
     #[arg(long)]
     pub slots: bool,
+
+    /// Show publications and their tables
+    #[arg(long)]
+    pub publications: bool,
 }
 
 pub async fn run(url: String, args: InfoArgs, use_tls: bool) -> Result<()> {
@@ -121,6 +125,39 @@ pub async fn run(url: String, args: InfoArgs, use_tls: bool) -> Result<()> {
                     s.confirmed_flush_lsn.as_deref().unwrap_or("-").dimmed(),
                     s.restart_lsn.as_deref().unwrap_or("-").dimmed(),
                 );
+            }
+        }
+    }
+
+    if args.publications {
+        println!("\n{}", "── Publications ──".cyan().bold());
+        let rows = client
+            .query(
+                "SELECT p.pubname, COALESCE(puballtables, false), \
+                 (SELECT string_agg(n.nspname || '.' || c.relname, ', ' ORDER BY n.nspname, c.relname) \
+                  FROM pg_publication_rel pr \
+                  JOIN pg_class c ON c.oid = pr.prrelid \
+                  JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE pr.prpubid = p.oid) AS tables \
+                 FROM pg_publication p ORDER BY p.pubname",
+                &[],
+            )
+            .await?;
+        if rows.is_empty() {
+            println!("  {}", "(no publications)".dimmed());
+        } else {
+            for r in &rows {
+                let name: String = r.get(0);
+                let all_tables: bool = r.get(1);
+                let tables: Option<String> = r.get(2);
+                let info = if all_tables {
+                    "ALL TABLES".green().to_string()
+                } else if let Some(t) = tables {
+                    t.dimmed().to_string()
+                } else {
+                    "(no tables)".dimmed().to_string()
+                };
+                println!("  {:<30}  {}", name.yellow(), info);
             }
         }
     }

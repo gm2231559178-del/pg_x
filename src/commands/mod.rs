@@ -1,3 +1,4 @@
+pub mod doctor;
 pub mod export;
 pub mod info;
 pub mod listen;

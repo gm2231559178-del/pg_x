@@ -223,7 +223,12 @@ pub async fn run(url: String, args: InfoArgs, use_tls: bool) -> Result<()> {
                 Some(u) => format!("{} {}", setting, u),
                 None => setting,
             };
-            println!("  {:<40} {}  [{}]", name.yellow(), val.cyan(), context.dimmed());
+            println!(
+                "  {:<40} {}  [{}]",
+                name.yellow(),
+                val.cyan(),
+                context.dimmed()
+            );
         }
     }
 

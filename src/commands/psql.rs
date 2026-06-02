@@ -41,12 +41,13 @@ pub fn run(url: String, args: PsqlArgs) -> Result<()> {
 
 fn which_psql() -> Result<String> {
     // Check common locations
-    for candidate in &["psql", "/usr/bin/psql", "/usr/local/bin/psql", "/opt/homebrew/bin/psql"] {
-        if Command::new(candidate)
-            .arg("--version")
-            .output()
-            .is_ok()
-        {
+    for candidate in &[
+        "psql",
+        "/usr/bin/psql",
+        "/usr/local/bin/psql",
+        "/opt/homebrew/bin/psql",
+    ] {
+        if Command::new(candidate).arg("--version").output().is_ok() {
             return Ok(candidate.to_string());
         }
     }

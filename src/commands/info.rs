@@ -34,6 +34,18 @@ pub struct InfoArgs {
     /// Show installed extensions
     #[arg(long)]
     pub extensions: bool,
+
+    /// Show indexes in current database
+    #[arg(long)]
+    pub indexes: bool,
+
+    /// Show user-defined functions/procedures
+    #[arg(long)]
+    pub functions: bool,
+
+    /// Show PostgreSQL configuration settings
+    #[arg(long)]
+    pub settings: bool,
 }
 
 pub async fn run(url: String, args: InfoArgs, use_tls: bool) -> Result<()> {
@@ -188,6 +200,92 @@ pub async fn run(url: String, args: InfoArgs, use_tls: bool) -> Result<()> {
                     name.yellow(),
                     version,
                     schema.dimmed(),
+                );
+            }
+        }
+    }
+
+    if args.settings {
+        println!("\n{}", "── Settings ──".cyan().bold());
+        let rows = client
+            .query(
+                "SELECT name, setting, unit, context \
+                 FROM pg_settings ORDER BY name",
+                &[],
+            )
+            .await?;
+        for r in &rows {
+            let name: String = r.get(0);
+            let setting: String = r.get(1);
+            let unit: Option<String> = r.get(2);
+            let context: String = r.get(3);
+            let val = match unit {
+                Some(u) => format!("{} {}", setting, u),
+                None => setting,
+            };
+            println!("  {:<40} {}  [{}]", name.yellow(), val.cyan(), context.dimmed());
+        }
+    }
+
+    if args.indexes {
+        println!("\n{}", "── Indexes ──".cyan().bold());
+        let rows = client
+            .query(
+                "SELECT schemaname, tablename, indexname, pg_size_pretty(pg_relation_size(indexrelid)) \
+                 FROM pg_indexes \
+                 WHERE schemaname NOT IN ('pg_catalog','information_schema') \
+                 ORDER BY schemaname, tablename, indexname",
+                &[],
+            )
+            .await?;
+        if rows.is_empty() {
+            println!("  {}", "(no indexes)".dimmed());
+        } else {
+            for r in &rows {
+                let schema: String = r.get(0);
+                let table: String = r.get(1);
+                let index: String = r.get(2);
+                let size: String = r.get(3);
+                println!(
+                    "  {}.{}  →  {}  [{}]",
+                    schema.dimmed(),
+                    table,
+                    index.yellow(),
+                    size.dimmed(),
+                );
+            }
+        }
+    }
+
+    if args.functions {
+        println!("\n{}", "── Functions ──".cyan().bold());
+        let rows = client
+            .query(
+                "SELECT n.nspname, p.proname, pg_get_function_arguments(p.oid), \
+                        CASE WHEN p.prorettype = 0 THEN 'trigger' \
+                             ELSE format_type(p.prorettype, NULL) END AS return_type \
+                 FROM pg_proc p \
+                 JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname NOT IN ('pg_catalog','information_schema') \
+                   AND p.prokind IN ('f', 'p') \
+                 ORDER BY n.nspname, p.proname",
+                &[],
+            )
+            .await?;
+        if rows.is_empty() {
+            println!("  {}", "(no user functions)".dimmed());
+        } else {
+            for r in &rows {
+                let schema: String = r.get(0);
+                let name: String = r.get(1);
+                let args: String = r.get(2);
+                let ret: String = r.get(3);
+                println!(
+                    "  {}.{}({})  → {}",
+                    schema.dimmed(),
+                    name.yellow(),
+                    args.dimmed(),
+                    ret,
                 );
             }
         }

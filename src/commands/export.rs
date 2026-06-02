@@ -114,11 +114,7 @@ pub async fn run(url: String, args: ExportArgs) -> Result<()> {
         }
 
         if rows.is_empty() {
-            println!(
-                "  {} «{}» — no rows returned",
-                "⚠".yellow(),
-                block.sheet
-            );
+            println!("  {} «{}» — no rows returned", "⚠".yellow(), block.sheet);
             continue;
         }
 
@@ -145,9 +141,14 @@ pub async fn run(url: String, args: ExportArgs) -> Result<()> {
     match args.format {
         #[cfg(feature = "excel")]
         OutputFormat::Excel => {
-            let refs: Vec<(&str, &RowSet)> =
-                results.iter().map(|(n, r)| (n.as_str(), r)).collect();
-            write_excel(&refs, &out_path, args.freeze_header, args.autofit, args.stripe)?;
+            let refs: Vec<(&str, &RowSet)> = results.iter().map(|(n, r)| (n.as_str(), r)).collect();
+            write_excel(
+                &refs,
+                &out_path,
+                args.freeze_header,
+                args.autofit,
+                args.stripe,
+            )?;
         }
         OutputFormat::Csv => {
             let (_, rowset) = &results[0];
@@ -167,10 +168,7 @@ pub async fn run(url: String, args: ExportArgs) -> Result<()> {
             results.len(),
         );
     }
-    println!(
-        "  {}",
-        out_path.display().to_string().underline()
-    );
+    println!("  {}", out_path.display().to_string().underline());
 
     Ok(())
 }

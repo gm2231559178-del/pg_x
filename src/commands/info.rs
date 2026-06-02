@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
 
+use crate::replication::slot::list_slots;
 use crate::utils::db::connect;
 
 #[derive(Args, Debug)]
@@ -21,6 +22,10 @@ pub struct InfoArgs {
     /// Show server version and settings
     #[arg(long, default_value_t = true)]
     pub version: bool,
+
+    /// Show logical replication slots
+    #[arg(long)]
+    pub slots: bool,
 }
 
 pub async fn run(url: String, args: InfoArgs) -> Result<()> {
@@ -92,6 +97,31 @@ pub async fn run(url: String, args: InfoArgs) -> Result<()> {
                 app.unwrap_or_default().dimmed(),
                 state.unwrap_or_default().green(),
             );
+        }
+    }
+
+    if args.slots {
+        println!("\n{}", "── Replication Slots ──".cyan().bold());
+        let slots = list_slots(&client).await?;
+        if slots.is_empty() {
+            println!("  {}", "(no logical replication slots)".dimmed());
+        } else {
+            for s in &slots {
+                let status = if s.active {
+                    "active".green()
+                } else {
+                    "inactive".dimmed()
+                };
+                println!(
+                    "  {:<30}  plugin={:<12}  db={:<12}  {}  flush={}  restart={}",
+                    s.name.yellow(),
+                    s.plugin,
+                    s.database.as_deref().unwrap_or("-"),
+                    status,
+                    s.confirmed_flush_lsn.as_deref().unwrap_or("-").dimmed(),
+                    s.restart_lsn.as_deref().unwrap_or("-").dimmed(),
+                );
+            }
         }
     }
 

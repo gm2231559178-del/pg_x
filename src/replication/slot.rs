@@ -4,13 +4,14 @@ use anyhow::{bail, Context, Result};
 use tokio_postgres::Client;
 
 /// Information about an existing replication slot.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SlotInfo {
     pub name: String,
     pub plugin: String,
-    pub confirmed_flush_lsn: Option<String>,
+    pub database: Option<String>,
     pub active: bool,
+    pub confirmed_flush_lsn: Option<String>,
+    pub restart_lsn: Option<String>,
 }
 
 /// Validate a replication slot name.
@@ -99,11 +100,11 @@ pub async fn drop_slot(client: &Client, slot_name: &str) -> Result<()> {
 }
 
 /// List all logical replication slots on the server.
-#[allow(dead_code)]
 pub async fn list_slots(client: &Client) -> Result<Vec<SlotInfo>> {
     let rows = client
         .query(
-            "SELECT slot_name, plugin, confirmed_flush_lsn::text, active \
+            "SELECT slot_name, plugin, database, active, \
+                    confirmed_flush_lsn::text, restart_lsn::text \
              FROM pg_replication_slots \
              WHERE slot_type = 'logical' \
              ORDER BY slot_name",
@@ -117,8 +118,10 @@ pub async fn list_slots(client: &Client) -> Result<Vec<SlotInfo>> {
         .map(|row| SlotInfo {
             name: row.get("slot_name"),
             plugin: row.get("plugin"),
-            confirmed_flush_lsn: row.get("confirmed_flush_lsn"),
+            database: row.get("database"),
             active: row.get("active"),
+            confirmed_flush_lsn: row.get("confirmed_flush_lsn"),
+            restart_lsn: row.get("restart_lsn"),
         })
         .collect())
 }

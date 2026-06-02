@@ -103,7 +103,9 @@ impl std::str::FromStr for OpFilter {
             "update" => Ok(Self::Update),
             "delete" => Ok(Self::Delete),
             "truncate" => Ok(Self::Truncate),
-            other => Err(format!("unknown op filter '{other}'; expected insert|update|delete|truncate")),
+            other => Err(format!(
+                "unknown op filter '{other}'; expected insert|update|delete|truncate"
+            )),
         }
     }
 }
@@ -612,7 +614,12 @@ fn log_event(event: &WalEvent, lsn_str: &str) {
 // Main entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn run(base_url: String, mut args: ReplicateArgs, conn: Option<&Connection>) -> Result<()> {
+pub async fn run(
+    base_url: String,
+    mut args: ReplicateArgs,
+    conn: Option<&Connection>,
+    use_tls: bool,
+) -> Result<()> {
     // Merge connection-level defaults into CLI args (CLI wins).
     if let Some(cfg) = conn.and_then(|c| c.replicate.as_ref()) {
         if args.slot == "pgx_slot" && cfg.slot.is_some() {
@@ -702,6 +709,7 @@ pub async fn run(base_url: String, mut args: ReplicateArgs, conn: Option<&Connec
         publication: pub_names.clone(),
         start_lsn: initial_lsn,
         temporary: args.temporary,
+        use_tls,
         ..Default::default()
     };
 

@@ -48,6 +48,7 @@ pub struct ReplicationConfig {
     pub publication: String,
     pub start_lsn: Lsn,
     pub temporary: bool,
+    pub use_tls: bool,
     pub status_interval_secs: u64,
     pub idle_wakeup_secs: u64,
     pub buffer_events: usize,
@@ -65,6 +66,7 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("publication", &self.publication)
             .field("start_lsn", &self.start_lsn)
             .field("temporary", &self.temporary)
+            .field("use_tls", &self.use_tls)
             .field("status_interval_secs", &self.status_interval_secs)
             .field("idle_wakeup_secs", &self.idle_wakeup_secs)
             .field("buffer_events", &self.buffer_events)
@@ -84,6 +86,7 @@ impl Default for ReplicationConfig {
             publication: "pgx_pub".into(),
             start_lsn: Lsn::ZERO,
             temporary: false,
+            use_tls: false,
             status_interval_secs: 10,
             idle_wakeup_secs: 10,
             buffer_events: 8192,
@@ -286,8 +289,72 @@ impl Worker {
     async fn run(&mut self) -> ReplResult<()> {
         let tcp = TcpStream::connect((self.cfg.host.as_str(), self.cfg.port)).await?;
         tcp.set_nodelay(true)?;
-        let mut stream = tcp;
-        self.run_on_stream(&mut stream).await
+
+        #[cfg(feature = "tls")]
+        if self.cfg.use_tls {
+            let mut tls_stream = self.negotiate_tls(tcp).await?;
+            return self.run_on_stream(&mut tls_stream).await;
+        }
+
+        #[cfg(not(feature = "tls"))]
+        if self.cfg.use_tls {
+            return Err(ReplError::Protocol(
+                "TLS support not enabled. Rebuild with --features tls".into(),
+            ));
+        }
+
+        let mut tcp = tcp;
+        self.run_on_stream(&mut tcp).await
+    }
+
+    /// Perform the PostgreSQL TLS handshake on an already-connected TCP stream:
+    /// 1. Send SSLRequest (Int32 8, Int32 80877103)
+    /// 2. Read the server's one-byte response ('S' = proceed, 'N' = reject)
+    /// 3. Wrap the TCP stream in a rustls TLS session
+    #[cfg(feature = "tls")]
+    async fn negotiate_tls(
+        &self,
+        mut tcp: TcpStream,
+    ) -> ReplResult<tokio_rustls::client::TlsStream<TcpStream>> {
+        use std::sync::Arc;
+
+        use tokio::io::AsyncReadExt;
+        use tokio_rustls::TlsConnector as RustlsTlsConnector;
+
+        use super::framing::write_ssl_request;
+
+        write_ssl_request(&mut tcp).await?;
+
+        let mut resp = [0u8; 1];
+        tcp.read_exact(&mut resp).await?;
+
+        match resp[0] {
+            b'S' => {} // server accepted TLS
+            b'N' => {
+                return Err(ReplError::Protocol(
+                    "PostgreSQL server does not support TLS".into(),
+                ))
+            }
+            other => {
+                return Err(ReplError::Protocol(format!(
+                    "unexpected SSLRequest response byte: 0x{other:02x}"
+                )))
+            }
+        }
+
+        let config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+
+        let connector = RustlsTlsConnector::from(Arc::new(config));
+        let domain = rustls::ServerName::try_from(self.cfg.host.as_str())
+            .map_err(|e| ReplError::Protocol(format!("invalid TLS server name: {e}")))?;
+
+        connector
+            .connect(domain, tcp)
+            .await
+            .map_err(|e| ReplError::Protocol(format!("TLS handshake failed: {e}")))
     }
 
     async fn run_on_stream<S: AsyncRead + AsyncWrite + Unpin>(
@@ -669,3 +736,5 @@ impl Worker {
         write_copy_data(stream, &payload).await
     }
 }
+
+

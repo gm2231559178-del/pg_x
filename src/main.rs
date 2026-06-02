@@ -102,6 +102,6 @@ async fn main() -> Result<()> {
         Commands::Query(args) => query::run(url, args).await,
         Commands::Info(args) => info::run(url, args).await,
         Commands::Listen(args) => listen::run(url, args, conn).await,
-        Commands::Replicate(args) => replicate::run(url, args, conn).await,
+        Commands::Replicate(args) => replicate::run(url, args, conn, cli.tls).await,
     }
 }

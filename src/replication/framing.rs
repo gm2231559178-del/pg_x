@@ -3,6 +3,25 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::error::{ReplError, ReplResult};
 
+#[cfg(feature = "tls")]
+pub const SSL_REQUEST_CODE: i32 = 80877103;
+
+/// Send an SSLRequest message.  The server replies with a single byte:
+/// - `'S'` — SSL/TLS negotiation accepted; proceed with handshake.
+/// - `'N'` — SSL not available; continue without encryption.
+#[cfg(feature = "tls")]
+pub async fn write_ssl_request<W: AsyncWrite + Unpin>(wr: &mut W) -> ReplResult<()> {
+    let buf: [u8; 8] = {
+        let mut b = [0u8; 8];
+        b[0..4].copy_from_slice(&8i32.to_be_bytes()); // length
+        b[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+        b
+    };
+    wr.write_all(&buf).await?;
+    wr.flush().await?;
+    Ok(())
+}
+
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
 #[derive(Debug, Clone)]

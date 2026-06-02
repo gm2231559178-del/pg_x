@@ -72,11 +72,19 @@ fn check_config(all_ok: &mut bool) {
     };
 
     if !path.exists() {
-        println!("  {} config file: {} (not found — using defaults)", "ℹ".cyan(), path.display().to_string().dimmed());
+        println!(
+            "  {} config file: {} (not found — using defaults)",
+            "ℹ".cyan(),
+            path.display().to_string().dimmed()
+        );
         return;
     }
 
-    print!("  {} config file: {} ... ", "✔".green(), path.display().to_string().dimmed());
+    print!(
+        "  {} config file: {} ... ",
+        "✔".green(),
+        path.display().to_string().dimmed()
+    );
 
     match Config::load() {
         Ok(cfg) => {
@@ -104,7 +112,10 @@ async fn check_connection(cli_url: Option<String>, cli_conn: Option<String>, all
         match cfg.resolve_from(cli_url, cli_conn) {
             Ok((u, _)) => u,
             Err(_) => {
-                println!("  {} database: no URL provided and no config default set", "ℹ".cyan());
+                println!(
+                    "  {} database: no URL provided and no config default set",
+                    "ℹ".cyan()
+                );
                 return;
             }
         }
@@ -127,7 +138,10 @@ async fn check_connection(cli_url: Option<String>, cli_conn: Option<String>, all
                 if w == "logical" {
                     println!("       wal_level = logical  {}", "✔".green());
                 } else {
-                    println!("       wal_level = {w}  {} (replication needs 'logical')", "⚠".yellow());
+                    println!(
+                        "       wal_level = {w}  {} (replication needs 'logical')",
+                        "⚠".yellow()
+                    );
                 }
             }
         }
@@ -148,12 +162,9 @@ fn check_system_deps(_all_ok: &mut bool) {
         let found = Command::new("ldconfig")
             .arg("-p")
             .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout).contains("librdkafka")
-            })
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("librdkafka"))
             .unwrap_or(false)
-            ||
-            Command::new("pkg-config")
+            || Command::new("pkg-config")
                 .args(["--exists", "librdkafka"])
                 .status()
                 .map(|s| s.success())

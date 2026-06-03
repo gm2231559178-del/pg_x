@@ -1,0 +1,8 @@
+type Material {
+  mat_no: String!
+  name: String!
+  status: String
+  sizes: [Size!]!
+  colorways: [Colorway!]!
+  features: [MaterialFeature!]!
+}

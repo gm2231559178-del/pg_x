@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: postgres_events
+    container_name: pgx_postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -9,7 +9,6 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # Mount the local init.sql file into the container's init folder
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,5 +17,23 @@ services:
       timeout: 5s
       retries: 5
 
+  elasticsearch:
+    image: elasticsearch:8.17.0
+    container_name: pgx_es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   pgdata:
+  esdata:

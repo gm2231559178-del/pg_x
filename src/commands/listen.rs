@@ -2,11 +2,12 @@ use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
-use crate::utils::config::{Connection, DownstreamSinkKind};
+use crate::utils::config::{Connection, DownstreamSinkKind, ResolverConfig};
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 use crate::utils::tls;
 
@@ -50,6 +51,10 @@ pub enum DownstreamCommand {
 
     /// Forward events to a shell command
     Shell(ShellArgs),
+
+    /// Execute GraphQL query and index result into Elasticsearch
+    #[cfg(feature = "elasticsearch")]
+    Elasticsearch(ElasticsearchArgs),
 }
 
 #[cfg(feature = "rabbitmq")]
@@ -103,6 +108,23 @@ pub struct ShellArgs {
     pub mode: ForwardMode,
 }
 
+#[cfg(feature = "elasticsearch")]
+#[derive(Args)]
+pub struct ElasticsearchArgs {
+    /// Elasticsearch URL.
+    #[arg(long, env = "ES_URL", default_value = "http://localhost:9200")]
+    pub es_url: String,
+    /// Elasticsearch index name.
+    #[arg(long, default_value = "pgx")]
+    pub index: String,
+    /// Field to use as document _id.
+    #[arg(long)]
+    pub id_field: Option<String>,
+    /// Schema directory (defaults to ~/.pgx/schema).
+    #[arg(long)]
+    pub schema_dir: Option<String>,
+}
+
 #[derive(Clone, ValueEnum)]
 pub enum ForwardMode {
     Simple,
@@ -141,6 +163,7 @@ pub async fn run(
     mut args: ListenArgs,
     conn: Option<&Connection>,
     use_tls: bool,
+    resolvers: &HashMap<String, ResolverConfig>,
 ) -> Result<()> {
     // Merge connection-level defaults into CLI args (CLI wins).
     if let Some(cfg) = conn.and_then(|c| c.listen.as_ref()) {
@@ -227,13 +250,37 @@ pub async fn run(
                         }
                     }
                 }
+                #[cfg(feature = "elasticsearch")]
+                (
+                    DownstreamCommand::Elasticsearch(a),
+                    DownstreamSinkKind::Elasticsearch {
+                        url,
+                        index,
+                        id_field,
+                        schema_dir,
+                    },
+                ) => {
+                    if a.es_url == "http://localhost:9200" {
+                        a.es_url = url.clone();
+                    }
+                    if a.index == "pgx" {
+                        a.index = index.clone();
+                    }
+                    if a.id_field.is_none() {
+                        a.id_field = id_field.clone();
+                    }
+                    if a.schema_dir.is_none() {
+                        a.schema_dir = schema_dir.clone();
+                    }
+                }
                 // Mismatch — CLI subcommand doesn't match config sink type; CLI wins.
                 _ => {}
             }
         }
     }
 
-    let sink: Arc<dyn Downstream> = build_downstream(&args.downstream).await?;
+    let sink: Arc<dyn Downstream> =
+        build_downstream(&args.downstream, &url, use_tls, resolvers).await?;
 
     tokio::pin!(let shutdown = shutdown_signal(););
 
@@ -432,7 +479,12 @@ pub async fn run(
     }
 }
 
-async fn build_downstream(cmd: &DownstreamCommand) -> Result<Arc<dyn Downstream>> {
+async fn build_downstream(
+    cmd: &DownstreamCommand,
+    url: &str,
+    use_tls: bool,
+    resolvers: &HashMap<String, ResolverConfig>,
+) -> Result<Arc<dyn Downstream>> {
     match cmd {
         #[cfg(feature = "rabbitmq")]
         DownstreamCommand::Rabbitmq(a) => {
@@ -495,6 +547,24 @@ async fn build_downstream(cmd: &DownstreamCommand) -> Result<Arc<dyn Downstream>
                 base_env,
                 contract_mode,
             )))
+        }
+
+        #[cfg(feature = "elasticsearch")]
+        DownstreamCommand::Elasticsearch(a) => {
+            use crate::downstream::elasticsearch::ElasticsearchDownstream;
+            use crate::graphql::pool::QueryPool;
+
+            let pool = QueryPool::connect(url, use_tls).await?;
+            let schema_dir = a.schema_dir.as_ref().map(PathBuf::from);
+            let ds = ElasticsearchDownstream::new(
+                &a.es_url,
+                &a.index,
+                a.id_field.clone(),
+                pool,
+                resolvers.clone(),
+                schema_dir,
+            )?;
+            Ok(Arc::new(ds))
         }
     }
 }

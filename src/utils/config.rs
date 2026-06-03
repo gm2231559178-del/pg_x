@@ -12,6 +12,23 @@ pub struct Config {
     /// Named connection profiles
     #[serde(default)]
     pub connections: HashMap<String, Connection>,
+
+    /// Resolver mappings for GraphQL composition
+    #[serde(default)]
+    pub resolvers: HashMap<String, ResolverConfig>,
+}
+
+/// Configuration for a single resolver — maps a GraphQL field to SQL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolverConfig {
+    /// The SQL query string (or path to a .sql file)
+    pub sql: String,
+    /// Which variable/column to bind as $1
+    pub param: Option<String>,
+    /// Column name used for DataLoader batching (ANY($1))
+    pub batch_by: Option<String>,
+    /// Optional named connection override (e.g. read replica)
+    pub connection: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,6 +139,17 @@ pub enum DownstreamSinkKind {
         topic: Option<String>,
         /// Forward mode (simple or contract).
         mode: Option<String>,
+    },
+    /// Index documents into Elasticsearch.
+    Elasticsearch {
+        /// Elasticsearch URL (e.g. http://localhost:9200).
+        url: String,
+        /// Elasticsearch index name.
+        index: String,
+        /// Optional field to use as document _id.
+        id_field: Option<String>,
+        /// Schema directory override.
+        schema_dir: Option<String>,
     },
 }
 

@@ -1,0 +1,5 @@
+type Colorway {
+  colorway_code: String!
+  name: String!
+  hex: String
+}

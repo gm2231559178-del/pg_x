@@ -73,6 +73,7 @@ pub struct ContractMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageMeta {
+    #[serde(default)]
     pub routing: RoutingSpec,
     #[serde(default = "default_schema_version")]
     pub schema_version: String,

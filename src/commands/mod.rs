@@ -1,8 +1,9 @@
 pub mod doctor;
-pub mod profiles;
 pub mod export;
+pub mod graphql;
 pub mod info;
 pub mod listen;
+pub mod profiles;
 pub mod psql;
 pub mod query;
 pub mod replicate;

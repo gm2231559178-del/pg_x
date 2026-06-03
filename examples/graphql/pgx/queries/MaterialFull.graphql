@@ -1,0 +1,24 @@
+query MaterialFull($mat_no: String!) {
+  material(mat_no: $mat_no) {
+    mat_no
+    name
+    status
+    sizes {
+      size_code
+      name
+    }
+    colorways {
+      colorway_code
+      name
+      hex
+    }
+    features {
+      feature_name
+      description
+      attribute_entries {
+        attr_name
+        attr_value
+      }
+    }
+  }
+}

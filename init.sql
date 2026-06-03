@@ -50,23 +50,48 @@ INSERT INTO colorways (colorway_code, mat_no, name, hex) VALUES
     ('BL', 'M002', 'Blue',     '#0000FF'),
     ('GY', 'M003', 'Grey',     '#808080');
 
-CREATE TABLE material_attributes (
+CREATE TABLE material_features (
+    id            SERIAL PRIMARY KEY,
+    mat_no        VARCHAR(20) NOT NULL REFERENCES materials(mat_no),
+    feature_name  VARCHAR(100) NOT NULL,
+    description   VARCHAR(200)
+);
+
+CREATE INDEX idx_features_mat_no ON material_features(mat_no);
+
+CREATE TABLE feature_attributes (
     id         SERIAL PRIMARY KEY,
-    mat_no     VARCHAR(20) NOT NULL REFERENCES materials(mat_no),
+    feature_id INTEGER NOT NULL REFERENCES material_features(id),
     attr_name  VARCHAR(50) NOT NULL,
     attr_value VARCHAR(200) NOT NULL
 );
 
-CREATE INDEX idx_attrs_mat_no ON material_attributes(mat_no);
+CREATE INDEX idx_fattrs_feature_id ON feature_attributes(feature_id);
 
-INSERT INTO material_attributes (mat_no, attr_name, attr_value) VALUES
-    ('M001', 'weight',        '200 gsm'),
-    ('M001', 'width',         '150 cm'),
-    ('M001', 'care',          'Machine wash 30°C'),
-    ('M002', 'weight',        '180 gsm'),
-    ('M002', 'width',         '120 cm'),
-    ('M002', 'care',          'Dry clean only'),
-    ('M002', 'stretch',       '4-way stretch'),
-    ('M003', 'weight',        '150 gsm'),
-    ('M003', 'width',         '160 cm'),
-    ('M003', 'water_resistant', 'yes');
+INSERT INTO material_features (mat_no, feature_name, description) VALUES
+    ('M001', 'Construction', 'Plain weave'),
+    ('M001', 'Care',         'Standard care instructions'),
+    ('M002', 'Construction', 'Knitted'),
+    ('M002', 'Certification', NULL),
+    ('M003', 'Construction', 'Twist'),
+    ('M003', 'Eco',          'Recycled materials');
+
+INSERT INTO feature_attributes (feature_id, attr_name, attr_value) VALUES
+    -- M001 Construction
+    (1, 'weave_type',   'plain'),
+    (1, 'thread_count', '120'),
+    -- M001 Care
+    (2, 'wash',  '30°C'),
+    (2, 'bleach', 'No'),
+    -- M002 Construction
+    (3, 'weave_type', 'knit'),
+    (3, 'weight',     '180 gsm'),
+    -- M002 Certification
+    (4, 'standard', 'OEKO-TEX'),
+    (4, 'class',    'I'),
+    -- M003 Construction
+    (5, 'weave_type', 'twist'),
+    (5, 'weight',     '150 gsm'),
+    -- M003 Eco
+    (6, 'recycled_content', '100%'),
+    (6, 'certification',    'GRS');

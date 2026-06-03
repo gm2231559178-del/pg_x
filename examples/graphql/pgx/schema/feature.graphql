@@ -1,0 +1,10 @@
+type MaterialFeature {
+  feature_name: String!
+  description: String
+  attribute_entries: [FeatureAttribute!]!
+}
+
+type FeatureAttribute {
+  attr_name: String!
+  attr_value: String!
+}

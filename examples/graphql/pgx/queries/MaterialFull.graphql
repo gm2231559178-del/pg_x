@@ -12,9 +12,13 @@ query MaterialFull($mat_no: String!) {
       name
       hex
     }
-    attributes {
-      attr_name
-      attr_value
+    features {
+      feature_name
+      description
+      attribute_entries {
+        attr_name
+        attr_value
+      }
     }
   }
 }

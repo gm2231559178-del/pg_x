@@ -87,10 +87,23 @@ cargo run -- graphql run MaterialFull -V mat_no=M002
         { "colorway_code": "BK", "name": "Black", "hex": "#000000" },
         { "colorway_code": "NV", "name": "Navy",  "hex": "#000080" }
       ],
-      "attributes": [
-        { "attr_name": "weight", "attr_value": "200 gsm" },
-        { "attr_name": "width",  "attr_value": "150 cm" },
-        { "attr_name": "care",   "attr_value": "Machine wash 30°C" }
+      "features": [
+        {
+          "feature_name": "Construction",
+          "description": "Plain weave",
+          "attribute_entries": [
+            { "attr_name": "weave_type",   "attr_value": "plain" },
+            { "attr_name": "thread_count", "attr_value": "120" }
+          ]
+        },
+        {
+          "feature_name": "Care",
+          "description": "Standard care instructions",
+          "attribute_entries": [
+            { "attr_name": "wash",  "attr_value": "30°C" },
+            { "attr_name": "bleach", "attr_value": "No" }
+          ]
+        }
       ]
     }
   ]
@@ -106,6 +119,7 @@ cargo run -- graphql run MaterialFull -V mat_no=M002
     material.graphql    # type Material { ... }
     size.graphql        # type Size { ... }
     colorway.graphql    # type Colorway { ... }
+    feature.graphql     # type MaterialFeature { ... }, FeatureAttribute { ... }
   queries/
-    get_material.graphql # named query with selection set
+    MaterialFull.graphql # 3-tier: material -> features -> attributes
 ```

@@ -1,4 +1,0 @@
-type MaterialAttribute {
-  attr_name: String!
-  attr_value: String!
-}

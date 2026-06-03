@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
         Commands::Export(args) => export::run(url, args, cli.tls).await,
         Commands::Query(args) => query::run(url, args, cli.tls).await,
         Commands::Info(args) => info::run(url, args, cli.tls).await,
-        Commands::Listen(args) => listen::run(url, args, conn, cli.tls).await,
+        Commands::Listen(args) => listen::run(url, args, conn, cli.tls, &cfg.resolvers).await,
         Commands::Replicate(args) => replicate::run(url, args, conn, cli.tls).await,
         Commands::Psql(args) => psql::run(url, args),
         Commands::Graphql(args) => {

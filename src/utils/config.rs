@@ -140,6 +140,17 @@ pub enum DownstreamSinkKind {
         /// Forward mode (simple or contract).
         mode: Option<String>,
     },
+    /// Index documents into Elasticsearch.
+    Elasticsearch {
+        /// Elasticsearch URL (e.g. http://localhost:9200).
+        url: String,
+        /// Elasticsearch index name.
+        index: String,
+        /// Optional field to use as document _id.
+        id_field: Option<String>,
+        /// Schema directory override.
+        schema_dir: Option<String>,
+    },
 }
 
 impl Config {

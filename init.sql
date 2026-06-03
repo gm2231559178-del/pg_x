@@ -95,3 +95,30 @@ INSERT INTO feature_attributes (feature_id, attr_name, attr_value) VALUES
     -- M003 Eco
     (6, 'recycled_content', '100%'),
     (6, 'certification',    'GRS');
+
+-- NOTIFY trigger for pgx graphql → Elasticsearch pipeline.
+-- Sends ContractMessage format on INSERT/UPDATE/DELETE of materials.
+
+CREATE OR REPLACE FUNCTION notify_material_change()
+RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify(
+    'materials',
+    json_build_object(
+      'meta', json_build_object(
+        'event_type', 'MaterialFull',
+        'schema_version', '1'
+      ),
+      'data', json_build_object(
+        'mat_no', COALESCE(NEW.mat_no, OLD.mat_no)
+      )
+    )::text
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER materials_notify
+  AFTER INSERT OR UPDATE OR DELETE ON materials
+  FOR EACH ROW
+  EXECUTE FUNCTION notify_material_change();

@@ -55,17 +55,8 @@ impl SchemaRegistry {
     }
 
     /// Parse all `.graphql` type definition files from a directory.
-    /// Each file is expected to contain type definitions like:
-    ///
-    /// ```graphql
-    /// type Material {
-    ///   mat_no: String!
-    ///   name: String!
-    ///   status: String
-    ///   sizes: [Size!]!
-    ///   colorways: [Colorway!]!
-    /// }
-    /// ```
+    /// Uses a global two-pass across all files: first collect type names for
+    /// forward-reference validation, then parse each file's bodies.
     pub fn load_from_dir(dir: &Path) -> Result<Self> {
         let mut registry = SchemaRegistry::new();
 
@@ -73,48 +64,48 @@ impl SchemaRegistry {
             return Ok(registry);
         }
 
+        // Pass 1: read all SDL content and collect global type names
+        let mut all_sdls: Vec<String> = Vec::new();
+        let mut global_type_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for entry in std::fs::read_dir(dir).context("Cannot read schema directory")? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "graphql") {
                 let content = std::fs::read_to_string(&path)
                     .with_context(|| format!("Cannot read schema file: {}", path.display()))?;
-                registry.parse_sdl(&content)?;
+                collect_type_names(&content, &mut global_type_names);
+                all_sdls.push(content);
             }
+        }
+
+        // Pass 2: parse each file with the global type names
+        for sdl in &all_sdls {
+            registry.parse_sdl_with_types(sdl, &global_type_names)?;
         }
 
         Ok(registry)
     }
 
     /// Parse inline SDL (Schema Definition Language) content.
-    /// This is a minimal parser that handles `type Name { field: Type }` blocks.
+    /// Collects type names from the SDL content itself for cross-reference validation.
+    #[allow(dead_code)]
     pub fn parse_sdl(&mut self, sdl: &str) -> Result<()> {
+        let mut type_names = std::collections::HashSet::new();
+        collect_type_names(sdl, &mut type_names);
+        self.parse_sdl_with_types(sdl, &type_names)
+    }
+
+    /// Parse SDL with a pre-collected set of type names (for cross-file resolution).
+    fn parse_sdl_with_types(
+        &mut self,
+        sdl: &str,
+        type_names: &std::collections::HashSet<String>,
+    ) -> Result<()> {
         let mut lines = sdl.lines().peekable();
-        // Two-pass: first collect all type names, then parse and cross-validate
         let mut parsed_types: Vec<(String, Vec<FieldDef>, Vec<RelationDef>)> = Vec::new();
-        let mut type_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // Pass 1: collect type names for forward references
-        let raw = sdl.to_string();
-        for mut rest in raw.lines().map(|l| l.trim()) {
-            loop {
-                rest = rest.trim_start();
-                if let Some(after_type) = rest.strip_prefix("type ") {
-                    if let Some(name) = after_type.split('{').next() {
-                        type_names.insert(name.trim().to_string());
-                    }
-                    if let Some(close_brace) = after_type.find('}') {
-                        rest = &after_type[close_brace + 1..];
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Pass 2: parse type definitions
         while let Some(line) = lines.peek() {
             let trimmed = line.trim();
             if trimmed.starts_with("type ") {
@@ -147,7 +138,7 @@ impl SchemaRegistry {
                     }
                     let body_end = close_pos.unwrap_or(after_brace.len());
                     let body = &after_brace[..body_end];
-                    let (fields, relations) = parse_fields_and_relations(body, &type_names)?;
+                    let (fields, relations) = parse_fields_and_relations(body, type_names)?;
                     parsed_types.push((type_name.to_string(), fields, relations));
                     lines.next();
                     continue;
@@ -172,7 +163,7 @@ impl SchemaRegistry {
                     body.push('\n');
                 }
 
-                let (fields, relations) = parse_fields_and_relations(&body, &type_names)?;
+                let (fields, relations) = parse_fields_and_relations(&body, type_names)?;
                 parsed_types.push((type_name.to_string(), fields, relations));
             } else {
                 lines.next();
@@ -216,6 +207,27 @@ impl SchemaRegistry {
     #[allow(dead_code)]
     pub fn has_type(&self, name: &str) -> bool {
         self.types.contains_key(name)
+    }
+}
+
+/// Extract all `type Name` definitions from SDL text into a set.
+fn collect_type_names(sdl: &str, names: &mut std::collections::HashSet<String>) {
+    for mut rest in sdl.lines().map(|l| l.trim()) {
+        loop {
+            rest = rest.trim_start();
+            if let Some(after_type) = rest.strip_prefix("type ") {
+                if let Some(name) = after_type.split('{').next() {
+                    names.insert(name.trim().to_string());
+                }
+                if let Some(close_brace) = after_type.find('}') {
+                    rest = &after_type[close_brace + 1..];
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
     }
 }
 

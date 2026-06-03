@@ -1,0 +1,4 @@
+type Size {
+  size_code: String!
+  name: String!
+}

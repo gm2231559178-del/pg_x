@@ -8,6 +8,17 @@ use super::query::{FieldSelection, NamedQuery};
 use super::row::row_to_json_value;
 use crate::utils::config::ResolverConfig;
 
+/// Convert a serde_json::Value to a string suitable for SQL $1 binding.
+fn value_to_param(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => String::new(),
+        _ => v.to_string(),
+    }
+}
+
 /// Execute a named query with given variables and return the assembled JSON document.
 /// Uses DataLoader batching for child resolvers when `batch_by` is configured.
 pub async fn execute(
@@ -75,8 +86,11 @@ async fn resolve_children_with_depth(
         };
 
         let client = pool.get().await?;
+        let param_str = value_to_param(&param_value);
+        // Single-string param — wrap in vec for ANY($1) compatibility
+        let param_vec = vec![param_str];
         let rows = client
-            .query(&resolver.sql, &[&param_value])
+            .query(&resolver.sql, &[&param_vec])
             .await
             .with_context(|| format!("Child resolver SQL failed for '{}'", field_name))?;
 
@@ -181,8 +195,9 @@ async fn execute_batched(
         };
 
         let client = pool.get().await?;
+        let param_str = value_to_param(&param_value);
         let rows = client
-            .query(&resolver.sql, &[&param_value])
+            .query(&resolver.sql, &[&param_str])
             .await
             .with_context(|| format!("Resolver SQL failed for '{}'", field_name))?;
 
@@ -288,8 +303,10 @@ async fn resolve_children_batched(
                 let param_value = obj.get(param_name).cloned().unwrap_or(Value::Null);
 
                 let client = pool.get().await?;
+                let param_str = value_to_param(&param_value);
+                let param_vec = vec![param_str];
                 let rows = client
-                    .query(&resolver.sql, &[&param_value])
+                    .query(&resolver.sql, &[&param_vec])
                     .await
                     .with_context(|| format!("Child resolver SQL failed for '{}'", field_name))?;
 

@@ -1,32 +1,51 @@
--- This runs automatically when the container starts for the first time
+-- Sample material catalog for pgx graphql demo
 
-CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(50) NOT NULL,
-    email VARCHAR(100) NOT NULL
+CREATE TABLE materials (
+    mat_no    VARCHAR(20) PRIMARY KEY,
+    name      VARCHAR(100) NOT NULL,
+    status    VARCHAR(20) NOT NULL DEFAULT 'active'
 );
 
-CREATE OR REPLACE FUNCTION notify_user_changes()
-RETURNS TRIGGER AS $$
-BEGIN
-    PERFORM pg_notify(
-        'user_updates', 
-        json_build_object(
-            'action', TG_OP,
-            'data', row_to_json(NEW)
-        )::text
-    );
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+CREATE TABLE sizes (
+    id        SERIAL PRIMARY KEY,
+    size_code VARCHAR(10) NOT NULL,
+    mat_no    VARCHAR(20) NOT NULL REFERENCES materials(mat_no),
+    name      VARCHAR(100) NOT NULL
+);
 
-CREATE OR REPLACE TRIGGER trigger_user_changes
-AFTER INSERT OR UPDATE ON users
-FOR EACH ROW
-EXECUTE FUNCTION notify_user_changes();
+CREATE INDEX idx_sizes_mat_no ON sizes(mat_no);
 
+CREATE TABLE colorways (
+    id            SERIAL PRIMARY KEY,
+    colorway_code VARCHAR(10) NOT NULL,
+    mat_no        VARCHAR(20) NOT NULL REFERENCES materials(mat_no),
+    name          VARCHAR(100) NOT NULL,
+    hex           VARCHAR(7)
+);
 
--- INSERT INTO users (username, email) VALUES ('alice', 'alice@example.com');
--- Usage example:
---   DATABASE_URL=$DATABASE_URL pgx listen -C user_updates shell --command 'echo "[$PGX_CHANNEL] $PGX_PAYLOAD" >> pg_notify.log' --mode simple
---   docker compose exec -it postgres psql -U postgres -d postgres -c "NOTIFY user_updates, 'optional_payload';"
+CREATE INDEX idx_colorways_mat_no ON colorways(mat_no);
+
+INSERT INTO materials (mat_no, name, status) VALUES
+    ('M001', 'Premium Cotton Canvas', 'active'),
+    ('M002', 'Merino Wool Blend',     'active'),
+    ('M003', 'Recycled Polyester',    'discontinued');
+
+INSERT INTO sizes (size_code, mat_no, name) VALUES
+    ('S',  'M001', 'Small'),
+    ('M',  'M001', 'Medium'),
+    ('L',  'M001', 'Large'),
+    ('XL', 'M001', 'Extra Large'),
+    ('S',  'M002', 'Small'),
+    ('M',  'M002', 'Medium'),
+    ('L',  'M002', 'Large'),
+    ('S',  'M003', 'Small'),
+    ('M',  'M003', 'Medium');
+
+INSERT INTO colorways (colorway_code, mat_no, name, hex) VALUES
+    ('WH', 'M001', 'White',    '#FFFFFF'),
+    ('BK', 'M001', 'Black',    '#000000'),
+    ('NV', 'M001', 'Navy',     '#000080'),
+    ('RD', 'M002', 'Red',      '#FF0000'),
+    ('GR', 'M002', 'Green',    '#00FF00'),
+    ('BL', 'M002', 'Blue',     '#0000FF'),
+    ('GY', 'M003', 'Grey',     '#808080');

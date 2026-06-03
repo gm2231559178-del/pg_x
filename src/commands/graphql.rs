@@ -93,12 +93,18 @@ async fn validate(
     // 5. Verify resolver SQL is valid by connecting
     let _client = connect(&url, use_tls).await?;
     for (rname, resolver) in resolvers {
-        // Try to EXPLAIN the SQL to verify syntax
+        // PREPARE validates SQL syntax without needing parameter bindings
+        let prep_name = format!("pgx_val_{}", rname);
         match _client
-            .query(&format!("EXPLAIN {}", resolver.sql), &[])
+            .query(&format!("PREPARE {} AS {}", prep_name, resolver.sql), &[])
             .await
         {
-            Ok(_) => {}
+            Ok(_) => {
+                // Clean up the prepared statement
+                let _ = _client
+                    .query(&format!("DEALLOCATE {}", prep_name), &[])
+                    .await;
+            }
             Err(e) => {
                 anyhow::bail!(
                     "Resolver '{}' has invalid SQL: {}\n  SQL: {}",

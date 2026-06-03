@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -479,6 +478,7 @@ pub async fn run(
     }
 }
 
+#[allow(unused_variables)]
 async fn build_downstream(
     cmd: &DownstreamCommand,
     url: &str,
@@ -553,6 +553,7 @@ async fn build_downstream(
         DownstreamCommand::Elasticsearch(a) => {
             use crate::downstream::elasticsearch::ElasticsearchDownstream;
             use crate::graphql::pool::QueryPool;
+            use std::path::PathBuf;
 
             let pool = QueryPool::connect(url, use_tls).await?;
             let schema_dir = a.schema_dir.as_ref().map(PathBuf::from);

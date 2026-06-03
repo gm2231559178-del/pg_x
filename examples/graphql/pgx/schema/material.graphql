@@ -4,4 +4,5 @@ type Material {
   status: String
   sizes: [Size!]!
   colorways: [Colorway!]!
+  attributes: [MaterialAttribute!]!
 }

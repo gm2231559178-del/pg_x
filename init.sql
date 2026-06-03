@@ -49,3 +49,24 @@ INSERT INTO colorways (colorway_code, mat_no, name, hex) VALUES
     ('GR', 'M002', 'Green',    '#00FF00'),
     ('BL', 'M002', 'Blue',     '#0000FF'),
     ('GY', 'M003', 'Grey',     '#808080');
+
+CREATE TABLE material_attributes (
+    id         SERIAL PRIMARY KEY,
+    mat_no     VARCHAR(20) NOT NULL REFERENCES materials(mat_no),
+    attr_name  VARCHAR(50) NOT NULL,
+    attr_value VARCHAR(200) NOT NULL
+);
+
+CREATE INDEX idx_attrs_mat_no ON material_attributes(mat_no);
+
+INSERT INTO material_attributes (mat_no, attr_name, attr_value) VALUES
+    ('M001', 'weight',        '200 gsm'),
+    ('M001', 'width',         '150 cm'),
+    ('M001', 'care',          'Machine wash 30°C'),
+    ('M002', 'weight',        '180 gsm'),
+    ('M002', 'width',         '120 cm'),
+    ('M002', 'care',          'Dry clean only'),
+    ('M002', 'stretch',       '4-way stretch'),
+    ('M003', 'weight',        '150 gsm'),
+    ('M003', 'width',         '160 cm'),
+    ('M003', 'water_resistant', 'yes');

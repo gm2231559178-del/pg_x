@@ -86,6 +86,11 @@ cargo run -- graphql run MaterialFull -V mat_no=M002
         { "colorway_code": "WH", "name": "White", "hex": "#FFFFFF" },
         { "colorway_code": "BK", "name": "Black", "hex": "#000000" },
         { "colorway_code": "NV", "name": "Navy",  "hex": "#000080" }
+      ],
+      "attributes": [
+        { "attr_name": "weight", "attr_value": "200 gsm" },
+        { "attr_name": "width",  "attr_value": "150 cm" },
+        { "attr_name": "care",   "attr_value": "Machine wash 30°C" }
       ]
     }
   ]

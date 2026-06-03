@@ -1,4 +1,5 @@
 pub mod contract;
+#[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 pub mod kafka;
 pub mod rabbitmq;

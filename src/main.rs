@@ -1,5 +1,6 @@
 mod commands;
 mod downstream;
+mod graphql;
 mod replication;
 mod utils;
 
@@ -71,6 +72,9 @@ enum Commands {
 
     /// Manage pgx connection profiles
     Profiles(profiles::ProfilesArgs),
+
+    /// GraphQL composition engine: validate and run named queries
+    Graphql(commands::graphql::GraphqlArgs),
 }
 
 #[tokio::main]
@@ -104,7 +108,9 @@ async fn main() -> Result<()> {
 
     // ── Commands that don't need a URL ──────────────────────────────────────
     match &cli.command {
-        Commands::Doctor(d) => return doctor::run(d, cli.url.clone(), cli.connection.clone()).await,
+        Commands::Doctor(d) => {
+            return doctor::run(d, cli.url.clone(), cli.connection.clone()).await
+        }
         Commands::Profiles(p) => return profiles::run(p),
         _ => {}
     }
@@ -120,6 +126,9 @@ async fn main() -> Result<()> {
         Commands::Listen(args) => listen::run(url, args, conn, cli.tls).await,
         Commands::Replicate(args) => replicate::run(url, args, conn, cli.tls).await,
         Commands::Psql(args) => psql::run(url, args),
+        Commands::Graphql(args) => {
+            commands::graphql::run(url, args, conn_name.as_deref(), cli.tls).await
+        }
         _ => unreachable!(),
     }
 }

@@ -9,82 +9,43 @@ use super::row::row_to_json_value;
 use crate::utils::config::ResolverConfig;
 
 /// Execute a named query with given variables and return the assembled JSON document.
+/// Uses DataLoader batching for child resolvers when `batch_by` is configured.
 pub async fn execute(
     query: &NamedQuery,
     variables: &HashMap<String, Value>,
     resolvers: &HashMap<String, ResolverConfig>,
     pool: &QueryPool,
 ) -> Result<Value> {
-    let root_selection = &query.selection;
-    let root_fields = &root_selection.children;
-
-    // Find the root resolver (top-level field like "material")
-    let mut root_values = Vec::new();
-
-    for field in root_fields {
-        // Extract the field name without arguments: "material(mat_no: $mat_no)" -> "material"
-        let field_name = field
-            .field_name
-            .split('(')
-            .next()
-            .unwrap_or(&field.field_name)
-            .to_string();
-
-        let resolver = resolvers
-            .get(&field_name)
-            .with_context(|| format!("No resolver configured for '{}'", field_name))?;
-
-        // Bind root-level parameters from variables
-        let param_value = if let Some(param_name) = &resolver.param {
-            variables
-                .get(param_name)
-                .cloned()
-                .or_else(|| {
-                    // Try extracting from argument: e.g. material(mat_no: $mat_no)
-                    extract_arg(&field.field_name, param_name)
-                        .and_then(|var_name| variables.get(&var_name).cloned())
-                })
-                .with_context(|| {
-                    format!(
-                        "Missing required variable '{}' for resolver '{}'",
-                        param_name, field_name
-                    )
-                })?
-        } else {
-            Value::Null
-        };
-
-        let client = pool.get().await?;
-        let rows = client
-            .query(&resolver.sql, &[&param_value])
-            .await
-            .with_context(|| format!("Resolver SQL failed for '{}'", field_name))?;
-
-        for row in &rows {
-            let mut obj = row_to_json_value(row)?;
-            // Resolve child fields
-            if !field.children.is_empty() {
-                resolve_children(&mut obj, &field.children, resolvers, pool).await?;
-            }
-            root_values.push(obj);
-        }
-    }
-
-    // If the root has a single field, return the object(s) directly
-    if root_values.len() == 1 {
-        Ok(root_values.into_iter().next().unwrap())
-    } else {
-        Ok(Value::Array(root_values))
-    }
+    execute_batched(query, variables, resolvers, pool).await
 }
 
 /// Recursively resolve child fields for a parent row.
+/// `depth` tracks the recursion level to prevent stack overflow on circular references.
 async fn resolve_children(
     parent_obj: &mut Value,
     child_fields: &[FieldSelection],
     resolvers: &HashMap<String, ResolverConfig>,
     pool: &QueryPool,
 ) -> Result<()> {
+    resolve_children_with_depth(parent_obj, child_fields, resolvers, pool, 0).await
+}
+
+const MAX_RESOLVE_DEPTH: u32 = 32;
+
+async fn resolve_children_with_depth(
+    parent_obj: &mut Value,
+    child_fields: &[FieldSelection],
+    resolvers: &HashMap<String, ResolverConfig>,
+    pool: &QueryPool,
+    depth: u32,
+) -> Result<()> {
+    if depth > MAX_RESOLVE_DEPTH {
+        anyhow::bail!(
+            "Max resolver recursion depth ({}) exceeded — possible circular reference",
+            MAX_RESOLVE_DEPTH
+        );
+    }
+
     for field in child_fields {
         let field_name = field
             .field_name
@@ -107,7 +68,6 @@ async fn resolve_children(
             continue;
         }
 
-        // Extract param value from parent before any mutable borrow
         let param_name = resolver.param.as_deref().unwrap_or(field_name);
         let param_value = match parent_obj {
             Value::Object(ref m) => m.get(param_name).cloned().unwrap_or(Value::Null),
@@ -124,11 +84,12 @@ async fn resolve_children(
         for row in &rows {
             let mut child_obj = row_to_json_value(row)?;
             if !field.children.is_empty() {
-                Box::pin(resolve_children(
+                Box::pin(resolve_children_with_depth(
                     &mut child_obj,
                     &field.children,
                     resolvers,
                     pool,
+                    depth + 1,
                 ))
                 .await?;
             }
@@ -178,8 +139,7 @@ fn is_to_many(resolver: &ResolverConfig) -> bool {
 }
 
 /// Execute a named query with DataLoader batching for child resolvers.
-#[allow(dead_code)]
-pub async fn execute_batched(
+async fn execute_batched(
     query: &NamedQuery,
     variables: &HashMap<String, Value>,
     resolvers: &HashMap<String, ResolverConfig>,
@@ -250,7 +210,6 @@ pub async fn execute_batched(
 }
 
 /// Resolve child fields using DataLoader batching.
-#[allow(dead_code)]
 async fn resolve_children_batched(
     parent_objs: &mut [Value],
     child_fields: &[FieldSelection],
@@ -285,16 +244,10 @@ async fn resolve_children_batched(
             let mut loader = DataLoader::new(&resolver.sql, batch_by);
 
             // Collect keys from parent objects
-            let keys: Vec<String> = parent_objs
-                .iter()
-                .filter_map(|obj| {
-                    obj.get(param_name)
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                })
-                .collect();
-
-            for key in &keys {
-                loader.add_key(key.clone());
+            for obj in parent_objs.iter() {
+                if let Some(key) = obj.get(param_name) {
+                    loader.add_key(key);
+                }
             }
 
             loader.execute(pool).await?;
@@ -312,8 +265,14 @@ async fn resolve_children_batched(
                 let mut resolved_children = Vec::new();
                 for mut child in children {
                     if !field.children.is_empty() {
-                        // Recursively resolve nested children (single-row path)
-                        resolve_children(&mut child, &field.children, resolvers, pool).await?;
+                        resolve_children_with_depth(
+                            &mut child,
+                            &field.children,
+                            resolvers,
+                            pool,
+                            0,
+                        )
+                        .await?;
                     }
                     resolved_children.push(child);
                 }
@@ -338,7 +297,14 @@ async fn resolve_children_batched(
                 for row in &rows {
                     let mut child_obj = row_to_json_value(row)?;
                     if !field.children.is_empty() {
-                        resolve_children(&mut child_obj, &field.children, resolvers, pool).await?;
+                        resolve_children_with_depth(
+                            &mut child_obj,
+                            &field.children,
+                            resolvers,
+                            pool,
+                            0,
+                        )
+                        .await?;
                     }
                     children.push(child_obj);
                 }

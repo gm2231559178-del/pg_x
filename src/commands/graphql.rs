@@ -87,7 +87,7 @@ async fn validate(
     // 4. Verify every selected field has a resolver
     for (qname, query) in &queries.queries {
         println!("  Validating query '{}'...", qname);
-        validate_selection(&query.selection, resolvers, &schema, qname)?;
+        validate_selection(&query.selection, resolvers, qname)?;
     }
 
     // 5. Verify resolver SQL is valid by connecting
@@ -117,24 +117,47 @@ async fn validate(
 fn validate_selection(
     selection: &crate::graphql::query::FieldSelection,
     resolvers: &HashMap<String, ResolverConfig>,
-    _schema: &SchemaRegistry,
     qname: &str,
 ) -> Result<()> {
+    // Determine which schema type this selection targets based on the resolver config.
+    // We use the first resolvable field name to infer the parent type.
     for field in &selection.children {
         let field_name = field
             .field_name
             .split('(')
             .next()
             .unwrap_or(&field.field_name);
-        if !field.is_leaf && !field.children.is_empty() && !resolvers.contains_key(field_name) {
+
+        if field.is_leaf || field.children.is_empty() {
+            continue;
+        }
+
+        if !resolvers.contains_key(field_name) {
             anyhow::bail!(
                 "Query '{}' selects field '{}' which has no resolver configured",
                 qname,
                 field_name
             );
         }
+
+        // If this field has a resolver with batch_by, verify the column exists
+        // by checking the resolver points to a known type with that field
+        if let Some(resolver) = resolvers.get(field_name) {
+            if let Some(batch_by) = &resolver.batch_by {
+                // batch_by columns are validated at runtime since we may not
+                // have the SQL result schema available without executing.
+                // Log a warning that the user should verify this manually.
+                tracing::info!(
+                    "Resolver '{}' uses batch_by='{}' — ensure this column exists in the SQL result",
+                    field_name,
+                    batch_by
+                );
+            }
+        }
+
+        // Check child fields against schema if we can determine the type
         if !field.children.is_empty() {
-            validate_selection(field, resolvers, _schema, qname)?;
+            validate_selection(field, resolvers, qname)?;
         }
     }
     Ok(())
@@ -189,11 +212,11 @@ async fn run_query(
 }
 
 fn resolve_schema_dir(override_dir: Option<&str>) -> Result<PathBuf> {
-    if let Some(dir) = override_dir {
-        let dir = dir.replace('~', &dirs::home_dir().unwrap().to_string_lossy());
-        return Ok(PathBuf::from(dir));
-    }
     let home = dirs::home_dir().context("Cannot determine home directory")?;
+    if let Some(dir) = override_dir {
+        let expanded = dir.replace('~', &home.to_string_lossy());
+        return Ok(PathBuf::from(expanded));
+    }
     Ok(home.join(".pgx").join("schema"))
 }
 

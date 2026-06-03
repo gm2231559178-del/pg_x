@@ -92,25 +92,72 @@ fn cell_to_json(row: &Row, idx: usize) -> Value {
 }
 
 /// Extract a column value as a string (used for DataLoader key matching).
-#[allow(dead_code)]
 pub fn cell_as_string(row: &Row, col_name: &str) -> Option<String> {
     let columns = row.columns();
     for (i, col) in columns.iter().enumerate() {
         if col.name() == col_name {
-            if let Ok(Some(v)) = row.try_get::<_, Option<String>>(i) {
-                return Some(v);
-            }
-            // Try other types
-            if let Ok(Some(v)) = row.try_get::<_, Option<i64>>(i) {
-                return Some(v.to_string());
-            }
-            if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(i) {
-                return Some(v.to_string());
-            }
-            if let Ok(Some(v)) = row.try_get::<_, Option<uuid::Uuid>>(i) {
-                return Some(v.to_string());
-            }
-            return None;
+            let col_type = col.type_().name();
+            return match col_type {
+                "bool" => row
+                    .try_get::<_, Option<bool>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                "int2" => row
+                    .try_get::<_, Option<i16>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                "int4" => row
+                    .try_get::<_, Option<i32>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                "int8" | "oid" => row
+                    .try_get::<_, Option<i64>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                "float4" => row
+                    .try_get::<_, Option<f32>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                "float8" | "numeric" => row
+                    .try_get::<_, Option<f64>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                "text" | "varchar" | "char" | "bpchar" | "name" | "citext" => {
+                    row.try_get::<_, Option<String>>(i).ok().flatten()
+                }
+                "uuid" => row
+                    .try_get::<_, Option<uuid::Uuid>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                "json" | "jsonb" => row
+                    .try_get::<_, Option<serde_json::Value>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                "timestamp" | "timestamptz" => {
+                    if let Ok(Some(v)) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(i)
+                    {
+                        Some(v.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
+                    } else if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDateTime>>(i) {
+                        Some(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+                    } else {
+                        row.try_get::<_, Option<String>>(i).ok().flatten()
+                    }
+                }
+                "date" => row
+                    .try_get::<_, Option<chrono::NaiveDate>>(i)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string()),
+                _ => row.try_get::<_, Option<String>>(i).ok().flatten(),
+            };
         }
     }
     None

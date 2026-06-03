@@ -224,30 +224,48 @@ fn parse_field_line(
         return Ok(None);
     }
 
-    // Check if this is a relation with sub-fields
-    if let Some(open_brace) = line.find('{') {
-        let field_name = line[..open_brace].trim().to_string();
-        let inner = &line[open_brace + 1..];
-        // Find matching close brace
-        let close_brace = inner.rfind('}').unwrap_or(inner.len());
-        let child_content = &inner[..close_brace];
+    let open_brace = match line.find('{') {
+        Some(p) => p,
+        None => {
+            let field_name = line.to_string();
+            return Ok(Some(FieldSelection {
+                field_name,
+                children: Vec::new(),
+                is_leaf: true,
+            }));
+        }
+    };
 
-        let children = parse_fields(child_content.trim(), "", _schema)?;
+    let field_name = line[..open_brace].trim().to_string();
+    let after_open = &line[open_brace + 1..];
 
-        Ok(Some(FieldSelection {
-            field_name,
-            children,
-            is_leaf: false,
-        }))
-    } else {
-        // Simple scalar field (or alias, which we don't support yet)
-        let field_name = line.to_string();
-        Ok(Some(FieldSelection {
-            field_name,
-            children: Vec::new(),
-            is_leaf: true,
-        }))
+    // Walk character by character to find the brace that brings depth back to 0
+    let mut depth = 1i32;
+    let mut close_pos = None;
+    for (i, ch) in after_open.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
     }
+
+    let close_brace = close_pos.unwrap_or(after_open.len());
+    let child_content = &after_open[..close_brace];
+
+    let children = parse_fields(child_content.trim(), "", _schema)?;
+
+    Ok(Some(FieldSelection {
+        field_name,
+        children,
+        is_leaf: false,
+    }))
 }
 
 #[cfg(test)]

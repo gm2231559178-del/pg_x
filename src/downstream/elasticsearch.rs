@@ -1,45 +1,60 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use serde::Serialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use super::contract::NotifyEvent;
 use super::sink::Downstream;
+use crate::graphql::{executor, pool::QueryPool, query::QueryLoader, schema::SchemaRegistry};
+use crate::utils::config::ResolverConfig;
 
 /// Elasticsearch downstream sink.
-/// Receives NOTIFY events, executes the named GraphQL query, and pushes
-/// the assembled document to Elasticsearch.
+/// Receives NOTIFY events with a ContractMessage containing query name and variables,
+/// executes the named GraphQL query, and pushes the assembled document to Elasticsearch.
 #[allow(dead_code)]
 pub struct ElasticsearchDownstream {
     es_url: String,
     index: String,
     id_field: Option<String>,
     client: reqwest::Client,
-    bulk_size: usize,
-    flush_interval: Duration,
+    pool: QueryPool,
+    queries: QueryLoader,
+    resolvers: HashMap<String, ResolverConfig>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Serialize)]
-struct BulkItem {
-    id: Option<String>,
-    document: serde_json::Value,
-}
-
 impl ElasticsearchDownstream {
-    #[allow(dead_code)]
-    pub fn new(es_url: &str, index: &str, id_field: Option<String>) -> Result<Self> {
+    pub fn new(
+        es_url: &str,
+        index: &str,
+        id_field: Option<String>,
+        pool: QueryPool,
+        resolvers: HashMap<String, ResolverConfig>,
+        schema_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
+
+        let schema = match schema_dir {
+            Some(ref p) => SchemaRegistry::load_from_dir(p)?,
+            None => {
+                let home = dirs::home_dir().context("Cannot determine home directory")?;
+                let p = home.join(".pgx").join("schema");
+                SchemaRegistry::load_from_dir(&p)?
+            }
+        };
+        let queries = QueryLoader::load(&schema)?;
 
         Ok(Self {
             es_url: es_url.trim_end_matches('/').to_string(),
             index: index.to_string(),
             id_field,
             client,
-            bulk_size: 100,
-            flush_interval: Duration::from_millis(500),
+            pool,
+            queries,
+            resolvers,
         })
     }
 }
@@ -51,7 +66,6 @@ impl Downstream for ElasticsearchDownstream {
     }
 
     async fn send(&self, event: &NotifyEvent) -> Result<()> {
-        // Parse the NOTIFY payload as a ContractMessage
         let msg = match super::contract::ContractMessage::try_parse(&event.payload) {
             Some(m) => m,
             None => {
@@ -62,18 +76,34 @@ impl Downstream for ElasticsearchDownstream {
             }
         };
 
-        // The assembled JSON document should be in msg.data
-        let document = &msg.data;
+        // Extract query name from event_type or routing info
+        let query_name = msg.meta.event_type.as_deref().unwrap_or("default");
 
-        // Determine document ID from a configured root field
-        let doc_id = self.id_field.as_ref().and_then(|idf| match document {
+        // Convert msg.data into a variable map (top-level keys become variables)
+        let variables: HashMap<String, serde_json::Value> = match &msg.data {
+            serde_json::Value::Object(m) => m.clone().into_iter().collect(),
+            other => {
+                let mut h = HashMap::new();
+                h.insert("data".to_string(), other.clone());
+                h
+            }
+        };
+
+        let query = self
+            .queries
+            .get(query_name)
+            .ok_or_else(|| anyhow::anyhow!("No named query '{}' found for ES sink", query_name))?;
+
+        let result: serde_json::Value =
+            executor::execute(query, &variables, &self.resolvers, &self.pool).await?;
+
+        let doc_id = self.id_field.as_ref().and_then(|idf| match &result {
             serde_json::Value::Object(m) => {
                 m.get(idf).and_then(|v| v.as_str().map(|s| s.to_string()))
             }
             _ => None,
         });
 
-        // POST to ES
         let url = if let Some(ref id) = doc_id {
             format!("{}/{}/_doc/{}", self.es_url, self.index, id)
         } else {
@@ -83,7 +113,7 @@ impl Downstream for ElasticsearchDownstream {
         let response = self
             .client
             .post(&url)
-            .json(document)
+            .json(&result)
             .send()
             .await
             .with_context(|| format!("ES POST failed to {}", url))?;
@@ -91,11 +121,12 @@ impl Downstream for ElasticsearchDownstream {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            tracing::error!(
-                status = %status,
-                doc_id = ?doc_id,
-                error = %text,
-                "ES document index failed"
+            anyhow::bail!(
+                "ES document index failed (HTTP {}) for query '{}' at {}: {}",
+                status,
+                query_name,
+                url,
+                text,
             );
         }
 

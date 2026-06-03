@@ -1,26 +1,22 @@
 use anyhow::Result;
+use serde_json::Value;
 use std::collections::HashMap;
 
 use super::pool::QueryPool;
 use super::row::cell_as_string;
 
+type Key = String;
+
 /// A per-resolver batch accumulator that eliminates N+1 queries.
 pub struct DataLoader {
-    /// Accumulated key values for the current batch
-    keys: Vec<String>,
-    /// The resolver SQL with a `WHERE ... = ANY($1)` clause
+    keys: Vec<Key>,
     sql: String,
-    /// The column name to extract from parent rows for batching
     batch_by: String,
-    /// The column name in the child result to match against the batch key
     result_key: Option<String>,
-    /// Whether a key has already been resolved
     resolved: bool,
-    /// Cached result: key -> Vec of JSON rows
-    cached: HashMap<String, Vec<serde_json::Value>>,
+    cached: HashMap<Key, Vec<serde_json::Value>>,
 }
 
-#[allow(dead_code)]
 impl DataLoader {
     pub fn new(sql: &str, batch_by: &str) -> Self {
         Self {
@@ -35,23 +31,17 @@ impl DataLoader {
 
     /// Set the result column name to match against the batch key.
     /// If not set, defaults to `batch_by`.
+    #[allow(dead_code)]
     pub fn with_result_key(mut self, key: &str) -> Self {
         self.result_key = Some(key.to_string());
         self
     }
 
-    /// Add a key value from a parent row to the batch.
-    pub fn add_key(&mut self, key: String) {
-        self.keys.push(key);
-    }
-
-    /// Return the number of unique keys accumulated.
-    pub fn unique_key_count(&self) -> usize {
-        let mut unique = std::collections::HashSet::new();
-        for k in &self.keys {
-            unique.insert(k.clone());
-        }
-        unique.len()
+    /// Add a key value from a parent row to the batch as a JSON Value.
+    /// Supports String, Number, Bool - converts to string representation for SQL ANY($1).
+    pub fn add_key(&mut self, key: &Value) {
+        let s = value_to_key(key);
+        self.keys.push(s);
     }
 
     /// Execute the batched SQL query and group results by key.
@@ -60,7 +50,6 @@ impl DataLoader {
             return Ok(());
         }
 
-        // Deduplicate keys
         let unique_keys: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
             self.keys
@@ -80,7 +69,6 @@ impl DataLoader {
         let client = pool.get().await?;
         let rows = client.query(&self.sql, &[&unique_key_refs]).await?;
 
-        // Determine the result key column: use result_key or fall back to batch_by
         let result_key_col = self.result_key.as_deref().unwrap_or(&self.batch_by);
 
         for row in &rows {
@@ -96,5 +84,15 @@ impl DataLoader {
     /// Get children for a specific parent key.
     pub fn get_children(&self, key: &str) -> Vec<serde_json::Value> {
         self.cached.get(key).cloned().unwrap_or_default()
+    }
+}
+
+fn value_to_key(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => String::new(),
+        _ => v.to_string(),
     }
 }

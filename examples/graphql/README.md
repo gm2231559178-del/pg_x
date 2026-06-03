@@ -1,7 +1,7 @@
 # pgx GraphQL Practice Setup
 
-End-to-end example: compose a material catalog with nested sizes and colorways
-via GraphQL, executed against PostgreSQL.
+End-to-end demo: compose a material catalog with 3-tier nested data
+via GraphQL, and stream changes from PostgreSQL NOTIFY into Elasticsearch.
 
 ## Prerequisites
 
@@ -14,7 +14,8 @@ via GraphQL, executed against PostgreSQL.
 docker compose up -d
 ```
 
-This starts PostgreSQL with the sample tables pre-loaded.
+Starts PostgreSQL (`:5432`) with sample tables + NOTIFY trigger, and
+Elasticsearch (`:9200`).
 
 ## 2. Copy the pgx config
 
@@ -22,104 +23,178 @@ This starts PostgreSQL with the sample tables pre-loaded.
 cp -r examples/graphql/pgx/* ~/.pgx/
 ```
 
-This sets up:
-- `~/.pgx/config.toml` — connection profiles + resolver definitions
-- `~/.pgx/schema/*.graphql` — GraphQL type definitions
-- `~/.pgx/queries/*.graphql` — named queries with selection sets
+Sets up `~/.pgx/` with connection profiles, resolvers, type schemas, and queries.
 
 ## 3. Validate the setup
 
 ```bash
-cargo run -- graphql validate
+pgx graphql validate
 ```
 
-This checks:
-- All type references in schema files resolve
-- All named queries parse correctly  
-- Every non-leaf field has a resolver
-- Each resolver SQL is valid (runs EXPLAIN against the DB)
+Checks all type references, query parses, resolver existence, and SQL validity.
 
-## 4. Run a query
+## 4. Run a query on demand (pgx graphql run)
 
-### Basic
+### Pretty-printed
 
 ```bash
-cargo run -- graphql run MaterialFull -V mat_no=M001
+pgx graphql run MaterialFull -V mat_no=M001
 ```
 
-Returns a nested JSON document with the material, its sizes, and colorways.
-
-### Compact output (single line)
+### Compact (single line)
 
 ```bash
-cargo run -- graphql run MaterialFull -V mat_no=M001 --compact
+pgx graphql run MaterialFull -V mat_no=M001 --compact
 ```
 
 ### Save to file
 
 ```bash
-cargo run -- graphql run MaterialFull -V mat_no=M001 -o result.json
+pgx graphql run MaterialFull -V mat_no=M001 -o result.json
 ```
 
-### Query different material
+### Other materials
 
 ```bash
-cargo run -- graphql run MaterialFull -V mat_no=M002
+pgx graphql run MaterialFull -V mat_no=M002
+pgx graphql run MaterialFull -V mat_no=M003
 ```
 
-## Expected output (pretty-printed)
+## 5. Stream changes into Elasticsearch (pgx listen)
+
+### Start the listener
+
+```bash
+pgx listen --channel materials elasticsearch \
+  --index materials \
+  --id-field mat_no
+```
+
+This subscribes to the `materials` NOTIFY channel. Every time a row changes,
+the trigger fires a ContractMessage payload. The Elasticsearch sink:
+
+1. Parses the event
+2. Looks up the `MaterialFull` query
+3. Executes the 3-tier GraphQL composition against PostgreSQL
+4. POSTs the assembled document to `http://localhost:9200/materials/_doc/{mat_no}`
+
+### Trigger a change (separate terminal)
+
+```bash
+docker compose exec postgres psql -U postgres \
+  -c "UPDATE materials SET name = name WHERE mat_no = 'M001';"
+```
+
+### Verify in Elasticsearch
+
+```bash
+curl http://localhost:9200/materials/_search?pretty
+```
+
+Each document contains the full nested tree:
 
 ```json
 {
-  "material": [
+  "mat_no": "M001",
+  "name": "Premium Cotton Canvas",
+  "status": "active",
+  "sizes": [
+    { "size_code": "S",  "name": "Small" },
+    { "size_code": "M",  "name": "Medium" },
+    { "size_code": "L",  "name": "Large" },
+    { "size_code": "XL", "name": "Extra Large" }
+  ],
+  "colorways": [
+    { "colorway_code": "WH", "name": "White", "hex": "#FFFFFF" },
+    { "colorway_code": "BK", "name": "Black", "hex": "#000000" },
+    { "colorway_code": "NV", "name": "Navy",  "hex": "#000080" }
+  ],
+  "features": [
     {
-      "mat_no": "M001",
-      "name": "Premium Cotton Canvas",
-      "status": "active",
-      "sizes": [
-        { "size_code": "S",  "name": "Small" },
-        { "size_code": "M",  "name": "Medium" },
-        { "size_code": "L",  "name": "Large" },
-        { "size_code": "XL", "name": "Extra Large" }
-      ],
-      "colorways": [
-        { "colorway_code": "WH", "name": "White", "hex": "#FFFFFF" },
-        { "colorway_code": "BK", "name": "Black", "hex": "#000000" },
-        { "colorway_code": "NV", "name": "Navy",  "hex": "#000080" }
-      ],
-      "features": [
-        {
-          "feature_name": "Construction",
-          "description": "Plain weave",
-          "attribute_entries": [
-            { "attr_name": "weave_type",   "attr_value": "plain" },
-            { "attr_name": "thread_count", "attr_value": "120" }
-          ]
-        },
-        {
-          "feature_name": "Care",
-          "description": "Standard care instructions",
-          "attribute_entries": [
-            { "attr_name": "wash",  "attr_value": "30°C" },
-            { "attr_name": "bleach", "attr_value": "No" }
-          ]
-        }
+      "feature_name": "Construction",
+      "description": "Plain weave",
+      "attribute_entries": [
+        { "attr_name": "weave_type",   "attr_value": "plain" },
+        { "attr_name": "thread_count", "attr_value": "120" }
+      ]
+    },
+    {
+      "feature_name": "Care",
+      "description": "Standard care instructions",
+      "attribute_entries": [
+        { "attr_name": "wash",  "attr_value": "30°C" },
+        { "attr_name": "bleach", "attr_value": "No" }
       ]
     }
   ]
 }
 ```
 
+### With config-driven sink
+
+Instead of CLI flags, add to `~/.pgx/config.toml`:
+
+```toml
+[connections.local.listen]
+channels = ["materials"]
+
+[connections.local.listen.sink]
+type = "elasticsearch"
+url = "http://localhost:9200"
+index = "materials"
+id_field = "mat_no"
+```
+
+Then start without subcommand args:
+
+```bash
+pgx listen -C materials elasticsearch
+```
+
+## Architecture
+
+```
+┌──────────────┐     NOTIFY      ┌──────────────────┐
+│  PostgreSQL  │ ──────────────> │   pgx listen     │
+│              │                 │                  │
+│  materials   │  ContractMessage│  Elasticsearch   │
+│  trigger     │   {             │  Downstream      │
+│              │    meta: {      │       │          │
+│              │     event_type  │       │ GraphQL   │
+│              │    }            │       │ execute   │
+│              │    data: {      │       ▼          │
+│              │     mat_no }    │  ┌──────────────┐│
+│              │   }             │  │  executor    ││
+└──────────────┘                 │  │  DataLoader  ││
+                                 │  │  resolvers   ││
+                                 │  └──────┬───────┘│
+                                 │         │ SQL    │
+                                 │         ▼        │
+                                 │  ┌──────────────┐│
+                                 │  │  PostgreSQL  ││
+                                 │  └──────────────┘│
+                                 │         │        │
+                                 │         ▼        │
+                                 │  ┌──────────────┐│
+                                 │  │ Elasticsearch ││
+                                 │  │  POST _doc    ││
+                                 │  └──────────────┘│
+                                 └──────────────────┘
+```
+
 ## Structure
 
 ```
 ~/.pgx/
-  config.toml           # Connection URL + resolvers
+  config.toml              # Connection URL + resolvers
   schema/
-    material.graphql    # type Material { ... }
-    size.graphql        # type Size { ... }
-    colorway.graphql    # type Colorway { ... }
-    feature.graphql     # type MaterialFeature { ... }, FeatureAttribute { ... }
+    material.graphql       # type Material { ... }
+    size.graphql           # type Size { ... }
+    colorway.graphql       # type Colorway { ... }
+    feature.graphql        # type MaterialFeature / FeatureAttribute { ... }
   queries/
-    MaterialFull.graphql # 3-tier: material -> features -> attributes
+    MaterialFull.graphql   # 3-tier: material -> features -> attributes
+
+docker-compose.yml         # PostgreSQL + Elasticsearch
+init.sql                   # Tables, seed data, NOTIFY trigger
 ```

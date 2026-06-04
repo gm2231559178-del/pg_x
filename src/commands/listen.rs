@@ -564,6 +564,7 @@ async fn build_downstream(
                 es_url,
                 index,
                 a.id_field.clone(),
+                8,
                 pool,
                 resolvers.clone(),
                 schema_dir,

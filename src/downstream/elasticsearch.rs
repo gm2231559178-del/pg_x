@@ -20,6 +20,7 @@ pub struct ElasticsearchDownstream {
     pool: QueryPool,
     queries: QueryLoader,
     resolvers: HashMap<String, ResolverConfig>,
+    max_depth: u32,
 }
 
 impl ElasticsearchDownstream {
@@ -27,6 +28,7 @@ impl ElasticsearchDownstream {
         es_url: &str,
         index: &str,
         id_field: Option<String>,
+        max_depth: u32,
         pool: QueryPool,
         resolvers: HashMap<String, ResolverConfig>,
         schema_dir: Option<PathBuf>,
@@ -49,6 +51,7 @@ impl ElasticsearchDownstream {
             es_url: es_url.trim_end_matches('/').to_string(),
             index: index.to_string(),
             id_field,
+            max_depth,
             client,
             pool,
             queries,
@@ -93,7 +96,7 @@ impl Downstream for ElasticsearchDownstream {
             .ok_or_else(|| anyhow::anyhow!("No named query '{}' found for ES sink", query_name))?;
 
         let result: serde_json::Value =
-            executor::execute(query, &variables, &self.resolvers, &self.pool).await?;
+            executor::execute(query, &variables, &self.resolvers, &self.pool, self.max_depth).await?;
 
         let doc_id = self.id_field.as_ref().and_then(|idf| match &result {
             serde_json::Value::Object(m) => {

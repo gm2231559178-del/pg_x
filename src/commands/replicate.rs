@@ -83,7 +83,7 @@ pub struct ReplicateArgs {
     #[arg(long)]
     pub emit_schema: bool,
 
-    /// Maximum consecutive reconnect attempts before giving up (0 = infinite, default 10).
+    /// Maximum consecutive reconnect attempts before giving up (0 = infinite, default 0).
     #[arg(long, env = "PGX_REPLICATE_MAX_RECONNECT_ATTEMPTS")]
     pub max_reconnect_attempts: Option<u32>,
 
@@ -750,7 +750,7 @@ pub async fn run(
     }
 
     let slot_name = args.slot.clone().unwrap_or_else(|| "pgx_slot".to_string());
-    let max_reconnect_attempts = args.max_reconnect_attempts.unwrap_or(10);
+    let max_reconnect_attempts = args.max_reconnect_attempts.unwrap_or(0);
     let reconnect_base_ms = args.reconnect_base_ms.unwrap_or(1000);
     let reconnect_max_ms = args.reconnect_max_ms.unwrap_or(60000);
     let sink = build_wal_sink(&args.downstream).await?;

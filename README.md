@@ -4,12 +4,12 @@ A feature-rich PostgreSQL CLI tool — beyond psql.
 
 ## Features
 
-| Command     | Description |
-|-------------|-------------|
-| `query`     | Run SQL and display results as a table or JSON |
-| `export`    | Export SQL results to Excel / CSV / JSON |
-| `info`      | Show server version, databases, tables, connections |
-| `listen`    | Subscribe to NOTIFY channels and forward to downstream sinks |
+| Command     | Description                                                       |
+| ----------- | ----------------------------------------------------------------- |
+| `query`     | Run SQL and display results as a table or JSON                    |
+| `export`    | Export SQL results to Excel / CSV / JSON                          |
+| `info`      | Show server version, databases, tables, connections               |
+| `listen`    | Subscribe to NOTIFY channels and forward to downstream sinks      |
 | `replicate` | Stream WAL changes via logical replication (INSERT/UPDATE/DELETE) |
 
 ---
@@ -71,13 +71,13 @@ PostgreSQL replication wire protocol (no libpq, no external replication crate).
 
 ### Comparison: `listen` vs `replicate`
 
-| | `listen` | `replicate` |
-|---|---|---|
-| Source | Explicit `pg_notify()` calls | Any INSERT / UPDATE / DELETE automatically |
-| Payload | Whatever the app puts in the NOTIFY | Full row images, before + after |
-| Setup | None | `wal_level=logical` + publication |
-| Durability | At-most-once | Exactly-once via replication slot |
-| Resume | No | Yes — stores LSN checkpoint in slot |
+|            | `listen`                            | `replicate`                                |
+| ---------- | ----------------------------------- | ------------------------------------------ |
+| Source     | Explicit `pg_notify()` calls        | Any INSERT / UPDATE / DELETE automatically |
+| Payload    | Whatever the app puts in the NOTIFY | Full row images, before + after            |
+| Setup      | None                                | `wal_level=logical` + publication          |
+| Durability | At-most-once                        | Exactly-once via replication slot          |
+| Resume     | No                                  | Yes — stores LSN checkpoint in slot        |
 
 ### PostgreSQL prerequisites
 
@@ -135,16 +135,16 @@ pgx -U $DATABASE_URL replicate \
 
 **Environment variables available in the shell command:**
 
-| Variable      | Description |
-|---------------|-------------|
+| Variable      | Description                                                             |
+| ------------- | ----------------------------------------------------------------------- |
 | `PGX_OP`      | `insert`, `update`, `delete`, `truncate`, `begin`, `commit`, `relation` |
-| `PGX_SCHEMA`  | Schema name (DML events) |
-| `PGX_TABLE`   | Table name (DML events) |
-| `PGX_LSN`     | WAL position of this event (e.g. `0/1A2B3C`) |
-| `PGX_XID`     | Transaction ID (BEGIN events, requires `--emit-txn-boundaries`) |
-| `PGX_NEW`     | JSON of new row values (INSERT / UPDATE) |
-| `PGX_OLD`     | JSON of old row values (UPDATE / DELETE) |
-| `PGX_PAYLOAD` | Full event JSON |
+| `PGX_SCHEMA`  | Schema name (DML events)                                                |
+| `PGX_TABLE`   | Table name (DML events)                                                 |
+| `PGX_LSN`     | WAL position of this event (e.g. `0/1A2B3C`)                            |
+| `PGX_XID`     | Transaction ID (BEGIN events, requires `--emit-txn-boundaries`)         |
+| `PGX_NEW`     | JSON of new row values (INSERT / UPDATE)                                |
+| `PGX_OLD`     | JSON of old row values (UPDATE / DELETE)                                |
+| `PGX_PAYLOAD` | Full event JSON                                                         |
 
 ### Downstream: webhook
 
@@ -214,25 +214,25 @@ pgx -U $DATABASE_URL replicate \
 
 ### Slot management
 
-| Flag | Description |
-|------|-------------|
-| `--slot <name>` | Slot name (default: `pgx_slot`). Created automatically if absent. |
-| `--reset-slot` | Drop and recreate the slot. **Loses acknowledged progress.** |
-| `--temporary` | Create a temporary slot — dropped when the session ends. |
-| `--start-lsn <A/BB>` | Resume from a specific WAL position. |
+| Flag                 | Description                                                       |
+| -------------------- | ----------------------------------------------------------------- |
+| `--slot <name>`      | Slot name (default: `pgx_slot`). Created automatically if absent. |
+| `--reset-slot`       | Drop and recreate the slot. **Loses acknowledged progress.**      |
+| `--temporary`        | Create a temporary slot — dropped when the session ends.          |
+| `--start-lsn <A/BB>` | Resume from a specific WAL position.                              |
 
 ### Reconnection & retry
 
 When the PostgreSQL connection or replication stream breaks (server restart,
 network flap, etc.), `pgx` automatically reconnects with exponential backoff:
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--max-reconnect-attempts <N>` | Max consecutive failures before giving up. `0` = retry forever. | `10` |
-| `--reconnect-base-ms <N>` | Initial backoff delay in milliseconds (doubles each attempt). | `1000` |
-| `--reconnect-max-ms <N>` | Cap on the backoff delay. | `60000` |
+| Flag                           | Description                                                     | Default |
+| ------------------------------ | --------------------------------------------------------------- | ------- |
+| `--max-reconnect-attempts <N>` | Max consecutive failures before giving up. `0` = retry forever. | `0`     |
+| `--reconnect-base-ms <N>`      | Initial backoff delay in milliseconds (doubles each attempt).   | `1000`  |
+| `--reconnect-max-ms <N>`       | Cap on the backoff delay.                                       | `60000` |
 
-The backoff for attempt *n* is `base × 2ⁿ⁻¹` with ±20% jitter, capped at
+The backoff for attempt _n_ is `base × 2ⁿ⁻¹` with ±20% jitter, capped at
 `reconnect_max_ms`. The streaming position resumes from the last confirmed
 LSN, so no events are lost or duplicated.
 
@@ -252,10 +252,10 @@ reconnect_max_ms = 30000
 PostgreSQL's WAL contains three distinct states for each column in old-row tuples.
 `pgx` represents them precisely:
 
-| JSON value | Meaning |
-|---|---|
-| `"alice"` | The actual SQL value |
-| `null` | The column is SQL NULL |
+| JSON value             | Meaning                                   |
+| ---------------------- | ----------------------------------------- |
+| `"alice"`              | The actual SQL value                      |
+| `null`                 | The column is SQL NULL                    |
 | `{"$unchanged": true}` | Column not sent by the server (see below) |
 
 The `{"$unchanged": true}` marker appears because under the default `REPLICA IDENTITY DEFAULT`,
@@ -273,11 +273,11 @@ value, and `{"$unchanged": true}` will never appear.
 
 **What you see per operation:**
 
-| Operation | `REPLICA IDENTITY DEFAULT` | `REPLICA IDENTITY FULL` |
-|---|---|---|
-| INSERT `old` | absent | absent (there is no old row) |
-| UPDATE `old` | `null` when no key col changed; key cols only otherwise | all columns |
-| DELETE `old` | key cols only; rest are `{"$unchanged": true}` | all columns |
+| Operation    | `REPLICA IDENTITY DEFAULT`                              | `REPLICA IDENTITY FULL`      |
+| ------------ | ------------------------------------------------------- | ---------------------------- |
+| INSERT `old` | absent                                                  | absent (there is no old row) |
+| UPDATE `old` | `null` when no key col changed; key cols only otherwise | all columns                  |
+| DELETE `old` | key cols only; rest are `{"$unchanged": true}`          | all columns                  |
 
 ---
 
@@ -327,9 +327,9 @@ downstream sink. Unlike `replicate`, this requires the application to call
 
 ### Two forwarding modes
 
-| Mode | Description |
-|------|-------------|
-| `simple` | Pass the raw NOTIFY payload as the message body |
+| Mode       | Description                                                                        |
+| ---------- | ---------------------------------------------------------------------------------- |
+| `simple`   | Pass the raw NOTIFY payload as the message body                                    |
 | `contract` | Parse the payload as a structured `ContractMessage` and use embedded routing hints |
 
 ### Downstream: RabbitMQ
@@ -405,14 +405,14 @@ pgx -U $DATABASE_URL listen \
 
 In contract mode:
 
-| Variable | Source |
-|---|---|
-| `PGX_CHANNEL` | NOTIFY channel name |
-| `PGX_PID` | Sending backend PID |
-| `PGX_PAYLOAD` | Business data JSON (the `data` field) |
-| `PGX_EVENT_TYPE` | `meta.event_type` |
-| `PGX_SCHEMA_VERSION` | `meta.schema_version` |
-| *custom* | Any keys in `meta.routing.shell_env` |
+| Variable             | Source                                |
+| -------------------- | ------------------------------------- |
+| `PGX_CHANNEL`        | NOTIFY channel name                   |
+| `PGX_PID`            | Sending backend PID                   |
+| `PGX_PAYLOAD`        | Business data JSON (the `data` field) |
+| `PGX_EVENT_TYPE`     | `meta.event_type`                     |
+| `PGX_SCHEMA_VERSION` | `meta.schema_version`                 |
+| _custom_             | Any keys in `meta.routing.shell_env`  |
 
 ---
 
@@ -505,10 +505,10 @@ stdout / shell / webhook / rabbitmq / kafka
 
 ## Cargo features
 
-| Feature | Default | Enables |
-|---|---|---|---|
-| `excel` | ✅ | Excel (.xlsx) export via `rust_xlsxwriter` |
-| `rabbitmq` | ✅ | RabbitMQ downstream via `lapin` |
-| `webhook` | ✅ | HTTP webhook downstream via `reqwest` |
-| `kafka` | ❌ | Kafka downstream via `rdkafka` (requires librdkafka) |
-| `tls` | ❌ | TLS for the tokio-postgres control-plane connection |
+| Feature    | Default | Enables                                              |
+| ---------- | ------- | ---------------------------------------------------- |
+| `excel`    | ✅      | Excel (.xlsx) export via `rust_xlsxwriter`           |
+| `rabbitmq` | ✅      | RabbitMQ downstream via `lapin`                      |
+| `webhook`  | ✅      | HTTP webhook downstream via `reqwest`                |
+| `kafka`    | ❌      | Kafka downstream via `rdkafka` (requires librdkafka) |
+| `tls`      | ❌      | TLS for the tokio-postgres control-plane connection  |

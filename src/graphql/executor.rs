@@ -26,8 +26,9 @@ pub async fn execute(
     variables: &HashMap<String, Value>,
     resolvers: &HashMap<String, ResolverConfig>,
     pool: &QueryPool,
+    max_depth: u32,
 ) -> Result<Value> {
-    execute_batched(query, variables, resolvers, pool).await
+    execute_batched(query, variables, resolvers, pool, max_depth).await
 }
 
 /// Recursively resolve child fields for a parent row.
@@ -37,23 +38,23 @@ async fn resolve_children(
     child_fields: &[FieldSelection],
     resolvers: &HashMap<String, ResolverConfig>,
     pool: &QueryPool,
+    max_depth: u32,
 ) -> Result<()> {
-    resolve_children_with_depth(parent_obj, child_fields, resolvers, pool, 0).await
+    resolve_children_with_depth(parent_obj, child_fields, resolvers, pool, max_depth, 0).await
 }
-
-const MAX_RESOLVE_DEPTH: u32 = 32;
 
 async fn resolve_children_with_depth(
     parent_obj: &mut Value,
     child_fields: &[FieldSelection],
     resolvers: &HashMap<String, ResolverConfig>,
     pool: &QueryPool,
+    max_depth: u32,
     depth: u32,
 ) -> Result<()> {
-    if depth > MAX_RESOLVE_DEPTH {
+    if depth > max_depth {
         anyhow::bail!(
             "Max resolver recursion depth ({}) exceeded — possible circular reference",
-            MAX_RESOLVE_DEPTH
+            max_depth
         );
     }
 
@@ -103,6 +104,7 @@ async fn resolve_children_with_depth(
                     &field.children,
                     resolvers,
                     pool,
+                    max_depth,
                     depth + 1,
                 ))
                 .await?;
@@ -158,6 +160,7 @@ async fn execute_batched(
     variables: &HashMap<String, Value>,
     resolvers: &HashMap<String, ResolverConfig>,
     pool: &QueryPool,
+    max_depth: u32,
 ) -> Result<Value> {
     let root_selection = &query.selection;
     let root_fields = &root_selection.children;
@@ -208,11 +211,11 @@ async fn execute_batched(
 
         // Resolve child fields with batching using DataLoader
         if !field.children.is_empty() && root_values.len() > 1 {
-            resolve_children_batched(&mut root_values, &field.children, resolvers, pool).await?;
+            resolve_children_batched(&mut root_values, &field.children, resolvers, pool, max_depth).await?;
         } else if !field.children.is_empty() {
             // Single root row — use direct resolver (no batching needed)
             for root_val in &mut root_values {
-                resolve_children(root_val, &field.children, resolvers, pool).await?;
+                resolve_children(root_val, &field.children, resolvers, pool, max_depth).await?;
             }
         }
     }
@@ -230,6 +233,7 @@ async fn resolve_children_batched(
     child_fields: &[FieldSelection],
     resolvers: &HashMap<String, ResolverConfig>,
     pool: &QueryPool,
+    max_depth: u32,
 ) -> Result<()> {
     for field in child_fields {
         let field_name = field
@@ -285,6 +289,7 @@ async fn resolve_children_batched(
                             &field.children,
                             resolvers,
                             pool,
+                            max_depth,
                             0,
                         )
                         .await?;
@@ -319,6 +324,7 @@ async fn resolve_children_batched(
                             &field.children,
                             resolvers,
                             pool,
+                            max_depth,
                             0,
                         )
                         .await?;

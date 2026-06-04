@@ -418,7 +418,9 @@ impl Worker {
         match code {
             0 => Ok(()), // AuthenticationOk
             3 => {
-                // Cleartext password
+                tracing::warn!(
+                    "Server requested cleartext password — password will be sent in plain text. Use --tls to protect credentials"
+                );
                 let mut payload = self.cfg.password.as_bytes().to_vec();
                 payload.push(0);
                 write_password_message(stream, &payload).await

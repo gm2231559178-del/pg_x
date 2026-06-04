@@ -221,6 +221,30 @@ pgx -U $DATABASE_URL replicate \
 | `--temporary` | Create a temporary slot — dropped when the session ends. |
 | `--start-lsn <A/BB>` | Resume from a specific WAL position. |
 
+### Reconnection & retry
+
+When the PostgreSQL connection or replication stream breaks (server restart,
+network flap, etc.), `pgx` automatically reconnects with exponential backoff:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--max-reconnect-attempts <N>` | Max consecutive failures before giving up. `0` = retry forever. | `10` |
+| `--reconnect-base-ms <N>` | Initial backoff delay in milliseconds (doubles each attempt). | `1000` |
+| `--reconnect-max-ms <N>` | Cap on the backoff delay. | `60000` |
+
+The backoff for attempt *n* is `base × 2ⁿ⁻¹` with ±20% jitter, capped at
+`reconnect_max_ms`. The streaming position resumes from the last confirmed
+LSN, so no events are lost or duplicated.
+
+These settings can also be configured per-connection in `~/.pgx/config.toml`:
+
+```toml
+[connections.myconn.replicate]
+max_reconnect_attempts = 20
+reconnect_base_ms = 500
+reconnect_max_ms = 30000
+```
+
 ---
 
 ### Understanding column values in old rows

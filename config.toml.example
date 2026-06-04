@@ -32,6 +32,9 @@ mode = "simple"
 slot = "my_slot"
 publications = ["my_pub"]
 temporary = true
+max_reconnect_attempts = 10
+reconnect_base_ms = 1000
+reconnect_max_ms = 60000
 
 [connections.local.replicate.sink]
 type = "stdout"

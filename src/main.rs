@@ -58,7 +58,7 @@ enum Commands {
     /// Show database / server information
     Info(info::InfoArgs),
 
-    /// Subscribe to PostgreSQL NOTIFY channels and forward events to a downstream sink
+    /// Subscribe to PostgreSQL NOTIFY channels and forward events to a downstream sink (at-most-once)
     Listen(listen::ListenArgs),
 
     /// Stream WAL changes via PostgreSQL logical replication (INSERT/UPDATE/DELETE)

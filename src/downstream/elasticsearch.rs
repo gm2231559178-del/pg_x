@@ -12,7 +12,6 @@ use crate::utils::config::ResolverConfig;
 /// Elasticsearch downstream sink.
 /// Receives NOTIFY events with a ContractMessage containing query name and variables,
 /// executes the named GraphQL query, and pushes the assembled document to Elasticsearch.
-#[allow(dead_code)]
 pub struct ElasticsearchDownstream {
     es_url: String,
     index: String,
@@ -21,14 +20,15 @@ pub struct ElasticsearchDownstream {
     pool: QueryPool,
     queries: QueryLoader,
     resolvers: HashMap<String, ResolverConfig>,
+    max_depth: u32,
 }
 
-#[allow(dead_code)]
 impl ElasticsearchDownstream {
     pub fn new(
         es_url: &str,
         index: &str,
         id_field: Option<String>,
+        max_depth: u32,
         pool: QueryPool,
         resolvers: HashMap<String, ResolverConfig>,
         schema_dir: Option<PathBuf>,
@@ -51,6 +51,7 @@ impl ElasticsearchDownstream {
             es_url: es_url.trim_end_matches('/').to_string(),
             index: index.to_string(),
             id_field,
+            max_depth,
             client,
             pool,
             queries,
@@ -94,8 +95,14 @@ impl Downstream for ElasticsearchDownstream {
             .get(query_name)
             .ok_or_else(|| anyhow::anyhow!("No named query '{}' found for ES sink", query_name))?;
 
-        let result: serde_json::Value =
-            executor::execute(query, &variables, &self.resolvers, &self.pool).await?;
+        let result: serde_json::Value = executor::execute(
+            query,
+            &variables,
+            &self.resolvers,
+            &self.pool,
+            self.max_depth,
+        )
+        .await?;
 
         let doc_id = self.id_field.as_ref().and_then(|idf| match &result {
             serde_json::Value::Object(m) => {

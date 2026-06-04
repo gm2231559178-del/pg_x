@@ -117,7 +117,10 @@ pub fn parse_pgoutput_boundary(data: &Bytes) -> ReplResult<Option<PgOutputBounda
         }
         let (h, t) = p.split_at(4);
         *p = t;
-        Ok(i32::from_be_bytes(h.try_into().unwrap()))
+        Ok(i32::from_be_bytes(
+            h.try_into()
+                .expect("len < 4 check above guarantees 4 bytes"),
+        ))
     }
     fn take_i64(p: &mut &[u8]) -> ReplResult<i64> {
         if p.len() < 8 {
@@ -125,7 +128,10 @@ pub fn parse_pgoutput_boundary(data: &Bytes) -> ReplResult<Option<PgOutputBounda
         }
         let (h, t) = p.split_at(8);
         *p = t;
-        Ok(i64::from_be_bytes(h.try_into().unwrap()))
+        Ok(i64::from_be_bytes(
+            h.try_into()
+                .expect("len < 8 check above guarantees 8 bytes"),
+        ))
     }
 
     match tag {

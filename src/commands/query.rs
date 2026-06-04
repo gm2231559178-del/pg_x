@@ -40,11 +40,21 @@ pub struct QueryArgs {
 pub async fn run(url: String, args: QueryArgs, use_tls: bool) -> Result<()> {
     let sql = resolve_sql(&args)?;
 
-    loop {
-        let client = connect(&url, use_tls).await?;
+    let mut client = connect(&url, use_tls).await?;
 
+    loop {
         let t0 = Instant::now();
-        let rows = client.query(sql.as_str(), &[]).await?;
+        let rows = match client.query(sql.as_str(), &[]).await {
+            Ok(r) => r,
+            Err(e) => {
+                if args.watch == 0 {
+                    return Err(e.into());
+                }
+                tracing::warn!("Query failed, reconnecting: {e}");
+                client = connect(&url, use_tls).await?;
+                continue;
+            }
+        };
         let elapsed = t0.elapsed();
 
         if args.watch > 0 {

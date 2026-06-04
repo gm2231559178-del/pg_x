@@ -35,6 +35,9 @@ pub struct RunArgs {
     /// Variables in KEY=VALUE format
     #[arg(short = 'V', long = "var", value_parser = parse_var)]
     pub vars: Vec<(String, String)>,
+    /// Max resolver recursion depth (default 8)
+    #[arg(long, default_value_t = 8)]
+    pub max_depth: u32,
     /// Print compact JSON (no pretty-print)
     #[arg(long, default_value_t = false)]
     pub compact: bool,
@@ -197,7 +200,8 @@ async fn run_query(
     let pool: QueryPool = QueryPool::connect(&url, use_tls).await?;
     let resolvers: &HashMap<String, crate::utils::config::ResolverConfig> = &config.resolvers;
 
-    let result: serde_json::Value = executor::execute(query, &variables, resolvers, &pool).await?;
+    let result: serde_json::Value =
+        executor::execute(query, &variables, resolvers, &pool, args.max_depth).await?;
 
     // Output
     let json_str = if args.compact {

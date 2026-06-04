@@ -47,16 +47,30 @@ pub mod webhook {
 
         async fn send(&self, event: &NotifyEvent) -> Result<()> {
             let msg = SimpleMessage::from(event);
-            self.client
-                .post(&self.url)
-                .json(&msg)
+            let req = self.client.post(&self.url).json(&msg);
+            send_with_retry(&self.client, req).await
+        }
+    }
+
+    async fn send_with_retry(_client: &Client, req: reqwest::RequestBuilder) -> Result<()> {
+        let mut attempt = 0u32;
+        loop {
+            let result = req
+                .try_clone()
+                .ok_or_else(|| anyhow::anyhow!("Request body not clonable"))?
                 .send()
                 .await
-                .context("Webhook POST failed")?
-                .error_for_status()
-                .context("Webhook returned error status")?;
+                .and_then(|r| r.error_for_status());
 
-            Ok(())
+            match result {
+                Ok(_) => return Ok(()),
+                Err(_) if attempt < 2 => {
+                    attempt += 1;
+                    let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e).context("Webhook POST failed after 3 retries"),
+            }
         }
     }
 
@@ -98,27 +112,17 @@ pub mod webhook {
                 merged.extend(r.webhook_headers.clone());
                 let headers = build_header_map(&merged);
 
-                self.client
-                    .post(url)
-                    .headers(headers)
-                    .json(&contract.data)
-                    .send()
-                    .await
-                    .context("Webhook POST failed")?
-                    .error_for_status()
-                    .context("Webhook returned error status")?;
+                let req = self.client.post(url).headers(headers).json(&contract.data);
+                send_with_retry(&self.client, req).await?;
             } else {
                 let msg = SimpleMessage::from(event);
                 let headers = build_header_map(&self.default_headers);
-                self.client
+                let req = self
+                    .client
                     .post(&self.default_url)
                     .headers(headers)
-                    .json(&msg)
-                    .send()
-                    .await
-                    .context("Webhook POST failed")?
-                    .error_for_status()
-                    .context("Webhook returned error status")?;
+                    .json(&msg);
+                send_with_retry(&self.client, req).await?;
             }
 
             Ok(())

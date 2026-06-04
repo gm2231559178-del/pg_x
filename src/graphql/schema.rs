@@ -3,9 +3,29 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// GraphQL keywords that are recognised but explicitly unsupported.
+const UNSUPPORTED_KEYWORDS: &[&str] = &[
+    "interface ",
+    "union ",
+    "enum ",
+    "input ",
+    "directive ",
+    "extend ",
+    "scalar ",
+    "fragment ",
+];
+
 /// A parsed GraphQL type system representation.
 /// This is NOT a full GraphQL schema parser — it handles the subset needed
 /// for document composition: object types with scalar fields and list relations.
+///
+/// Limitations (not supported):
+///   - Interfaces, unions, enums
+///   - Custom directives
+///   - Input types (use scalars instead)
+///   - Inline fragments (`... on Type`)
+///   - Non-null (`!`) is parsed but treated as optional at runtime
+///   - Arguments on fields are parsed but ignored during composition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaRegistry {
     /// Object types keyed by name (e.g. "Material", "Size", "Colorway")
@@ -118,7 +138,10 @@ impl SchemaRegistry {
                 // Check for inline open brace: type Foo { ... }
                 if trimmed.contains('{') && !trimmed.ends_with('{') {
                     // inline form: type Material { mat_no: String! }
-                    let body_start = trimmed.find('{').unwrap();
+                    // safe: contains('{') checked on previous line
+                    let body_start = trimmed
+                        .find('{')
+                        .expect("conditional above ensures '{' is present");
                     let after_brace = &trimmed[body_start + 1..];
                     // Walk character by character to find matching close brace
                     let mut depth = 1i32;
@@ -165,6 +188,18 @@ impl SchemaRegistry {
 
                 let (fields, relations) = parse_fields_and_relations(&body, type_names)?;
                 parsed_types.push((type_name.to_string(), fields, relations));
+            } else if UNSUPPORTED_KEYWORDS
+                .iter()
+                .any(|kw| trimmed.starts_with(kw))
+            {
+                let kw = UNSUPPORTED_KEYWORDS
+                    .iter()
+                    .find(|kw| trimmed.starts_with(*kw))
+                    .unwrap();
+                anyhow::bail!(
+                    "Unsupported GraphQL construct '{kw}' — pgx only supports object types (`type Name {{ ... }}`). \
+                     See schema.rs doc comment for full list of limitations."
+                );
             } else {
                 lines.next();
             }

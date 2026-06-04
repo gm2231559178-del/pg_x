@@ -331,6 +331,10 @@ Subscribe to one or more NOTIFY channels and forward every notification to a
 downstream sink. Unlike `replicate`, this requires the application to call
 `pg_notify()` explicitly.
 
+> **Delivery:** at-most-once. If the process exits or crashes between receiving
+> a NOTIFY and forwarding it to the downstream, the event is lost. Use
+> `replicate` for exactly-once delivery via WAL slots.
+
 ### Two forwarding modes
 
 | Mode       | Description                                                                        |

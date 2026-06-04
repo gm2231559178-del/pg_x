@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// GraphQL keywords that are recognised but explicitly unsupported.
+const UNSUPPORTED_KEYWORDS: &[&str] = &[
+    "interface ", "union ", "enum ", "input ", "directive ", "extend ", "scalar ", "fragment ",
+];
+
 /// A parsed GraphQL type system representation.
 /// This is NOT a full GraphQL schema parser — it handles the subset needed
 /// for document composition: object types with scalar fields and list relations.
@@ -174,8 +179,17 @@ impl SchemaRegistry {
                     body.push('\n');
                 }
 
-                let (fields, relations) = parse_fields_and_relations(&body, type_names)?;
+                        let (fields, relations) = parse_fields_and_relations(&body, type_names)?;
                 parsed_types.push((type_name.to_string(), fields, relations));
+            } else if UNSUPPORTED_KEYWORDS.iter().any(|kw| trimmed.starts_with(kw)) {
+                let kw = UNSUPPORTED_KEYWORDS
+                    .iter()
+                    .find(|kw| trimmed.starts_with(*kw))
+                    .unwrap();
+                anyhow::bail!(
+                    "Unsupported GraphQL construct '{kw}' — pgx only supports object types (`type Name {{ ... }}`). \
+                     See schema.rs doc comment for full list of limitations."
+                );
             } else {
                 lines.next();
             }

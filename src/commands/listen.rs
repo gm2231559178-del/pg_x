@@ -143,15 +143,6 @@ impl std::str::FromStr for ForwardMode {
     }
 }
 
-/// Exponential backoff with ±20% jitter. Shift is clamped to avoid u64 overflow.
-fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> std::time::Duration {
-    let shift = attempt.saturating_sub(1).min(62);
-    let base = (base_ms.saturating_mul(1u64 << shift)).min(max_ms);
-    let jitter = base / 5;
-    let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));
-    std::time::Duration::from_millis(delay_ms)
-}
-
 /// Escape a channel name so it can be safely used in LISTEN "..."
 fn escape_channel(ch: &str) -> String {
     ch.replace('"', "\"\"")
@@ -310,7 +301,7 @@ pub async fn run(
                 ));
             }
 
-            let delay = backoff_delay(consecutive_failures, reconnect_base_ms, reconnect_max_ms);
+            let delay = crate::utils::backoff::delay(consecutive_failures, reconnect_base_ms, reconnect_max_ms);
 
             warn!(
                 consecutive_failures,

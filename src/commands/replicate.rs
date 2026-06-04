@@ -664,7 +664,9 @@ pub async fn run(
             args.tables = cfg.tables.clone();
         }
         if args.ops.is_empty() && !cfg.ops.is_empty() {
-            args.ops = cfg.ops.iter().filter_map(|o| o.parse().ok()).collect();
+            args.ops = cfg.ops.iter().filter_map(|o| {
+                o.parse().map_err(|_| tracing::warn!("Ignoring invalid op filter '{o}' in config (expected insert|update|delete|truncate)")).ok()
+            }).collect();
         }
         if !args.temporary && cfg.temporary.unwrap_or(false) {
             args.temporary = true;
@@ -850,10 +852,7 @@ pub async fn run(
         if attempt > 0 {
             let infinite = max_reconnect_attempts == 0;
 
-            let base = (reconnect_base_ms * (1u64 << (attempt - 1).min(6))).min(reconnect_max_ms);
-            let jitter = base / 5;
-            let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));
-            let delay = std::time::Duration::from_millis(delay_ms);
+            let delay = crate::utils::backoff::delay(attempt, reconnect_base_ms, reconnect_max_ms);
 
             warn!(
                 attempt,

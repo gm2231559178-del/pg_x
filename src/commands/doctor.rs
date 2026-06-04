@@ -94,7 +94,7 @@ fn check_config(all_ok: &mut bool) {
             println!("       {} connection(s), default: {default}", conn_count);
             for (name, conn) in &cfg.connections {
                 let desc = conn.description.as_deref().unwrap_or("");
-                println!("         {name:<20} {}  {desc}", conn.url);
+                println!("         {name:<20} {}  {desc}", mask_password(&conn.url));
             }
         }
         Err(e) => {

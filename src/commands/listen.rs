@@ -301,7 +301,11 @@ pub async fn run(
                 ));
             }
 
-            let delay = crate::utils::backoff::delay(consecutive_failures, reconnect_base_ms, reconnect_max_ms);
+            let delay = crate::utils::backoff::delay(
+                consecutive_failures,
+                reconnect_base_ms,
+                reconnect_max_ms,
+            );
 
             warn!(
                 consecutive_failures,

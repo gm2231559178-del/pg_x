@@ -11,6 +11,7 @@ A feature-rich PostgreSQL CLI tool — beyond psql.
 | `info`      | Show server version, databases, tables, connections               |
 | `listen`    | Subscribe to NOTIFY channels and forward to downstream sinks      |
 | `replicate` | Stream WAL changes via logical replication (INSERT/UPDATE/DELETE) |
+| `graphql`   | Validate and run named GraphQL queries with batched SQL resolvers |
 
 ---
 
@@ -78,6 +79,11 @@ PostgreSQL replication wire protocol (no libpq, no external replication crate).
 | Setup      | None                                | `wal_level=logical` + publication          |
 | Durability | At-most-once                        | Exactly-once via replication slot          |
 | Resume     | No                                  | Yes — stores LSN checkpoint in slot        |
+
+> **Note:** `replicate` always emits full WAL event JSON. The contract
+> routing metadata (custom exchange, topic, headers) available in `listen` sinks
+> is driven by application-layer `pg_notify()` payloads and is not available
+> in the replication stream.
 
 ### PostgreSQL prerequisites
 

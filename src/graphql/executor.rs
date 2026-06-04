@@ -116,7 +116,9 @@ async fn resolve_children_with_depth(
             m.insert(
                 field_name.to_string(),
                 if children.len() == 1 && !is_to_many(resolver) {
-                    children.into_iter().next().expect("invariant: len == 1")
+                    let val = children.into_iter().next()
+                        .ok_or_else(|| anyhow::anyhow!("expected 1 child, got 0 for field '{}'", field_name))?;
+                    val
                 } else {
                     Value::Array(children)
                 },
@@ -228,7 +230,8 @@ async fn execute_batched(
     }
 
     if root_values.len() == 1 {
-        Ok(root_values.into_iter().next().expect("invariant: len == 1"))
+        Ok(root_values.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!("expected 1 root value, got 0"))?)
     } else {
         Ok(Value::Array(root_values))
     }

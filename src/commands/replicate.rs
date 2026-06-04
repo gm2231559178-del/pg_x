@@ -236,7 +236,10 @@ impl WalSink for StdoutSink {
     async fn send_wal(&self, event_json: &str, _env: &HashMap<String, String>) -> Result<()> {
         if self.pretty {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(event_json) {
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                if let Ok(s) = serde_json::to_string_pretty(&v) {
+                    println!("{s}");
+                    return Ok(());
+                }
                 return Ok(());
             }
         }
@@ -763,12 +766,14 @@ pub async fn run(
     // across connections, and re-running ensure_slot on every reconnect is
     // harmless but noisy.
     //
-    // Known limitation: this management connection is NOT recreated during
-    // retries. If the PostgreSQL server restarts, the slot cleanup/creation
-    // (lines below) still ran before the reconnect loop, so the replication
-    // client will reconnect successfully — but the mgmt_client will be a
-    // stale handle. This is acceptable because mgmt_client is only used for
-    // one-time setup, not during the streaming retry loop.
+    // TODO: this management connection is NOT recreated during retries.
+    // If the PostgreSQL server restarts, the slot cleanup/creation (lines
+    // below) still ran before the reconnect loop, so the replication client
+    // will reconnect successfully — but the mgmt_client will be a stale
+    // handle. This is acceptable because mgmt_client is only used for
+    // one-time setup, not during the streaming retry loop, but the stale
+    // handle will be a problem if health-check or slot-status polling is
+    // ever added inside the loop.
     info!("Connecting to PostgreSQL…");
 
     let mgmt_connector = tls::build_tls(use_tls)?;
@@ -869,12 +874,6 @@ pub async fn run(
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
-
-            if !infinite && attempt >= max_reconnect_attempts {
-                return Err(anyhow::anyhow!(
-                    "Giving up after {max_reconnect_attempts} consecutive connection failures"
-                ));
-            }
         }
 
         // ── Open replication stream ───────────────────────────────────────────
@@ -893,6 +892,11 @@ pub async fn run(
             Err(e) => {
                 error!(error = %e, "Failed to open replication connection");
                 attempt += 1;
+                if max_reconnect_attempts > 0 && attempt > max_reconnect_attempts {
+                    return Err(anyhow::anyhow!(
+                        "Giving up after {max_reconnect_attempts} consecutive connection failures"
+                    ));
+                }
                 continue;
             }
         };

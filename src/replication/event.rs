@@ -1,3 +1,4 @@
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 /// |--------------|--------------------------------------------|---------------------|
 /// | `'t'`        | Text value (even if the text is "NULL")    | `"some text"`       |
 /// | `'n'`        | SQL NULL                                   | `null`              |
-/// | `'u'`        | Unchanged / not sent (TOAST or non-key)    | `"__pgx_unchanged"` |
+/// | `'u'`        | Unchanged / not sent (TOAST or non-key)    | `{"$unchanged": true}` |
 ///
 /// The `'u'` case appears in:
 /// - UPDATE old-tuples under `REPLICA IDENTITY DEFAULT/INDEX` for non-key columns
@@ -52,8 +53,13 @@ impl Serialize for ColVal {
         match self {
             ColVal::Text(v) => s.serialize_str(v),
             ColVal::Null => s.serialize_none(),
-            // Use a sentinel string so consumers can tell "not sent" from NULL
-            ColVal::Unchanged => s.serialize_str("__pgx_unchanged"),
+            // Use a structured marker so consumers can tell "not sent" from NULL
+            // without needing to know a magic string.
+            ColVal::Unchanged => {
+                let mut map = s.serialize_map(Some(1))?;
+                map.serialize_entry("$unchanged", &true)?;
+                map.end()
+            }
         }
     }
 }
@@ -226,7 +232,7 @@ mod tests {
     #[test]
     fn colval_serialize_unchanged() {
         let v = serde_json::to_value(&ColVal::Unchanged).unwrap();
-        assert_eq!(v, serde_json::json!("__pgx_unchanged"));
+        assert_eq!(v, serde_json::json!({"$unchanged": true}));
     }
 
     // ── WalEvent ─────────────────────────────────────────────────────────────

@@ -232,9 +232,9 @@ PostgreSQL's WAL contains three distinct states for each column in old-row tuple
 |---|---|
 | `"alice"` | The actual SQL value |
 | `null` | The column is SQL NULL |
-| `"__pgx_unchanged"` | Column not sent by the server (see below) |
+| `{"$unchanged": true}` | Column not sent by the server (see below) |
 
-**Why `__pgx_unchanged` appears** — under the default `REPLICA IDENTITY DEFAULT`,
+The `{"$unchanged": true}` marker appears because under the default `REPLICA IDENTITY DEFAULT`,
 PostgreSQL only includes the primary key column(s) in old-row tuples. All other
 columns receive the `'u'` (unchanged/not-sent) tag in the WAL.
 
@@ -245,7 +245,7 @@ ALTER TABLE public.orders REPLICA IDENTITY FULL;
 ```
 
 With `REPLICA IDENTITY FULL`, every column in the old tuple is sent with its actual
-value, and `__pgx_unchanged` will never appear.
+value, and `{"$unchanged": true}` will never appear.
 
 **What you see per operation:**
 
@@ -253,7 +253,7 @@ value, and `__pgx_unchanged` will never appear.
 |---|---|---|
 | INSERT `old` | absent | absent (there is no old row) |
 | UPDATE `old` | `null` when no key col changed; key cols only otherwise | all columns |
-| DELETE `old` | key cols only; rest are `__pgx_unchanged` | all columns |
+| DELETE `old` | key cols only; rest are `{"$unchanged": true}` | all columns |
 
 ---
 
@@ -274,9 +274,9 @@ value, and `__pgx_unchanged` will never appear.
   "old": { "id": "42", "status": "pending", "total": "99.95" },
   "new": { "id": "42", "status": "shipped", "total": "99.95" } }
 
-// DELETE — non-key columns are "__pgx_unchanged" under DEFAULT identity
+// DELETE — non-key columns are {"$unchanged": true} under DEFAULT identity
 { "op": "delete", "rel_id": 16391, "schema": "public", "table": "orders",
-  "old": { "id": "42", "status": "__pgx_unchanged", "total": "__pgx_unchanged" } }
+  "old": { "id": "42", "status": {"$unchanged": true}, "total": {"$unchanged": true} } }
 
 // DELETE with REPLICA IDENTITY FULL — full before image
 { "op": "delete", "rel_id": 16391, "schema": "public", "table": "orders",

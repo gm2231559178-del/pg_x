@@ -43,9 +43,9 @@ use crate::utils::tls;
 
 #[derive(Args)]
 pub struct ReplicateArgs {
-    /// Replication slot name (created automatically if it does not exist).
-    #[arg(long, default_value = "pgx_slot")]
-    pub slot: String,
+    /// Replication slot name (default: pgx_slot).
+    #[arg(long)]
+    pub slot: Option<String>,
 
     /// Publication name(s) to stream from (repeatable).
     /// Create with: CREATE PUBLICATION name FOR TABLE t1, t2;
@@ -639,8 +639,8 @@ pub async fn run(
 ) -> Result<()> {
     // Merge connection-level defaults into CLI args (CLI wins).
     if let Some(cfg) = conn.and_then(|c| c.replicate.as_ref()) {
-        if args.slot == "pgx_slot" && cfg.slot.is_some() {
-            args.slot = cfg.slot.clone().unwrap();
+        if args.slot.is_none() {
+            args.slot = cfg.slot.clone();
         }
         if args.publications.is_empty() && !cfg.publications.is_empty() {
             args.publications = cfg.publications.clone();
@@ -728,6 +728,7 @@ pub async fn run(
         }
     }
 
+    let slot_name = args.slot.clone().unwrap_or_else(|| "pgx_slot".to_string());
     let sink = build_wal_sink(&args.downstream).await?;
 
     // ── 1. Parse connection URL ───────────────────────────────────────────────
@@ -765,13 +766,13 @@ pub async fn run(
     // Slot lifecycle (once, before the retry loop).
     // Temporary slots are created by the replication client itself.
     if args.reset_slot {
-        warn!(slot = %args.slot, "Dropping slot (--reset-slot)");
-        slot::drop_slot(&mgmt_client, &args.slot).await?;
+        warn!(slot = %slot_name, "Dropping slot (--reset-slot)");
+        slot::drop_slot(&mgmt_client, &slot_name).await?;
     }
     if !args.temporary {
-        slot::ensure_slot(&mgmt_client, &args.slot, false).await?;
+        slot::ensure_slot(&mgmt_client, &slot_name, false).await?;
     }
-    info!(slot = %args.slot, "Slot ready");
+    info!(slot = %slot_name, "Slot ready");
 
     // ── 3. Build the base ReplicationConfig (cloned per attempt) ─────────────
     let pub_names = args.publications.join(", ");
@@ -789,7 +790,7 @@ pub async fn run(
         user,
         password,
         database,
-        slot: args.slot.clone(),
+        slot: slot_name.clone(),
         publication: pub_names.clone(),
         start_lsn: initial_lsn,
         temporary: args.temporary,

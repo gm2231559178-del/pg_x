@@ -16,19 +16,19 @@ pub struct ListenArgs {
     #[arg(short = 'C', long = "channel", required = true)]
     pub channels: Vec<String>,
 
-    /// Maximum consecutive reconnect attempts before giving up (0 = infinite).
+    /// Maximum consecutive reconnect attempts before giving up (0 = infinite, default).
     /// In containerized environments, set to a small number (e.g. 5) and rely
     /// on your restart policy, OR set to 0 to retry forever inside the process.
-    #[arg(long, env = "PGX_MAX_RECONNECT_ATTEMPTS", default_value_t = 0)]
-    pub max_reconnect_attempts: u32,
+    #[arg(long, env = "PGX_MAX_RECONNECT_ATTEMPTS")]
+    pub max_reconnect_attempts: Option<u32>,
 
-    /// Base reconnect delay in milliseconds (doubles each attempt).
-    #[arg(long, env = "PGX_RECONNECT_BASE_MS", default_value_t = 1_000)]
-    pub reconnect_base_ms: u64,
+    /// Base reconnect delay in milliseconds (doubles each attempt, default 1000).
+    #[arg(long, env = "PGX_RECONNECT_BASE_MS")]
+    pub reconnect_base_ms: Option<u64>,
 
-    /// Maximum reconnect delay cap in milliseconds.
-    #[arg(long, env = "PGX_RECONNECT_MAX_MS", default_value_t = 60_000)]
-    pub reconnect_max_ms: u64,
+    /// Maximum reconnect delay cap in milliseconds (default 60000).
+    #[arg(long, env = "PGX_RECONNECT_MAX_MS")]
+    pub reconnect_max_ms: Option<u64>,
 
     #[command(subcommand)]
     pub downstream: DownstreamCommand,
@@ -110,12 +110,12 @@ pub struct ShellArgs {
 #[cfg(feature = "elasticsearch")]
 #[derive(Args)]
 pub struct ElasticsearchArgs {
-    /// Elasticsearch URL.
-    #[arg(long, env = "ES_URL", default_value = "http://localhost:9200")]
-    pub es_url: String,
-    /// Elasticsearch index name.
-    #[arg(long, default_value = "pgx")]
-    pub index: String,
+    /// Elasticsearch URL (default: http://localhost:9200).
+    #[arg(long, env = "ES_URL")]
+    pub es_url: Option<String>,
+    /// Elasticsearch index name (default: pgx).
+    #[arg(long)]
+    pub index: Option<String>,
     /// Field to use as document _id.
     #[arg(long)]
     pub id_field: Option<String>,
@@ -169,14 +169,14 @@ pub async fn run(
         if args.channels.is_empty() && !cfg.channels.is_empty() {
             args.channels = cfg.channels.clone();
         }
-        if args.max_reconnect_attempts == 0 && cfg.max_reconnect_attempts.unwrap_or(0) > 0 {
-            args.max_reconnect_attempts = cfg.max_reconnect_attempts.unwrap();
+        if args.max_reconnect_attempts.is_none() {
+            args.max_reconnect_attempts = cfg.max_reconnect_attempts;
         }
-        if args.reconnect_base_ms == 1000 && cfg.reconnect_base_ms.unwrap_or(0) > 0 {
-            args.reconnect_base_ms = cfg.reconnect_base_ms.unwrap();
+        if args.reconnect_base_ms.is_none() {
+            args.reconnect_base_ms = cfg.reconnect_base_ms;
         }
-        if args.reconnect_max_ms == 60000 && cfg.reconnect_max_ms.unwrap_or(0) > 0 {
-            args.reconnect_max_ms = cfg.reconnect_max_ms.unwrap();
+        if args.reconnect_max_ms.is_none() {
+            args.reconnect_max_ms = cfg.reconnect_max_ms;
         }
 
         // Merge downstream sink defaults from config into CLI subcommand args.
@@ -259,11 +259,11 @@ pub async fn run(
                         schema_dir,
                     },
                 ) => {
-                    if a.es_url == "http://localhost:9200" {
-                        a.es_url = url.clone();
+                    if a.es_url.is_none() {
+                        a.es_url = Some(url.clone());
                     }
-                    if a.index == "pgx" {
-                        a.index = index.clone();
+                    if a.index.is_none() {
+                        a.index = Some(index.clone());
                     }
                     if a.id_field.is_none() {
                         a.id_field = id_field.clone();
@@ -278,6 +278,11 @@ pub async fn run(
         }
     }
 
+    // Resolve optional reconnect parameters to final defaults.
+    let max_reconnect_attempts = args.max_reconnect_attempts.unwrap_or(0);
+    let reconnect_base_ms = args.reconnect_base_ms.unwrap_or(1000);
+    let reconnect_max_ms = args.reconnect_max_ms.unwrap_or(60000);
+
     let sink: Arc<dyn Downstream> =
         build_downstream(&args.downstream, &url, use_tls, resolvers).await?;
 
@@ -291,25 +296,21 @@ pub async fn run(
     loop {
         // ── Backoff (skipped on first attempt) ────────────────────────────────
         if consecutive_failures > 0 {
-            let infinite = args.max_reconnect_attempts == 0;
+            let infinite = max_reconnect_attempts == 0;
 
-            if !infinite && consecutive_failures >= args.max_reconnect_attempts {
+            if !infinite && consecutive_failures >= max_reconnect_attempts {
                 error!(
                     consecutive_failures,
-                    max = args.max_reconnect_attempts,
+                    max = max_reconnect_attempts,
                     "Max reconnect attempts reached"
                 );
                 return Err(anyhow::anyhow!(
                     "Max reconnect attempts ({}) reached",
-                    args.max_reconnect_attempts
+                    max_reconnect_attempts
                 ));
             }
 
-            let delay = backoff_delay(
-                consecutive_failures,
-                args.reconnect_base_ms,
-                args.reconnect_max_ms,
-            );
+            let delay = backoff_delay(consecutive_failures, reconnect_base_ms, reconnect_max_ms);
 
             warn!(
                 consecutive_failures,
@@ -317,7 +318,7 @@ pub async fn run(
                 max_attempts = if infinite {
                     "∞".to_string()
                 } else {
-                    args.max_reconnect_attempts.to_string()
+                    max_reconnect_attempts.to_string()
                 },
                 "Connection lost, reconnecting…"
             );
@@ -556,10 +557,12 @@ async fn build_downstream(
             use std::path::PathBuf;
 
             let pool = QueryPool::connect(url, use_tls).await?;
+            let es_url = a.es_url.as_deref().unwrap_or("http://localhost:9200");
+            let index = a.index.as_deref().unwrap_or("pgx");
             let schema_dir = a.schema_dir.as_ref().map(PathBuf::from);
             let ds = ElasticsearchDownstream::new(
-                &a.es_url,
-                &a.index,
+                es_url,
+                index,
                 a.id_field.clone(),
                 pool,
                 resolvers.clone(),

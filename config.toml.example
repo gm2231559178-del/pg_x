@@ -1,5 +1,18 @@
 default = "local"
 
+# GraphQL resolver mappings — maps field names to SQL queries.
+# Used by the `listen elasticsearch` and `graphql` subcommands.
+# [resolvers.material]
+# sql = "SELECT mat_no, name, description FROM materials WHERE mat_no = ANY($1)"
+# param = "mat_no"
+# batch_by = "mat_no"
+#
+# [resolvers.sizes]
+# sql = "SELECT mat_no, size_code, name FROM sizes WHERE mat_no = ANY($1)"
+# param = "mat_no"
+# batch_by = "mat_no"
+# connection = "staging"
+
 [connections.local]
 url = "postgres://postgres:secret@localhost:5432/mydb"
 description = "Local dev database"

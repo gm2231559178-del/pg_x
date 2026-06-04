@@ -12,7 +12,6 @@ use crate::utils::config::ResolverConfig;
 /// Elasticsearch downstream sink.
 /// Receives NOTIFY events with a ContractMessage containing query name and variables,
 /// executes the named GraphQL query, and pushes the assembled document to Elasticsearch.
-#[allow(dead_code)]
 pub struct ElasticsearchDownstream {
     es_url: String,
     index: String,
@@ -23,7 +22,6 @@ pub struct ElasticsearchDownstream {
     resolvers: HashMap<String, ResolverConfig>,
 }
 
-#[allow(dead_code)]
 impl ElasticsearchDownstream {
     pub fn new(
         es_url: &str,

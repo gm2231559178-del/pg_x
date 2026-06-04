@@ -95,8 +95,14 @@ impl Downstream for ElasticsearchDownstream {
             .get(query_name)
             .ok_or_else(|| anyhow::anyhow!("No named query '{}' found for ES sink", query_name))?;
 
-        let result: serde_json::Value =
-            executor::execute(query, &variables, &self.resolvers, &self.pool, self.max_depth).await?;
+        let result: serde_json::Value = executor::execute(
+            query,
+            &variables,
+            &self.resolvers,
+            &self.pool,
+            self.max_depth,
+        )
+        .await?;
 
         let doc_id = self.id_field.as_ref().and_then(|idf| match &result {
             serde_json::Value::Object(m) => {

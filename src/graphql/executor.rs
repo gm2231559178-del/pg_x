@@ -211,7 +211,14 @@ async fn execute_batched(
 
         // Resolve child fields with batching using DataLoader
         if !field.children.is_empty() && root_values.len() > 1 {
-            resolve_children_batched(&mut root_values, &field.children, resolvers, pool, max_depth).await?;
+            resolve_children_batched(
+                &mut root_values,
+                &field.children,
+                resolvers,
+                pool,
+                max_depth,
+            )
+            .await?;
         } else if !field.children.is_empty() {
             // Single root row — use direct resolver (no batching needed)
             for root_val in &mut root_values {

@@ -83,6 +83,18 @@ pub struct ReplicateArgs {
     #[arg(long)]
     pub emit_schema: bool,
 
+    /// Maximum consecutive reconnect attempts before giving up (0 = infinite, default 10).
+    #[arg(long, env = "PGX_REPLICATE_MAX_RECONNECT_ATTEMPTS")]
+    pub max_reconnect_attempts: Option<u32>,
+
+    /// Base reconnect delay in milliseconds (doubles each attempt, default 1000).
+    #[arg(long, env = "PGX_REPLICATE_RECONNECT_BASE_MS")]
+    pub reconnect_base_ms: Option<u64>,
+
+    /// Maximum reconnect delay cap in milliseconds (default 60000).
+    #[arg(long, env = "PGX_REPLICATE_RECONNECT_MAX_MS")]
+    pub reconnect_max_ms: Option<u64>,
+
     #[command(subcommand)]
     pub downstream: ReplicateDownstreamCommand,
 }
@@ -660,6 +672,15 @@ pub async fn run(
         if !args.emit_schema && cfg.emit_schema.unwrap_or(false) {
             args.emit_schema = true;
         }
+        if args.max_reconnect_attempts.is_none() {
+            args.max_reconnect_attempts = cfg.max_reconnect_attempts;
+        }
+        if args.reconnect_base_ms.is_none() {
+            args.reconnect_base_ms = cfg.reconnect_base_ms;
+        }
+        if args.reconnect_max_ms.is_none() {
+            args.reconnect_max_ms = cfg.reconnect_max_ms;
+        }
 
         // Merge downstream sink defaults from config into CLI subcommand args.
         if let Some(sink_cfg) = &cfg.sink {
@@ -729,6 +750,9 @@ pub async fn run(
     }
 
     let slot_name = args.slot.clone().unwrap_or_else(|| "pgx_slot".to_string());
+    let max_reconnect_attempts = args.max_reconnect_attempts.unwrap_or(10);
+    let reconnect_base_ms = args.reconnect_base_ms.unwrap_or(1000);
+    let reconnect_max_ms = args.reconnect_max_ms.unwrap_or(60000);
     let sink = build_wal_sink(&args.downstream).await?;
 
     // ── 1. Parse connection URL ───────────────────────────────────────────────
@@ -738,6 +762,13 @@ pub async fn run(
     // Slot management only happens once before the retry loop: slots survive
     // across connections, and re-running ensure_slot on every reconnect is
     // harmless but noisy.
+    //
+    // Known limitation: this management connection is NOT recreated during
+    // retries. If the PostgreSQL server restarts, the slot cleanup/creation
+    // (lines below) still ran before the reconnect loop, so the replication
+    // client will reconnect successfully — but the mgmt_client will be a
+    // stale handle. This is acceptable because mgmt_client is only used for
+    // one-time setup, not during the streaming retry loop.
     info!("Connecting to PostgreSQL…");
 
     let mgmt_connector = tls::build_tls(use_tls)?;
@@ -799,9 +830,6 @@ pub async fn run(
     };
 
     // ── 4. Reconnection loop ──────────────────────────────────────────────────
-    const BASE_DELAY_MS: u64 = 1_000;
-    const MAX_DELAY_MS: u64 = 60_000;
-    const MAX_ATTEMPTS: u32 = 10;
 
     // The confirmed LSN advances each successful session.  It seeds start_lsn
     // on the next connect so we resume from the last durable checkpoint.
@@ -815,14 +843,20 @@ pub async fn run(
     loop {
         // ── Backoff sleep (skipped on first attempt) ──────────────────────────
         if attempt > 0 {
-            let base = (BASE_DELAY_MS * (1u64 << (attempt - 1).min(6))).min(MAX_DELAY_MS);
+            let infinite = max_reconnect_attempts == 0;
+
+            let base = (reconnect_base_ms * (1u64 << (attempt - 1).min(6))).min(reconnect_max_ms);
             let jitter = base / 5;
             let delay_ms = base - jitter + (rand::random::<u64>() % (jitter * 2 + 1));
             let delay = std::time::Duration::from_millis(delay_ms);
 
             warn!(
                 attempt,
-                max_attempts = MAX_ATTEMPTS,
+                max_attempts = if infinite {
+                    "∞".to_string()
+                } else {
+                    max_reconnect_attempts.to_string()
+                },
                 delay_secs = delay.as_secs_f32(),
                 "Reconnecting after connection loss"
             );
@@ -835,12 +869,12 @@ pub async fn run(
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
-        }
 
-        if attempt >= MAX_ATTEMPTS {
-            return Err(anyhow::anyhow!(
-                "Giving up after {MAX_ATTEMPTS} consecutive connection failures"
-            ));
+            if !infinite && attempt >= max_reconnect_attempts {
+                return Err(anyhow::anyhow!(
+                    "Giving up after {max_reconnect_attempts} consecutive connection failures"
+                ));
+            }
         }
 
         // ── Open replication stream ───────────────────────────────────────────

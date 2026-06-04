@@ -91,7 +91,7 @@ pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                    .unwrap()
+                    .expect("static template string always valid")
                     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
             );
             pb.set_message(format!("Executing «{}»…", block.sheet));

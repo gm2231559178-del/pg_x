@@ -61,25 +61,41 @@ impl<'a> Buf<'a> {
     }
     fn read_i32(&mut self) -> Result<i32> {
         self.ensure(4)?;
-        let v = i32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        let v = i32::from_be_bytes(
+            self.data[self.pos..self.pos + 4]
+                .try_into()
+                .expect("ensure(4) guarantees 4 bytes"),
+        );
         self.pos += 4;
         Ok(v)
     }
     fn read_u32(&mut self) -> Result<u32> {
         self.ensure(4)?;
-        let v = u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        let v = u32::from_be_bytes(
+            self.data[self.pos..self.pos + 4]
+                .try_into()
+                .expect("ensure(4) guarantees 4 bytes"),
+        );
         self.pos += 4;
         Ok(v)
     }
     fn read_u64(&mut self) -> Result<u64> {
         self.ensure(8)?;
-        let v = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+        let v = u64::from_be_bytes(
+            self.data[self.pos..self.pos + 8]
+                .try_into()
+                .expect("ensure(8) guarantees 8 bytes"),
+        );
         self.pos += 8;
         Ok(v)
     }
     fn read_i64(&mut self) -> Result<i64> {
         self.ensure(8)?;
-        let v = i64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+        let v = i64::from_be_bytes(
+            self.data[self.pos..self.pos + 8]
+                .try_into()
+                .expect("ensure(8) guarantees 8 bytes"),
+        );
         self.pos += 8;
         Ok(v)
     }

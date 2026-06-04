@@ -90,6 +90,15 @@ pub struct ReplicateSinkConfig {
     /// Emit RELATION events.
     pub emit_schema: Option<bool>,
 
+    /// Maximum reconnect attempts (0 = infinite). Default: 10.
+    pub max_reconnect_attempts: Option<u32>,
+
+    /// Base reconnect delay in milliseconds. Default: 1000.
+    pub reconnect_base_ms: Option<u64>,
+
+    /// Maximum reconnect delay cap in milliseconds. Default: 60000.
+    pub reconnect_max_ms: Option<u64>,
+
     /// Downstream sink kind and its options.
     pub sink: Option<DownstreamSinkKind>,
 }

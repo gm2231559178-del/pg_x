@@ -1,3 +1,4 @@
+pub mod consume;
 pub mod doctor;
 pub mod export;
 pub mod graphql;

@@ -1,4 +1,5 @@
 mod commands;
+mod consumer;
 mod downstream;
 mod graphql;
 mod replication;
@@ -6,7 +7,7 @@ mod utils;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use commands::{doctor, export, info, listen, profiles, psql, query, replicate};
+use commands::{consume, doctor, export, info, listen, profiles, psql, query, replicate};
 use utils::config::Config;
 
 /// pgx — PostgreSQL power CLI (beyond psql & pg_*)
@@ -75,6 +76,9 @@ enum Commands {
 
     /// GraphQL composition engine: validate and run named queries
     Graphql(commands::graphql::GraphqlArgs),
+
+    /// Consume messages from a broker, compose GraphQL, and sink downstream
+    Consume(commands::consume::ConsumeArgs),
 }
 
 #[tokio::main]
@@ -126,6 +130,7 @@ async fn main() -> Result<()> {
         Commands::Listen(args) => listen::run(url, args, conn, cli.tls, &cfg.resolvers).await,
         Commands::Replicate(args) => replicate::run(url, args, conn, cli.tls).await,
         Commands::Psql(args) => psql::run(url, args),
+        Commands::Consume(args) => consume::run(url, args, conn, cli.tls, &cfg.resolvers).await,
         Commands::Graphql(args) => {
             commands::graphql::run(url, args, conn_name.as_deref(), cli.tls).await
         }

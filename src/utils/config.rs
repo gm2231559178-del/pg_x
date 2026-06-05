@@ -43,6 +43,10 @@ pub struct Connection {
     /// Defaults for the `replicate` sub-command when using this connection.
     #[serde(default)]
     pub replicate: Option<ReplicateSinkConfig>,
+
+    /// Defaults for the `consume` sub-command when using this connection.
+    #[serde(default)]
+    pub consume: Option<ConsumeConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -159,6 +163,69 @@ pub enum DownstreamSinkKind {
         id_field: Option<String>,
         /// Schema directory override.
         schema_dir: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConsumeConfig {
+    /// Message source configuration.
+    pub source: ConsumeSourceKind,
+    /// Sink for the composed GraphQL document.
+    pub sink: ConsumeSinkKind,
+    /// Query mode: "contract" (from message event_type) or "simple" (fixed).
+    pub query_mode: Option<String>,
+    /// Query name (required in simple mode).
+    pub query: Option<String>,
+    /// Maximum resolver recursion depth.
+    pub max_depth: Option<u32>,
+    /// Schema directory override.
+    pub schema_dir: Option<String>,
+    /// Error mode: "lenient" or "strict".
+    pub on_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConsumeSourceKind {
+    Rabbitmq {
+        amqp_url: Option<String>,
+        queue: Option<String>,
+        exchange: Option<String>,
+        routing_key: Option<String>,
+    },
+    Kafka {
+        brokers: Option<String>,
+        topic: Option<String>,
+        group_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConsumeSinkKind {
+    /// Print the composed document as JSON to stdout.
+    Stdout,
+    /// Index the document into Elasticsearch.
+    Elasticsearch {
+        url: String,
+        index: String,
+        id_field: Option<String>,
+    },
+    /// POST the document as JSON to a webhook URL.
+    Webhook {
+        url: String,
+        headers: Option<Vec<String>>,
+    },
+    /// Store the document in a key-value store (Redis / Memcached).
+    Kv {
+        /// KV store URL (redis://... or memcached://...).
+        url: String,
+        /// Field in the document to use as the cache key.
+        key_field: Option<String>,
+        /// Prefix to prepend to the cache key.
+        key_prefix: Option<String>,
+        /// TTL in seconds (0 = no expiry).
+        ttl: Option<u64>,
     },
 }
 

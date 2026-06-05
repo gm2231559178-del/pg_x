@@ -68,12 +68,31 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      rabbitmq:
+        image: rabbitmq:4-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client python3 redis-tools
 
       - name: Build
         run: cargo build --release
@@ -119,3 +138,17 @@ jobs:
 
       - name: Test replicate command
         run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_replicate.sh
+
+      - name: Setup GraphQL schema for consume test
+        run: |
+          mkdir -p ~/.pgx/schema ~/.pgx/queries
+          cp -r examples/graphql/pgx/schema/* ~/.pgx/schema/
+          cp -r examples/graphql/pgx/queries/* ~/.pgx/queries/
+          cp examples/graphql/pgx/config.toml ~/.pgx/config.toml
+          cat init.sql | docker exec -i ${{ job.services.postgres.id }} psql -U postgres -d postgres
+
+      - name: Test consume command
+        run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume.sh
+
+      - name: Test consume KV command
+        run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume_kv.sh

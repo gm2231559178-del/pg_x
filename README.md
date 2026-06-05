@@ -426,6 +426,115 @@ In contract mode:
 
 ---
 
+## consume — Message Broker → GraphQL → Sink
+
+Consume messages from a broker (RabbitMQ, Kafka), compose them through GraphQL
+with batched SQL resolvers, and forward the result to a sink. This enables a
+CDC → enrichment → indexed document pipeline.
+
+### Sources
+
+```bash
+# RabbitMQ
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --amqp-url amqp://guest:guest@localhost:5672/%2F \
+  --queue pgx-events \
+  --sink stdout
+
+# Kafka
+pgx -U $DATABASE_URL consume \
+  --source kafka \
+  --brokers localhost:9092 \
+  --topic pgx-events \
+  --group-id pgx \
+  --sink stdout
+```
+
+### Query modes
+
+| Mode       | Description                                                                     |
+| ---------- | ------------------------------------------------------------------------------- |
+| `contract` | Query name derived from `meta.event_type` in the ContractMessage payload        |
+| `simple`   | Fixed query name specified via `--query`                                        |
+
+### Sinks
+
+#### stdout
+
+Prints the composed GraphQL document as JSON to stdout.
+
+```bash
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink stdout
+```
+
+#### elasticsearch
+
+Indexes the composed document into Elasticsearch.
+
+```bash
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink elasticsearch \
+  --es-url http://localhost:9200 \
+  --index materials \
+  --id-field mat_no
+```
+
+#### webhook
+
+POSTs the composed document as JSON to an HTTP endpoint.
+
+```bash
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink webhook \
+  --webhook-url https://hooks.example.com/events
+```
+
+#### kv (Redis / Memcached)
+
+Stores the composed document as a JSON value in a key-value store. The cache key
+is derived from a field in the document.
+
+```bash
+# Redis
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink kv \
+  --kv-url redis://localhost:6379 \
+  --key-field mat_no \
+  --key-prefix pgx: \
+  --ttl 3600
+
+# Memcached
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink kv \
+  --kv-url memcached://localhost:11211 \
+  --key-field id \
+  --key-prefix session:
+```
+
+| Flag              | Description                                           | Default    |
+| ----------------- | ----------------------------------------------------- | ---------- |
+| `--kv-url`        | KV store URL (`redis://...` or `memcached://...`)     | `redis://localhost:6379` |
+| `--key-field`     | Document field whose value becomes the cache key      | auto-generates UUID |
+| `--key-prefix`    | String prepended to the cache key                     | `pgx:`    |
+| `--ttl`           | Time-to-live in seconds (`0` = no expiry)             | `0`       |
+
+The key is constructed as `{key_prefix}{value_of_key_field}`. If `key_field` is
+not set or the field is missing, a random UUID is used as the suffix.
+
+---
+
 ## Other commands
 
 ```bash
@@ -522,3 +631,4 @@ stdout / shell / webhook / rabbitmq / kafka
 | `webhook`  | ✅      | HTTP webhook downstream via `reqwest`                |
 | `kafka`    | ❌      | Kafka downstream via `rdkafka` (requires librdkafka) |
 | `tls`      | ❌      | TLS for the tokio-postgres control-plane connection  |
+| `kv`       | ✅      | Redis / Memcached key-value store sink               |

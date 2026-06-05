@@ -23,6 +23,7 @@ echo "==> consume: setting up schema directory"
 mkdir -p ~/.pgx/schema ~/.pgx/queries
 cp -r examples/graphql/pgx/schema/* ~/.pgx/schema/
 cp -r examples/graphql/pgx/queries/* ~/.pgx/queries/
+cp examples/graphql/pgx/config.toml ~/.pgx/config.toml
 
 echo "==> consume: declaring RabbitMQ exchange 'pgx'"
 curl -u guest:guest -X PUT http://localhost:15672/api/exchanges/%2F/pgx \

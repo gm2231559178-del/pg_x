@@ -63,7 +63,7 @@ sleep 3
 
 echo "==> consume-kv: verifying document in Redis"
 VALUE=$(redis-cli -h localhost -p 6379 GET "pgx:M001")
-if echo "$VALUE" | grep -q '"mat_no": "M001"' && \
+if echo "$VALUE" | grep -q '"mat_no":"M001"' && \
    echo "$VALUE" | grep -q '"sizes"' && \
    echo "$VALUE" | grep -q '"colorways"'; then
   echo "==> consume-kv: document verified in Redis"

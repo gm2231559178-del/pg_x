@@ -72,6 +72,20 @@ pub struct ConsumeArgs {
     // ── Sink: Webhook ──
     #[arg(long, env = "WEBHOOK_URL")]
     pub webhook_url: Option<String>,
+
+    // ── Sink: KV (Redis / Memcached) ──
+    /// KV store URL (redis://... or memcached://...)
+    #[arg(long, env = "KV_URL")]
+    pub kv_url: Option<String>,
+    /// Field in the document to use as the cache key
+    #[arg(long)]
+    pub key_field: Option<String>,
+    /// Prefix to prepend to the cache key
+    #[arg(long, default_value = "pgx:")]
+    pub key_prefix: String,
+    /// TTL in seconds (0 = no expiry)
+    #[arg(long, default_value_t = 0)]
+    pub ttl: u64,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -85,6 +99,8 @@ pub enum ConsumeSinkType {
     Stdout,
     Elasticsearch,
     Webhook,
+    /// Key-value store (Redis / Memcached). Requires the 'kv' feature.
+    Kv,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -197,10 +213,15 @@ impl ConsumeSink for WebhookConsumeSink {
     }
 }
 
+// ── KV sink (Redis / Memcached) ───────────────────────────────────────────────
+
+#[cfg(feature = "kv")]
+use crate::consumer::kv::KvConsumeSink;
+
 // ── Builders ─────────────────────────────────────────────────────────────────
 
 #[allow(unused_variables)]
-fn build_sink(args: &ConsumeArgs) -> Result<Arc<dyn ConsumeSink>> {
+async fn build_sink(args: &ConsumeArgs) -> Result<Arc<dyn ConsumeSink>> {
     match args.sink {
         ConsumeSinkType::Stdout => Ok(Arc::new(StdoutConsumeSink)),
 
@@ -247,6 +268,20 @@ fn build_sink(args: &ConsumeArgs) -> Result<Arc<dyn ConsumeSink>> {
         #[cfg(not(feature = "webhook"))]
         ConsumeSinkType::Webhook => {
             anyhow::bail!("Webhook sink requires the 'webhook' feature")
+        }
+
+        #[cfg(feature = "kv")]
+        ConsumeSinkType::Kv => {
+            let url = args.kv_url.as_deref().unwrap_or("redis://localhost:6379");
+            let sink =
+                KvConsumeSink::connect(url, &args.key_prefix, args.key_field.clone(), args.ttl)
+                    .await?;
+            Ok(Arc::new(sink))
+        }
+
+        #[cfg(not(feature = "kv"))]
+        ConsumeSinkType::Kv => {
+            anyhow::bail!("KV sink requires the 'kv' feature")
         }
     }
 }
@@ -398,7 +433,7 @@ pub async fn run(
     let default_query = args.query.clone().unwrap_or_else(|| "default".to_string());
 
     // ── Build sink ───────────────────────────────────────────────────────────
-    let sink: Arc<dyn ConsumeSink> = build_sink(&args)?;
+    let sink: Arc<dyn ConsumeSink> = build_sink(&args).await?;
     info!("Using {} sink", sink.name());
 
     // ── Consume loop ─────────────────────────────────────────────────────────
@@ -583,6 +618,36 @@ fn merge_sink_config(args: &mut ConsumeArgs, sink: &ConsumeSinkKind) {
             if args.webhook_url.is_none() {
                 args.webhook_url = Some(url.clone());
             }
+        }
+        #[cfg(feature = "kv")]
+        ConsumeSinkKind::Kv {
+            url,
+            key_field,
+            key_prefix,
+            ttl,
+        } => {
+            args.sink = ConsumeSinkType::Kv;
+            if args.kv_url.is_none() {
+                args.kv_url = Some(url.clone());
+            }
+            if args.key_field.is_none() {
+                args.key_field = key_field.clone();
+            }
+            if args.key_prefix == "pgx:" {
+                if let Some(p) = key_prefix {
+                    args.key_prefix = p.clone();
+                }
+            }
+            if args.ttl == 0 {
+                if let Some(t) = ttl {
+                    args.ttl = *t;
+                }
+            }
+        }
+        #[cfg(not(feature = "kv"))]
+        ConsumeSinkKind::Kv { .. } => {
+            // Cannot configure KV sink without the 'kv' feature;
+            // build_sink will produce a clear error.
         }
     }
 }

@@ -47,6 +47,20 @@ mode = "simple"
 # query_mode = "simple"
 # query = "OrderFull"
 # on_error = "strict"
+#
+# Consume and store in Redis:
+#
+# [connections.local.consume]
+# source = { type = "rabbitmq", amqp_url = "amqp://guest:guest@localhost:5672/%2F", queue = "pgx-events" }
+# sink = { type = "kv", url = "redis://localhost:6379", key_field = "id", key_prefix = "pgx:", ttl = 3600 }
+# query_mode = "contract"
+#
+# Consume and store in Memcached:
+#
+# [connections.local.consume]
+# source = { type = "rabbitmq", amqp_url = "amqp://guest:guest@localhost:5672/%2F", queue = "pgx-events" }
+# sink = { type = "kv", url = "memcached://localhost:11211", key_field = "id", key_prefix = "pgx:" }
+# query_mode = "contract"
 
 [connections.local.replicate]
 slot = "my_slot"

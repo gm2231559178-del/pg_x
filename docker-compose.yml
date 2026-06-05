@@ -46,6 +46,23 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: pgx_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  memcached:
+    image: memcached:1-alpine
+    container_name: pgx_memcached
+    ports:
+      - "11211:11211"
+
 volumes:
   pgdata:
   esdata:

@@ -216,6 +216,17 @@ pub enum ConsumeSinkKind {
         url: String,
         headers: Option<Vec<String>>,
     },
+    /// Store the document in a key-value store (Redis / Memcached).
+    Kv {
+        /// KV store URL (redis://... or memcached://...).
+        url: String,
+        /// Field in the document to use as the cache key.
+        key_field: Option<String>,
+        /// Prefix to prepend to the cache key.
+        key_prefix: Option<String>,
+        /// TTL in seconds (0 = no expiry).
+        ttl: Option<u64>,
+    },
 }
 
 impl Config {

@@ -1,12 +1,14 @@
 # pgx GraphQL Practice Setup
 
 End-to-end demo: compose a material catalog with 3-tier nested data
-via GraphQL, and stream changes from PostgreSQL NOTIFY into Elasticsearch.
+via GraphQL, and stream changes from PostgreSQL NOTIFY into Elasticsearch,
+optionally via a message broker.
 
 ## Prerequisites
 
 - Docker & Docker Compose
 - `pgx` binary built (`cargo build --release`)
+- RabbitMQ feature enabled (default: on)
 
 ## 1. Start infrastructure
 
@@ -14,8 +16,8 @@ via GraphQL, and stream changes from PostgreSQL NOTIFY into Elasticsearch.
 docker compose up -d
 ```
 
-Starts PostgreSQL (`:5432`) with sample tables + NOTIFY trigger, and
-Elasticsearch (`:9200`).
+Starts PostgreSQL (`:5432`) with sample tables + NOTIFY trigger,
+RabbitMQ (`:5672`), and Elasticsearch (`:9200`).
 
 ## 2. Copy the pgx config
 
@@ -60,12 +62,12 @@ pgx graphql run MaterialFull -V mat_no=M002
 pgx graphql run MaterialFull -V mat_no=M003
 ```
 
-## 5. Stream changes into Elasticsearch (pgx listen)
+## 5. Stream changes directly into Elasticsearch (pgx listen)
 
 ### Start the listener
 
 ```bash
-pgx listen --channel materials elasticsearch \
+pgx listen -C materials elasticsearch \
   --index materials \
   --id-field mat_no
 ```
@@ -130,71 +132,153 @@ Each document contains the full nested tree:
 }
 ```
 
-### With config-driven sink
+## 6. Pipeline through a message broker (pgx listen → RabbitMQ → pgx consume → ES)
 
-Instead of CLI flags, add to `~/.pgx/config.toml`:
+This flow separates the NOTIFY subscription from the GraphQL composition:
+`pgx listen` forwards to RabbitMQ, then `pgx consume` reads from RabbitMQ,
+composes the GraphQL document, and indexes it.
 
-```toml
-[connections.local.listen]
-channels = ["materials"]
-
-[connections.local.listen.sink]
-type = "elasticsearch"
-url = "http://localhost:9200"
-index = "materials"
-id_field = "mat_no"
-```
-
-Then start without subcommand args:
+### Terminal 1: Start the consume command
 
 ```bash
-pgx listen -C materials elasticsearch
+pgx consume \
+  --source rabbitmq --queue pgx-events --exchange pgx --routing-key 'pgx.notify' \
+  --sink elasticsearch --es-url http://localhost:9200 --index materials --id-field mat_no
+```
+
+This connects to RabbitMQ, waits for messages on the `pgx-events` queue
+(bound to exchange `pgx` with routing key `pgx.notify`), parses each as a
+ContractMessage, resolves the query from `meta.event_type` ("MaterialFull"),
+executes GraphQL composition, and indexes to Elasticsearch.
+
+### Terminal 2: Forward NOTIFY events to RabbitMQ
+
+```bash
+pgx listen -C materials rabbitmq \
+  --exchange pgx --routing-key pgx.notify \
+  --mode contract
+```
+
+This listens on PostgreSQL `materials` channel and publishes every
+ContractMessage to RabbitMQ with per-message routing from the contract.
+
+### Terminal 3: Trigger a change
+
+```bash
+docker compose exec postgres psql -U postgres \
+  -c "UPDATE materials SET name = name WHERE mat_no = 'M002';"
+```
+
+### Verify
+
+```bash
+curl http://localhost:9200/materials/_search?pretty
+```
+
+### Or skip the broker — run consume directly with a file/stdin (simple mode)
+
+```bash
+echo '{"mat_no": "M001"}' | pgx consume \
+  --source rabbitmq --queue test \
+  --query-mode simple --query MaterialFull \
+  --sink stdout
+```
+
+## 7. Consume examples with different options
+
+### Simple mode — fixed query, raw payload as variables
+
+```bash
+# Message body {"mat_no": "M003"} → query MaterialFull(mat_no: "M003")
+pgx consume \
+  --source rabbitmq --queue events \
+  --query-mode simple --query MaterialFull \
+  --sink stdout
+```
+
+### Strict error mode — abort on first failure
+
+```bash
+pgx consume \
+  --source kafka --brokers localhost:9092 --topic materials --group-id pgx \
+  --on-error strict \
+  --sink webhook --webhook-url https://hooks.example.com/materials
+```
+
+### Stdout sink — inspect the composed document
+
+```bash
+pgx consume \
+  --source rabbitmq --queue events \
+  --sink stdout
+```
+
+### All in one: config-driven consume
+
+Add to `~/.pgx/config.toml`:
+
+```toml
+[connections.local.consume]
+source = { type = "rabbitmq", amqp_url = "amqp://guest:guest@localhost:5672/%2F", queue = "pgx-events", exchange = "pgx", routing_key = "pgx.notify" }
+sink = { type = "elasticsearch", url = "http://localhost:9200", index = "materials", id_field = "mat_no" }
+query_mode = "contract"
+max_depth = 8
+on_error = "lenient"
+```
+
+Then run with just the connection profile:
+
+```bash
+pgx consume -c local
 ```
 
 ## Architecture
 
 ```
-┌──────────────┐     NOTIFY      ┌──────────────────┐
-│  PostgreSQL  │ ──────────────> │   pgx listen     │
-│              │                 │                  │
-│  materials   │  ContractMessage│  Elasticsearch   │
-│  trigger     │   {             │  Downstream      │
-│              │    meta: {      │       │          │
-│              │     event_type  │       │ GraphQL   │
-│              │    }            │       │ execute   │
-│              │    data: {      │       ▼          │
-│              │     mat_no }    │  ┌──────────────┐│
-│              │   }             │  │  executor    ││
-└──────────────┘                 │  │  DataLoader  ││
-                                 │  │  resolvers   ││
-                                 │  └──────┬───────┘│
-                                 │         │ SQL    │
-                                 │         ▼        │
-                                 │  ┌──────────────┐│
-                                 │  │  PostgreSQL  ││
-                                 │  └──────────────┘│
-                                 │         │        │
-                                 │         ▼        │
-                                 │  ┌──────────────┐│
-                                 │  │ Elasticsearch ││
-                                 │  │  POST _doc    ││
-                                 │  └──────────────┘│
-                                 └──────────────────┘
+                            ┌──────────────────────┐
+                            │     PostgreSQL        │
+                            │  NOTIFY channel       │
+                            │  "materials"          │
+                            └──────────┬───────────┘
+                                       │ ContractMessage
+                                       │ { event_type: "MaterialFull"
+                          ┌────────────┤   data: { mat_no } }
+                          │            │
+                          ▼            ▼
+              ┌──────────────────┐  ┌──────────────────┐
+              │   pgx listen     │  │   pgx listen     │
+              │   ES sink        │  │   RMQ sink       │
+              │   direct index   │  │   forward to     │
+              │                  │  │   RabbitMQ       │
+              └────────┬─────────┘  └────────┬─────────┘
+                       │                     │
+                       │                     ▼
+                       │              ┌──────────────────┐
+                       │              │    pgx consume   │
+                       │              │  RabbitMQ source  │
+                       │              │  GraphQL compose  │
+                       │              │  ES sink          │
+                       │              └────────┬─────────┘
+                       ▼                       │
+              ┌──────────────────┐              │
+              │  Elasticsearch   │◄─────────────┘
+              │  materials index │
+              └──────────────────┘
 ```
 
 ## Structure
 
 ```
 ~/.pgx/
-  config.toml              # Connection URL + resolvers
+  config.toml              # Connection URL + resolvers + listen/consume config
   schema/
     material.graphql       # type Material { ... }
     size.graphql           # type Size { ... }
     colorway.graphql       # type Colorway { ... }
     feature.graphql        # type MaterialFeature / FeatureAttribute { ... }
   queries/
-    MaterialFull.graphql   # 3-tier: material -> features -> attributes
+    MaterialFull.graphql   # 3-tier: material -> sizes -> colorways -> features -> attributes
 
-docker-compose.yml         # PostgreSQL + Elasticsearch
+docker-compose.yml         # PostgreSQL + RabbitMQ + Elasticsearch
 init.sql                   # Tables, seed data, NOTIFY trigger
 ```

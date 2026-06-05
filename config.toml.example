@@ -1,7 +1,7 @@
 default = "local"
 
 # GraphQL resolver mappings — maps field names to SQL queries.
-# Used by the `listen elasticsearch` and `graphql` subcommands.
+# Used by the `listen elasticsearch`, `graphql`, and `consume` subcommands.
 # [resolvers.material]
 # sql = "SELECT mat_no, name, description FROM materials WHERE mat_no = ANY($1)"
 # param = "mat_no"
@@ -27,6 +27,26 @@ reconnect_max_ms = 60000
 type = "shell"
 command = "echo [$PGX_CHANNEL] $PGX_PAYLOAD"
 mode = "simple"
+
+# pgx consume examples:
+#
+# Consume from RabbitMQ, GraphQL compose, index to Elasticsearch:
+#
+# [connections.local.consume]
+# source = { type = "rabbitmq", amqp_url = "amqp://guest:guest@localhost:5672/%2F", queue = "pgx-events" }
+# sink = { type = "elasticsearch", url = "http://localhost:9200", index = "materials", id_field = "mat_no" }
+# query_mode = "contract"
+# max_depth = 8
+# on_error = "lenient"
+#
+# Consume from Kafka with simple (fixed query) mode:
+#
+# [connections.staging.consume]
+# source = { type = "kafka", brokers = "kafka:9092", topic = "orders", group_id = "pgx" }
+# sink = { type = "webhook", url = "https://hooks.example.com/orders" }
+# query_mode = "simple"
+# query = "OrderFull"
+# on_error = "strict"
 
 [connections.local.replicate]
 slot = "my_slot"
@@ -59,6 +79,12 @@ description = "Staging"
 # type = "webhook"
 # url = "https://hooks.example.com/pgx"
 # mode = "contract"
+#
+# [connections.prod.consume]
+# source = { type = "rabbitmq", amqp_url = "amqp://rabbitmq:5672/%2F", queue = "events" }
+# sink = { type = "elasticsearch", url = "http://es:9200", index = "alerts" }
+# query_mode = "contract"
+# on_error = "strict"
 #
 # [connections.prod.replicate]
 # slot = "prod_slot"

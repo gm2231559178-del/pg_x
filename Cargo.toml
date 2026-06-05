@@ -50,6 +50,7 @@ csv = "1"
 
 # Async utilities
 async-trait = "0.1"
+futures = "0.3"
 
 # Replication frame parsing and SCRAM auth
 # (used by our inlined replication client in src/replication/)

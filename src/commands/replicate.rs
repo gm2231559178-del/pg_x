@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 use crate::replication::{
     client::{ReplicationClient, ReplicationConfig, ReplicationEvent},
     decoder::{decode_pgoutput, RelationCache},
-    event::WalEvent,
+    event::{ColVal, Row, WalEvent},
     lsn::Lsn,
     slot,
 };
@@ -145,6 +145,9 @@ pub enum ReplicateDownstreamCommand {
     /// Forward events to Apache Kafka.
     #[cfg(feature = "kafka")]
     Kafka(KafkaArgs),
+
+    /// Apply WAL changes directly to a PostgreSQL target database.
+    Postgres(PostgresArgs),
 }
 
 #[derive(Args)]
@@ -209,6 +212,22 @@ pub struct KafkaArgs {
     pub brokers: String,
     #[arg(long, default_value = "pgx-wal")]
     pub topic: String,
+}
+
+#[derive(Args)]
+pub struct PostgresArgs {
+    /// Target PostgreSQL connection URL.
+    /// Required unless provided via config or PGX_REPLICATE_TARGET_URL env.
+    #[arg(long, env = "PGX_REPLICATE_TARGET_URL")]
+    pub target_url: Option<String>,
+
+    /// Schema/table mapping (src_schema.src_table=tgt_schema.tgt_table, repeatable).
+    #[arg(long = "schema-map")]
+    pub schema_map: Vec<String>,
+
+    /// Maximum statements per transaction batch.
+    #[arg(long, default_value = "1000")]
+    pub batch_size: u32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -409,6 +428,349 @@ impl WalSink for KafkaWalSink {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PostgreSQL Applier  (applies WAL changes to a target PG database)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Applies decoded WAL events to a target PostgreSQL database.
+struct PostgresApplier {
+    client: tokio_postgres::Client,
+    buffer: Vec<String>,
+    schema_map: HashMap<(String, String), (String, String)>,
+    batch_size: usize,
+    pending_count: usize,
+}
+
+impl PostgresApplier {
+    async fn connect(args: &PostgresArgs) -> Result<Self> {
+        let url = args
+            .target_url
+            .as_deref()
+            .context("Postgres sink: --target-url is required (or set PGX_REPLICATE_TARGET_URL)")?;
+
+        let (client, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .context("Failed to connect to target PostgreSQL database")?;
+
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::error!(error = %e, "Target PG connection error");
+            }
+        });
+
+        // Verify target connection and default schema
+        let version: String = client.query_one("SELECT version()", &[]).await?.get(0);
+        tracing::info!(version = %version, "Connected to target PostgreSQL");
+
+        let mut schema_map = HashMap::new();
+        for mapping in &args.schema_map {
+            let parts: Vec<&str> = mapping.splitn(2, '=').collect();
+            if parts.len() != 2 {
+                anyhow::bail!("Invalid schema-map '{mapping}': expected src_schema.src_table=tgt_schema.tgt_table");
+            }
+            let src_parts: Vec<&str> = parts[0].splitn(2, '.').collect();
+            let tgt_parts: Vec<&str> = parts[1].splitn(2, '.').collect();
+            if src_parts.len() != 2 || tgt_parts.len() != 2 {
+                anyhow::bail!("Invalid schema-map '{mapping}': expected format src_schema.src_table=tgt_schema.tgt_table");
+            }
+            schema_map.insert(
+                (src_parts[0].to_string(), src_parts[1].to_string()),
+                (tgt_parts[0].to_string(), tgt_parts[1].to_string()),
+            );
+        }
+
+        Ok(Self {
+            client,
+            buffer: Vec::with_capacity(args.batch_size as usize),
+            schema_map,
+            batch_size: args.batch_size as usize,
+            pending_count: 0,
+        })
+    }
+
+    fn handle_begin(&mut self) {
+        self.buffer.clear();
+        self.pending_count = 0;
+    }
+
+    async fn handle_commit(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self
+            .client
+            .transaction()
+            .await
+            .context("Failed to begin transaction on target")?;
+
+        for sql in &self.buffer {
+            txn.execute(sql, &[])
+                .await
+                .with_context(|| format!("Failed to execute on target: {sql:.200}"))?;
+        }
+
+        txn.commit()
+            .await
+            .context("Failed to commit transaction on target")?;
+
+        let count = self.buffer.len();
+        tracing::debug!(applied = count, "Applied batch to target");
+        self.buffer.clear();
+        self.pending_count = 0;
+        Ok(())
+    }
+
+    async fn handle_event(&mut self, event: &WalEvent) -> Result<()> {
+        match event {
+            WalEvent::Relation { .. } => {
+                // Schema is ensured by the target; we trust it matches.
+                // In a future enhancement we could CREATE TABLE IF NOT EXISTS
+                // using the ColumnDef from the Relation event.
+                Ok(())
+            }
+
+            WalEvent::Insert {
+                schema, table, new, ..
+            } => {
+                let sql = gen_insert_sql(schema, table, new, &self.schema_map);
+                tracing::trace!(sql = %sql, "Buffering INSERT");
+                self.buffer.push(sql);
+                self.pending_count += 1;
+                if self.pending_count >= self.batch_size {
+                    self.handle_commit().await?;
+                    self.handle_begin();
+                }
+                Ok(())
+            }
+
+            WalEvent::Update {
+                schema,
+                table,
+                old,
+                new,
+                ..
+            } => match old {
+                Some(old_row) => {
+                    let sql = gen_update_sql(schema, table, old_row, new, &self.schema_map);
+                    tracing::trace!(sql = %sql, "Buffering UPDATE");
+                    self.buffer.push(sql);
+                    self.pending_count += 1;
+                    if self.pending_count >= self.batch_size {
+                        self.handle_commit().await?;
+                        self.handle_begin();
+                    }
+                    Ok(())
+                }
+                None => {
+                    tracing::warn!(
+                        schema = %schema, table = %table,
+                        "Skipping UPDATE without old tuple — set REPLICA IDENTITY FULL on this table"
+                    );
+                    Ok(())
+                }
+            },
+
+            WalEvent::Delete {
+                schema, table, old, ..
+            } => {
+                let sql = gen_delete_sql(schema, table, old, &self.schema_map);
+                tracing::trace!(sql = %sql, "Buffering DELETE");
+                self.buffer.push(sql);
+                self.pending_count += 1;
+                if self.pending_count >= self.batch_size {
+                    self.handle_commit().await?;
+                    self.handle_begin();
+                }
+                Ok(())
+            }
+
+            WalEvent::Truncate {
+                tables,
+                cascade,
+                restart_seqs,
+                ..
+            } => {
+                let sql = gen_truncate_sql(tables, *cascade, *restart_seqs, &self.schema_map);
+                tracing::debug!(sql = %sql, "Executing TRUNCATE");
+                self.client
+                    .execute(&sql, &[])
+                    .await
+                    .with_context(|| format!("Failed to execute TRUNCATE on target: {sql:.200}"))?;
+                Ok(())
+            }
+
+            WalEvent::Begin { .. } | WalEvent::Commit { .. } | WalEvent::Keepalive { .. } => {
+                // Handled via separate paths in the event loop
+                Ok(())
+            }
+        }
+    }
+}
+
+// ── SQL generation helpers ───────────────────────────────────────────────────
+
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn quote_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn colval_to_sql(val: &ColVal) -> String {
+    match val {
+        ColVal::Text(s) => quote_literal(s),
+        ColVal::Null | ColVal::Unchanged => "NULL".to_string(),
+    }
+}
+
+fn gen_insert_sql(
+    schema: &str,
+    table: &str,
+    new: &Row,
+    schema_map: &HashMap<(String, String), (String, String)>,
+) -> String {
+    let (tgt_schema, tgt_table) = schema_map
+        .get(&(schema.to_string(), table.to_string()))
+        .cloned()
+        .unwrap_or_else(|| (schema.to_string(), table.to_string()));
+
+    let mut cols: Vec<&String> = new.keys().collect();
+    cols.sort();
+
+    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
+    let col_vals: Vec<String> = cols.iter().map(|c| colval_to_sql(&new[*c])).collect();
+
+    format!(
+        "INSERT INTO {}.{} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
+        quote_ident(&tgt_schema),
+        quote_ident(&tgt_table),
+        col_names.join(", "),
+        col_vals.join(", "),
+    )
+}
+
+fn gen_update_sql(
+    schema: &str,
+    table: &str,
+    old: &Row,
+    new: &Row,
+    schema_map: &HashMap<(String, String), (String, String)>,
+) -> String {
+    let (tgt_schema, tgt_table) = schema_map
+        .get(&(schema.to_string(), table.to_string()))
+        .cloned()
+        .unwrap_or_else(|| (schema.to_string(), table.to_string()));
+
+    let qualified = format!("{}.{}", quote_ident(&tgt_schema), quote_ident(&tgt_table));
+
+    let mut set_cols: Vec<&String> = new.keys().collect();
+    set_cols.sort();
+    let set_clauses: Vec<String> = set_cols
+        .iter()
+        .map(|c| format!("{} = {}", quote_ident(c), colval_to_sql(&new[*c])))
+        .collect();
+
+    let where_clauses: Vec<String> = old
+        .iter()
+        .filter(|(_, v)| !matches!(v, ColVal::Unchanged))
+        .map(|(c, v)| format!("{} = {}", quote_ident(c), colval_to_sql(v)))
+        .collect();
+
+    if where_clauses.is_empty() {
+        tracing::warn!(
+            "Cannot generate safe UPDATE for {} — no usable WHERE columns in old tuple. \
+             Use REPLICA IDENTITY FULL to receive all columns.",
+            qualified,
+        );
+        return format!("SELECT 1 WHERE FALSE -- SKIPPED UPDATE {qualified}");
+    }
+
+    format!(
+        "UPDATE {} SET {} WHERE {}",
+        qualified,
+        set_clauses.join(", "),
+        where_clauses.join(" AND "),
+    )
+}
+
+fn gen_delete_sql(
+    schema: &str,
+    table: &str,
+    old: &Row,
+    schema_map: &HashMap<(String, String), (String, String)>,
+) -> String {
+    let (tgt_schema, tgt_table) = schema_map
+        .get(&(schema.to_string(), table.to_string()))
+        .cloned()
+        .unwrap_or_else(|| (schema.to_string(), table.to_string()));
+
+    let qualified = format!("{}.{}", quote_ident(&tgt_schema), quote_ident(&tgt_table));
+
+    let where_clauses: Vec<String> = old
+        .iter()
+        .filter(|(_, v)| !matches!(v, ColVal::Unchanged))
+        .map(|(c, v)| format!("{} = {}", quote_ident(c), colval_to_sql(v)))
+        .collect();
+
+    if where_clauses.is_empty() {
+        tracing::warn!(
+            "Cannot generate safe DELETE for {} — no usable WHERE columns in old tuple",
+            qualified,
+        );
+        return format!("SELECT 1 WHERE FALSE -- SKIPPED DELETE {qualified}");
+    }
+
+    format!(
+        "DELETE FROM {} WHERE {}",
+        qualified,
+        where_clauses.join(" AND ")
+    )
+}
+
+fn gen_truncate_sql(
+    tables: &[String],
+    cascade: bool,
+    restart_seqs: bool,
+    schema_map: &HashMap<(String, String), (String, String)>,
+) -> String {
+    let qualified: Vec<String> = tables
+        .iter()
+        .map(|t| {
+            let parts: Vec<&str> = t.splitn(2, '.').collect();
+            if parts.len() == 2 {
+                let (ts, tt) = schema_map
+                    .get(&(parts[0].to_string(), parts[1].to_string()))
+                    .cloned()
+                    .unwrap_or_else(|| (parts[0].to_string(), parts[1].to_string()));
+                format!("{}.{}", quote_ident(&ts), quote_ident(&tt))
+            } else {
+                quote_ident(t)
+            }
+        })
+        .collect();
+
+    let mut sql = format!("TRUNCATE {}", qualified.join(", "));
+    if restart_seqs {
+        sql.push_str(" RESTART IDENTITY");
+    }
+    if cascade {
+        sql.push_str(" CASCADE");
+    }
+    sql
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Build WalSink from CLI args
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -487,6 +849,24 @@ async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<Arc<dyn WalS
                 topic: a.topic.clone(),
             }))
         }
+
+        ReplicateDownstreamCommand::Postgres(_) => {
+            // PG applier is initialized separately in run(); no-op sink for the WS path.
+            Ok(Arc::new(NoopSink))
+        }
+    }
+}
+
+/// A no-op sink used when the real work is done by the PostgresApplier.
+struct NoopSink;
+
+#[async_trait::async_trait]
+impl WalSink for NoopSink {
+    fn name(&self) -> &str {
+        "postgres"
+    }
+    async fn send_wal(&self, _event_json: &str, _env: &HashMap<String, String>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -749,6 +1129,27 @@ pub async fn run(
                         a.topic = t.clone();
                     }
                 }
+                (
+                    ReplicateDownstreamCommand::Postgres(a),
+                    DownstreamSinkKind::Postgres {
+                        target_url,
+                        schema_map,
+                        batch_size,
+                        ..
+                    },
+                ) => {
+                    if a.target_url.is_none() {
+                        a.target_url = Some(target_url.clone());
+                    }
+                    if a.schema_map.is_empty() {
+                        if let Some(mappings) = schema_map {
+                            a.schema_map = mappings.clone();
+                        }
+                    }
+                    if let Some(bs) = batch_size {
+                        a.batch_size = *bs;
+                    }
+                }
                 _ => {}
             }
         }
@@ -759,6 +1160,16 @@ pub async fn run(
     let reconnect_base_ms = args.reconnect_base_ms.unwrap_or(1000);
     let reconnect_max_ms = args.reconnect_max_ms.unwrap_or(60000);
     let sink = build_wal_sink(&args.downstream).await?;
+
+    // ── Initialize PostgresApplier if Postgres sink is selected ─────────────
+    let mut pg_applier: Option<PostgresApplier> = match &args.downstream {
+        ReplicateDownstreamCommand::Postgres(pg_args) => {
+            let applier = PostgresApplier::connect(pg_args).await?;
+            info!(target = %pg_args.target_url.as_deref().unwrap_or("<config>"), "PostgreSQL applier ready");
+            Some(applier)
+        }
+        _ => None,
+    };
 
     // ── 1. Parse connection URL ───────────────────────────────────────────────
     let (host, port, user, password, database) = parse_postgres_url(&base_url)?;
@@ -951,6 +1362,11 @@ pub async fn run(
                         xid,
                         commit_time,
                     } => {
+                        // PG applier: start a new transaction batch
+                        if let Some(ref mut applier) = pg_applier {
+                            applier.handle_begin();
+                        }
+
                         if args.emit_txn_boundaries {
                             let event = WalEvent::Begin {
                                 lsn: final_lsn.to_string(),
@@ -972,6 +1388,14 @@ pub async fn run(
                         end_lsn,
                         commit_time,
                     } => {
+                        // PG applier: flush buffered changes to target
+                        if let Some(ref mut applier) = pg_applier {
+                            if let Err(e) = applier.handle_commit().await {
+                                error!(error = %e, "PG applier commit failed; LSN not advanced");
+                                continue;
+                            }
+                        }
+
                         if args.emit_txn_boundaries {
                             let event = WalEvent::Commit {
                                 lsn: lsn.to_string(),
@@ -985,16 +1409,28 @@ pub async fn run(
                                 continue;
                             }
                         }
+                        // Always advance LSN on commit (covers all DMLs in the txn).
+                        // When PG applier is active, per-DML advancement is skipped.
                         repl_client.update_applied_lsn(end_lsn);
                     }
 
                     // ── XLogData (Insert/Update/Delete/etc.) ──────────────────
                     ReplicationEvent::XLogData { data, wal_end, .. } => {
                         let lsn_str = wal_end.to_string();
+                        let is_pg_active = pg_applier.is_some();
 
                         match decode_pgoutput(&data, &mut rel_cache) {
                             Ok(Some(event)) => {
                                 log_event(&event, &lsn_str);
+
+                                // PG applier: process event (schema sync, buffer DML)
+                                if let Some(ref mut applier) = pg_applier {
+                                    if let Err(e) = applier.handle_event(&event).await {
+                                        error!(error = %e, "PG applier event failed; LSN not advanced");
+                                        continue;
+                                    }
+                                }
+
                                 if should_forward(&event, &args) {
                                     let env = event_env(&event, &lsn_str);
                                     if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
@@ -1002,8 +1438,12 @@ pub async fn run(
                                         continue;
                                     }
                                 }
-                                // ACK after confirmed delivery or intentional skip.
-                                repl_client.update_applied_lsn(wal_end);
+
+                                // When PG applier is active, per-DML LSN advancement is
+                                // deferred to the Commit event (end_lsn covers the txn).
+                                if !is_pg_active {
+                                    repl_client.update_applied_lsn(wal_end);
+                                }
                             }
                             Ok(None) => {
                                 // Intentionally skipped message type; safe to ACK.

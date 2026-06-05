@@ -164,6 +164,16 @@ pub enum DownstreamSinkKind {
         /// Schema directory override.
         schema_dir: Option<String>,
     },
+
+    /// Apply WAL changes directly to another PostgreSQL database.
+    Postgres {
+        /// Target database URL.
+        target_url: String,
+        /// Optional schema/table remapping (src_schema.src_table=tgt_schema.tgt_table).
+        schema_map: Option<Vec<String>>,
+        /// Maximum statements per transaction batch.
+        batch_size: Option<u32>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

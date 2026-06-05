@@ -144,6 +144,7 @@ jobs:
           mkdir -p ~/.pgx/schema ~/.pgx/queries
           cp -r examples/graphql/pgx/schema/* ~/.pgx/schema/
           cp -r examples/graphql/pgx/queries/* ~/.pgx/queries/
+          cp examples/graphql/pgx/config.toml ~/.pgx/config.toml
           cat init.sql | docker exec -i ${{ job.services.postgres.id }} psql -U postgres -d postgres
 
       - name: Test consume command

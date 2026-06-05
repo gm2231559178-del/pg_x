@@ -1,0 +1,44 @@
+default = "local"
+
+[connections.local]
+url = "postgres://postgres:postgres@localhost:5432/postgres"
+
+[connections.local.listen]
+channels = ["materials"]
+
+[connections.local.listen.sink]
+type = "elasticsearch"
+url = "http://localhost:9200"
+index = "materials"
+id_field = "mat_no"
+
+[connections.local.consume]
+source = { type = "rabbitmq", amqp_url = "amqp://guest:guest@localhost:5672/%2F", queue = "pgx-events", exchange = "pgx", routing_key = "pgx.notify" }
+sink = { type = "elasticsearch", url = "http://localhost:9200", index = "materials", id_field = "mat_no" }
+query_mode = "contract"
+max_depth = 8
+on_error = "lenient"
+
+[resolvers.material]
+sql = "SELECT mat_no, name, status FROM materials WHERE mat_no = $1"
+param = "mat_no"
+
+[resolvers.sizes]
+sql = "SELECT size_code, mat_no, name FROM sizes WHERE mat_no = ANY($1)"
+param = "mat_no"
+batch_by = "mat_no"
+
+[resolvers.colorways]
+sql = "SELECT colorway_code, mat_no, name, hex FROM colorways WHERE mat_no = ANY($1)"
+param = "mat_no"
+batch_by = "mat_no"
+
+[resolvers.features]
+sql = "SELECT id, mat_no, feature_name, description FROM material_features WHERE mat_no = ANY($1)"
+param = "mat_no"
+batch_by = "mat_no"
+
+[resolvers.attribute_entries]
+sql = "SELECT attr_name, attr_value FROM feature_attributes WHERE feature_id = ANY($1)"
+param = "id"
+batch_by = "id"

@@ -39,6 +39,6 @@ param = "mat_no"
 batch_by = "mat_no"
 
 [resolvers.attribute_entries]
-sql = "SELECT attr_name, attr_value FROM feature_attributes WHERE feature_id = ANY($1::int[])"
+sql = "SELECT attr_name, attr_value FROM feature_attributes WHERE feature_id::text = ANY($1)"
 param = "id"
 batch_by = "id"

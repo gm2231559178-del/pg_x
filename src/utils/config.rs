@@ -85,6 +85,10 @@ pub struct ReplicateSinkConfig {
     #[serde(default)]
     pub ops: Vec<String>,
 
+    /// Row-level WHERE filters.
+    #[serde(default)]
+    pub filters: Vec<String>,
+
     /// Use a temporary slot.
     pub temporary: Option<bool>,
 

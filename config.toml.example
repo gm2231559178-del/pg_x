@@ -70,6 +70,9 @@ max_reconnect_attempts = 10
 reconnect_base_ms = 1000
 reconnect_max_ms = 60000
 
+# Row-level filters (repeatable):
+# filters = ["public.orders:status = 'active'", "amount > 100"]
+
 [connections.local.replicate.sink]
 type = "stdout"
 pretty = true
@@ -110,6 +113,7 @@ description = "Staging"
 # publications = ["prod_pub"]
 # tables = ["public.orders"]
 # ops = ["insert", "update"]
+# filters = ["public.orders:status = 'active'"]
 #
 # # Apply to PostgreSQL + forward to Kafka simultaneously
 # [connections.prod.replicate.sink]

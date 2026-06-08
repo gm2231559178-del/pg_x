@@ -95,6 +95,17 @@ pub struct ReplicateArgs {
     #[arg(long, env = "PGX_REPLICATE_RECONNECT_MAX_MS")]
     pub reconnect_max_ms: Option<u64>,
 
+    /// Row-level WHERE filters (repeatable).
+    /// Format: [schema.table:]expression
+    /// Examples:
+    ///   --where "public.orders:status = 'active'"
+    ///   --where "amount > 100"
+    ///   --where "deleted_at IS NULL"
+    /// Supported operators: =, !=, <>, >, <, >=, <=, IS NULL, IS NOT NULL
+    /// Combinators: AND, OR
+    #[arg(long = "where")]
+    pub filters: Vec<String>,
+
     /// Additional sinks for fan-out (repeatable).
     /// Format: type:key=val,key=val,...
     /// Types: stdout, shell, webhook, kafka, rabbitmq
@@ -1139,7 +1150,416 @@ fn parse_postgres_url(url: &str) -> Result<(String, u16, String, String, String)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Filter predicates
+// Filter expression — row-level WHERE for DML events
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum FilterExpr {
+    Eq(String, String),
+    Neq(String, String),
+    Gt(String, f64),
+    Lt(String, f64),
+    Ge(String, f64),
+    Le(String, f64),
+    IsNull(String),
+    IsNotNull(String),
+    And(Box<FilterExpr>, Box<FilterExpr>),
+    Or(Box<FilterExpr>, Box<FilterExpr>),
+}
+
+impl FilterExpr {
+    pub fn evaluate(&self, row: &Row) -> bool {
+        match self {
+            FilterExpr::Eq(col, val) => row.get(col).is_some_and(|cv| match cv {
+                ColVal::Text(s) => s == val,
+                _ => false,
+            }),
+            FilterExpr::Neq(col, val) => !row.get(col).is_some_and(|cv| match cv {
+                ColVal::Text(s) => s == val,
+                _ => false,
+            }),
+            FilterExpr::Gt(col, val) => cmp_numeric(row, col, |a, b| a > b, *val),
+            FilterExpr::Lt(col, val) => cmp_numeric(row, col, |a, b| a < b, *val),
+            FilterExpr::Ge(col, val) => cmp_numeric(row, col, |a, b| a >= b, *val),
+            FilterExpr::Le(col, val) => cmp_numeric(row, col, |a, b| a <= b, *val),
+            FilterExpr::IsNull(col) => {
+                row.get(col).is_some_and(|cv| matches!(cv, ColVal::Null))
+            }
+            FilterExpr::IsNotNull(col) => {
+                !row.get(col).is_some_and(|cv| matches!(cv, ColVal::Null))
+            }
+            FilterExpr::And(a, b) => a.evaluate(row) && b.evaluate(row),
+            FilterExpr::Or(a, b) => a.evaluate(row) || b.evaluate(row),
+        }
+    }
+}
+
+fn cmp_numeric(row: &Row, col: &str, cmp: fn(f64, f64) -> bool, rhs: f64) -> bool {
+    row.get(col).and_then(|cv| match cv {
+        ColVal::Text(s) => s.parse::<f64>().ok(),
+        _ => None,
+    })
+    .is_some_and(|lhs| cmp(lhs, rhs))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recursive-descent filter expression parser
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Parser<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            chars: input.chars().peekable(),
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.chars.peek() {
+            if c.is_ascii_whitespace() {
+                self.chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn expect_word(&mut self) -> Result<String> {
+        self.skip_ws();
+        let mut s = String::new();
+        while let Some(c) = self.chars.peek() {
+            if c.is_alphanumeric() || *c == '_' {
+                s.push(self.chars.next().unwrap());
+            } else {
+                break;
+            }
+        }
+        if s.is_empty() {
+            bail!("expected identifier");
+        }
+        Ok(s)
+    }
+
+    fn expect_string_literal(&mut self) -> Result<String> {
+        self.skip_ws();
+        match self.chars.next() {
+            Some('\'') => {
+                let mut s = String::new();
+                loop {
+                    match self.chars.next() {
+                        Some('\'') => {
+                            // Check for escaped single quote ''
+                            if self.chars.peek() == Some(&'\'') {
+                                self.chars.next();
+                                s.push('\'');
+                            } else {
+                                return Ok(s);
+                            }
+                        }
+                        Some(c) => s.push(c),
+                        None => bail!("unterminated string literal"),
+                    }
+                }
+            }
+            Some(c) => bail!("expected ' to start string literal, got '{c}'"),
+            None => bail!("expected string literal"),
+        }
+    }
+
+    fn expect_number(&mut self) -> Result<f64> {
+        self.skip_ws();
+        let mut s = String::new();
+        if self.chars.peek() == Some(&'-') {
+            s.push(self.chars.next().unwrap());
+        }
+        let mut has_dot = false;
+        while let Some(c) = self.chars.peek() {
+            if c.is_ascii_digit() {
+                s.push(self.chars.next().unwrap());
+            } else if *c == '.' && !has_dot {
+                has_dot = true;
+                s.push(self.chars.next().unwrap());
+            } else {
+                break;
+            }
+        }
+        if s.is_empty() || s == "-" {
+            bail!("expected number, got '{s}'");
+        }
+        s.parse::<f64>()
+            .with_context(|| format!("invalid number literal: '{s}'"))
+    }
+
+    fn parse_literal(&mut self) -> Result<FilterExpr> {
+        self.skip_ws();
+        if self.chars.peek() == Some(&'\'') {
+            // String literal without preceding identifier or operator.
+            self.expect_string_literal()?;
+            bail!("unexpected string literal without comparison")
+        } else {
+            // Try number first, then identifier (column name)
+            let saved = self.chars.clone();
+            match self.expect_number() {
+                Ok(_) => {
+                    bail!("unexpected number literal without comparison")
+                }
+                _ => {
+                    self.chars = saved;
+                    let ident = self.expect_word()?;
+                    // Check for IS NULL / IS NOT NULL
+                    self.skip_ws();
+                    let upper: String = self.chars.clone().take(2).collect::<String>().to_uppercase();
+                    if upper == "IS" {
+                        self.chars.next(); self.chars.next(); // skip I, S
+                        self.skip_ws();
+                        let neg = {
+                            let next: String = self.chars.clone().take(3).collect::<String>().to_uppercase();
+                            if next == "NOT" {
+                                self.chars.next(); self.chars.next(); self.chars.next();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        self.skip_ws();
+                        let null = self.expect_word()?;
+                        if null.to_uppercase() != "NULL" {
+                            bail!("expected NULL after IS{}", if neg { " NOT" } else { "" });
+                        }
+                        if neg {
+                            Ok(FilterExpr::IsNotNull(ident))
+                        } else {
+                            Ok(FilterExpr::IsNull(ident))
+                        }
+                    } else {
+                        // Must be followed by an operator
+                        Err(anyhow::anyhow!("expected comparison operator after identifier '{ident}'"))
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_comparison(&mut self) -> Result<FilterExpr> {
+        self.skip_ws();
+
+        let saved = self.chars.clone();
+        let ident = self.expect_word()?;
+        self.skip_ws();
+
+        let op = self.parse_operator();
+        if let Some(op) = op {
+            self.skip_ws();
+            if self.chars.peek() == Some(&'\'') {
+                let val = self.expect_string_literal()?;
+                return Ok(match op {
+                    "=" => FilterExpr::Eq(ident, val),
+                    "!=" | "<>" => FilterExpr::Neq(ident, val),
+                    _ => bail!("string comparison does not support operator '{op}'"),
+                });
+            } else {
+                let n = self.expect_number()?;
+                return Ok(match op {
+                    "=" => FilterExpr::Eq(ident, n.to_string()),
+                    "!=" | "<>" => FilterExpr::Neq(ident, n.to_string()),
+                    ">" => FilterExpr::Gt(ident, n),
+                    "<" => FilterExpr::Lt(ident, n),
+                    ">=" => FilterExpr::Ge(ident, n),
+                    "<=" => FilterExpr::Le(ident, n),
+                    _ => bail!("unknown operator '{op}'"),
+                });
+            }
+        }
+
+        // No operator after identifier — likely IS NULL/IS NOT NULL (handled by parse_literal)
+        self.chars = saved;
+        self.parse_literal()
+    }
+
+    fn parse_operator(&mut self) -> Option<&'static str> {
+        self.skip_ws();
+        let mut two = String::new();
+        two.push(*self.chars.peek()?);
+        let c2 = {
+            let mut it = self.chars.clone();
+            it.next();
+            it.peek().copied()
+        };
+        if let Some(c2) = c2 {
+            two.push(c2);
+        }
+        match two.as_str() {
+            ">=" => { self.chars.next(); self.chars.next(); Some(">=") }
+            "<=" => { self.chars.next(); self.chars.next(); Some("<=") }
+            "<>" => { self.chars.next(); self.chars.next(); Some("<>") }
+            "!=" => { self.chars.next(); self.chars.next(); Some("!=") }
+            _ => {
+                let one = self.chars.peek().copied()?;
+                match one {
+                    '=' => { self.chars.next(); Some("=") }
+                    '>' => { self.chars.next(); Some(">") }
+                    '<' => { self.chars.next(); Some("<") }
+                    '!' => { self.chars.next(); Some("!") }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn parse_expression(&mut self) -> Result<FilterExpr> {
+        let mut left = self.parse_comparison()?;
+        loop {
+            self.skip_ws();
+            let word: String = self.chars.clone().take(3).collect::<String>().to_uppercase();
+            match word.as_str() {
+                "AND" => {
+                    self.chars.next(); self.chars.next(); self.chars.next();
+                    let right = self.parse_comparison()?;
+                    left = FilterExpr::And(Box::new(left), Box::new(right));
+                }
+                "OR" => {
+                    self.chars.next(); self.chars.next();
+                    let right = self.parse_comparison()?;
+                    left = FilterExpr::Or(Box::new(left), Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Ok(left)
+    }
+}
+
+/// Parse a single filter expression string (without table prefix).
+pub fn parse_filter_expr(input: &str) -> Result<FilterExpr> {
+    let mut parser = Parser::new(input);
+    let expr = parser.parse_expression()?;
+    parser.skip_ws();
+    if parser.chars.peek().is_some() {
+        bail!(
+            "trailing characters after filter expression: '{}'",
+            parser.chars.collect::<String>()
+        );
+    }
+    Ok(expr)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RowFilter — collection of table-scoped WHERE expressions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A set of row-level filters keyed optionally by table.
+///
+/// - `None` key  → filter applies to every table.
+/// - `Some((schema, table))` → filter applies only to that table.
+/// - A DML event passes through only if every matching filter evaluates to true.
+/// - Events for tables with no matching filter always pass through.
+#[derive(Debug, Clone)]
+pub struct RowFilter {
+    filters: Vec<(Option<(String, String)>, FilterExpr)>,
+}
+
+impl RowFilter {
+    pub fn new() -> Self {
+        Self {
+            filters: Vec::new(),
+        }
+    }
+
+    /// Add a filter: `None` for global, `Some((schema, table))` for table-specific.
+    pub fn add(&mut self, table_key: Option<(String, String)>, expr: FilterExpr) {
+        self.filters.push((table_key, expr));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.filters.is_empty()
+    }
+
+    /// Build from CLI `--where` args (format: `[schema.table:]expr`).
+    pub fn from_cli_args(filters: &[String]) -> Result<Self> {
+        let mut rf = RowFilter::new();
+        for arg in filters {
+            let (table_key, expr) = parse_where_arg(arg)?;
+            rf.add(table_key, expr);
+        }
+        Ok(rf)
+    }
+
+    /// Returns `true` if the event should be forwarded.
+    pub fn should_forward(&self, event: &WalEvent) -> bool {
+        if self.filters.is_empty() {
+            return true;
+        }
+        let (schema, table, row_option) = match event {
+            WalEvent::Insert { schema, table, new, .. } => (schema, table, Some(new)),
+            WalEvent::Update { schema, table, new, .. } => (schema, table, Some(new)),
+            WalEvent::Delete { schema, table, old, .. } => (schema, table, Some(old)),
+            _ => return true,
+        };
+        let row = match row_option {
+            Some(r) => r,
+            None => return true,
+        };
+        // Check all matching filters — event passes if all evaluate to true
+        for (key, expr) in &self.filters {
+            let applies = match key {
+                Some((s, t)) => s == schema && t == table,
+                None => true,
+            };
+            if !applies {
+                continue;
+            }
+            if !expr.evaluate(row) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Parse a `--where` arg into an optional table key and filter expression.
+///
+/// Input formats:
+///     `schema.table:expression` → `Some(("schema", "table")), expr`
+///     `expression`              → `None, expr`
+pub fn parse_where_arg(arg: &str) -> Result<(Option<(String, String)>, FilterExpr)> {
+    // Check for "schema.table:" prefix — a word with a dot followed by a colon
+    let colon_pos = arg.find(':');
+    let table_key = match colon_pos {
+        Some(pos) if pos > 0 => {
+            let prefix = &arg[..pos];
+            if let Some(dot) = prefix.find('.') {
+                // schema.table:expr
+                Some((prefix[..dot].to_string(), prefix[dot + 1..].to_string()))
+            } else {
+                // plain table name — no dot, treat as schema-less name? Actually
+                // for safety, require schema-qualified prefix for table filtering.
+                // A bare word before ':' could conflict with expressions like "x > 5".
+                // We treat a single word before : as a table name filter.
+                // But that's ambiguous with expressions. Let's just require schema.table.
+                return Err(anyhow::anyhow!(
+                    "filter prefix must be schema-qualified (e.g. public.orders:expression), \
+                     got '{prefix}' — use 'public.{prefix}:expression' or omit the prefix for global filters"
+                ));
+            }
+        }
+        _ => None,
+    };
+    let expr_str = match colon_pos {
+        Some(pos) => arg[pos + 1..].trim(),
+        None => arg.trim(),
+    };
+    if expr_str.is_empty() {
+        bail!("empty filter expression");
+    }
+    let expr = parse_filter_expr(expr_str)?;
+    Ok((table_key, expr))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter helpers (table name, op)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn table_matches(schema: &str, table: &str, filter: &[String]) -> bool {
@@ -1162,13 +1582,15 @@ fn op_matches(op: &str, filter: &[OpFilter]) -> bool {
     })
 }
 
-fn should_forward(event: &WalEvent, args: &ReplicateArgs) -> bool {
+fn should_forward(event: &WalEvent, args: &ReplicateArgs, row_filter: &RowFilter) -> bool {
     match event {
         WalEvent::Insert { schema, table, .. }
         | WalEvent::Update { schema, table, .. }
         | WalEvent::Delete { schema, table, .. } => {
             let op = event.op_label().to_lowercase();
-            table_matches(schema, table, &args.tables) && op_matches(&op, &args.ops)
+            table_matches(schema, table, &args.tables)
+                && op_matches(&op, &args.ops)
+                && row_filter.should_forward(event)
         }
         WalEvent::Truncate { .. } => op_matches("truncate", &args.ops),
         WalEvent::Begin { .. } | WalEvent::Commit { .. } => args.emit_txn_boundaries,
@@ -1286,6 +1708,7 @@ pub async fn run(
 ) -> Result<()> {
     // Merge connection-level defaults into CLI args (CLI wins).
     let mut config_additional_sinks: Vec<DownstreamSinkKind> = Vec::new();
+    let mut config_filters: Vec<String> = Vec::new();
     if let Some(cfg) = conn.and_then(|c| c.replicate.as_ref()) {
         if args.slot.is_none() {
             args.slot = cfg.slot.clone();
@@ -1408,6 +1831,17 @@ pub async fn run(
         }
 
         config_additional_sinks = cfg.additional_sinks.clone();
+        config_filters = cfg.filters.clone();
+    }
+
+    let row_filter = {
+        let mut all: Vec<String> = Vec::new();
+        all.extend(config_filters);
+        all.extend(args.filters.clone());
+        RowFilter::from_cli_args(&all)?
+    };
+    if !row_filter.is_empty() {
+        info!("Row-level WHERE filters active");
     }
 
     let slot_name = args.slot.clone().unwrap_or_else(|| "pgx_slot".to_string());
@@ -1686,7 +2120,7 @@ pub async fn run(
                                     }
                                 }
 
-                                if should_forward(&event, &args) {
+                                if should_forward(&event, &args, &row_filter) {
                                     let env = event_env(&event, &lsn_str);
                                     if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
                                         error!(sink = sink.name(), error = %e, "Downstream send failed; LSN not advanced");

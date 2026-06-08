@@ -1,3 +1,4 @@
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
@@ -22,7 +23,7 @@ use std::collections::HashMap;
 /// - DELETE old-tuples under `REPLICA IDENTITY DEFAULT` for non-key columns
 ///
 /// Run `ALTER TABLE t REPLICA IDENTITY FULL` to receive all column values.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ColVal {
     /// A text-encoded SQL value (may be any non-null SQL type).
     Text(String),
@@ -30,6 +31,43 @@ pub enum ColVal {
     Null,
     /// Column not sent by the server (unchanged TOAST or non-replica-identity column).
     Unchanged,
+}
+
+impl<'de> Deserialize<'de> for ColVal {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ColValVisitor;
+        impl<'de> Visitor<'de> for ColValVisitor {
+            type Value = ColVal;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON string, null, or {\"$unchanged\": true}")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ColVal, E> {
+                Ok(ColVal::Text(v.to_string()))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<ColVal, E> {
+                Ok(ColVal::Null)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<ColVal, E> {
+                Ok(ColVal::Null)
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<ColVal, M::Error> {
+                let mut key: Option<String> = None;
+                while let Some(k) = map.next_key::<String>()? {
+                    if k == "$unchanged" {
+                        let _: bool = map.next_value()?;
+                        return Ok(ColVal::Unchanged);
+                    }
+                    key = Some(k);
+                }
+                // Unknown key — ignore or error
+                Err(de::Error::custom(format!(
+                    "expected {{\"$unchanged\": true}}, got key {:?}",
+                    key.unwrap_or_default()
+                )))
+            }
+        }
+        d.deserialize_any(ColValVisitor)
+    }
 }
 
 #[allow(dead_code)]
@@ -72,7 +110,7 @@ pub type Row = HashMap<String, ColVal>;
 
 /// A decoded WAL event from the pgoutput logical replication protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WalEvent {
     /// Marks the start of a transaction.
     Begin {
@@ -420,5 +458,136 @@ mod tests {
         assert!(json.contains("Alice"), "JSON: {json}");
         assert!(json.contains("public"), "JSON: {json}");
         assert!(json.contains("users"), "JSON: {json}");
+    }
+
+    #[test]
+    fn apply_transforms_drop() {
+        let mut event = WalEvent::Insert {
+            rel_id: 1,
+            schema: "public".into(),
+            table: "t".into(),
+            new: {
+                let mut r = Row::new();
+                r.insert("a".into(), ColVal::Text("1".into()));
+                r.insert("b".into(), ColVal::Text("2".into()));
+                r
+            },
+        };
+        event.apply_transforms(&["b".to_string()], &[]);
+        let new = match &event {
+            WalEvent::Insert { new, .. } => new,
+            _ => panic!("expected Insert"),
+        };
+        assert!(new.contains_key("a"));
+        assert!(!new.contains_key("b"));
+    }
+
+    #[test]
+    fn apply_transforms_rename_simple() {
+        let mut event = WalEvent::Insert {
+            rel_id: 1,
+            schema: "public".into(),
+            table: "t".into(),
+            new: {
+                let mut r = Row::new();
+                r.insert("a".into(), ColVal::Text("1".into()));
+                r
+            },
+        };
+        event.apply_transforms(&[], &[("a".to_string(), "b".to_string())]);
+        let new = match &event {
+            WalEvent::Insert { new, .. } => new,
+            _ => panic!("expected Insert"),
+        };
+        assert!(!new.contains_key("a"));
+        assert_eq!(new.get("b").and_then(|c| c.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn apply_transforms_swap_rename() {
+        let mut event = WalEvent::Insert {
+            rel_id: 1,
+            schema: "public".into(),
+            table: "t".into(),
+            new: {
+                let mut r = Row::new();
+                r.insert("a".into(), ColVal::Text("x".into()));
+                r.insert("b".into(), ColVal::Text("y".into()));
+                r
+            },
+        };
+        // a→b, b→a should swap without data loss
+        event.apply_transforms(
+            &[],
+            &[
+                ("a".to_string(), "b".to_string()),
+                ("b".to_string(), "a".to_string()),
+            ],
+        );
+        let new = match &event {
+            WalEvent::Insert { new, .. } => new,
+            _ => panic!("expected Insert"),
+        };
+        assert_eq!(new.get("a").and_then(|c| c.as_str()), Some("y"));
+        assert_eq!(new.get("b").and_then(|c| c.as_str()), Some("x"));
+    }
+
+    #[test]
+    fn apply_transforms_update_both_rows() {
+        let mut event = WalEvent::Update {
+            rel_id: 1,
+            schema: "public".into(),
+            table: "t".into(),
+            old: Some({
+                let mut r = Row::new();
+                r.insert("a".into(), ColVal::Text("old".into()));
+                r
+            }),
+            new: {
+                let mut r = Row::new();
+                r.insert("a".into(), ColVal::Text("new".into()));
+                r
+            },
+        };
+        event.apply_transforms(&[], &[("a".to_string(), "b".to_string())]);
+        match &event {
+            WalEvent::Update { old, new, .. } => {
+                let old = old.as_ref().unwrap();
+                assert_eq!(old.get("b").and_then(|c| c.as_str()), Some("old"));
+                assert_eq!(new.get("b").and_then(|c| c.as_str()), Some("new"));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn apply_transforms_delete() {
+        let mut event = WalEvent::Delete {
+            rel_id: 1,
+            schema: "public".into(),
+            table: "t".into(),
+            old: {
+                let mut r = Row::new();
+                r.insert("a".into(), ColVal::Text("val".into()));
+                r
+            },
+        };
+        event.apply_transforms(&["a".to_string()], &[]);
+        let old = match &event {
+            WalEvent::Delete { old, .. } => old,
+            _ => panic!("expected Delete"),
+        };
+        assert!(old.is_empty());
+    }
+
+    #[test]
+    fn apply_transforms_noop_on_begin() {
+        let mut event = WalEvent::Begin {
+            lsn: "0/0".into(),
+            commit_time: 0,
+            xid: 1,
+        };
+        // Should not panic
+        event.apply_transforms(&["a".to_string()], &[]);
     }
 }

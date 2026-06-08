@@ -1725,6 +1725,16 @@ fn should_forward(event: &WalEvent, args: &ReplicateArgs, row_filter: &RowFilter
 // Event → env-var map (for shell sinks)
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn json_or_dash(v: &impl serde::Serialize) -> String {
+    match serde_json::to_string(v) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "Failed to serialize row for event_env");
+            String::new()
+        }
+    }
+}
+
 fn event_env(event: &WalEvent, lsn_str: &str) -> HashMap<String, String> {
     let mut env = HashMap::new();
     env.insert("PGX_OP".to_string(), event.op_label().to_lowercase());
@@ -1736,29 +1746,16 @@ fn event_env(event: &WalEvent, lsn_str: &str) -> HashMap<String, String> {
         } => {
             env.insert("PGX_SCHEMA".to_string(), schema.clone());
             env.insert("PGX_TABLE".to_string(), table.clone());
-            env.insert(
-                "PGX_NEW".to_string(),
-                serde_json::to_string(new).unwrap_or_default(),
-            );
+            env.insert("PGX_NEW".to_string(), json_or_dash(new));
         }
         WalEvent::Update {
-            schema,
-            table,
-            new,
-            old,
-            ..
+            schema, table, new, old, ..
         } => {
             env.insert("PGX_SCHEMA".to_string(), schema.clone());
             env.insert("PGX_TABLE".to_string(), table.clone());
-            env.insert(
-                "PGX_NEW".to_string(),
-                serde_json::to_string(new).unwrap_or_default(),
-            );
+            env.insert("PGX_NEW".to_string(), json_or_dash(new));
             if let Some(o) = old {
-                env.insert(
-                    "PGX_OLD".to_string(),
-                    serde_json::to_string(o).unwrap_or_default(),
-                );
+                env.insert("PGX_OLD".to_string(), json_or_dash(o));
             }
         }
         WalEvent::Delete {
@@ -1766,10 +1763,7 @@ fn event_env(event: &WalEvent, lsn_str: &str) -> HashMap<String, String> {
         } => {
             env.insert("PGX_SCHEMA".to_string(), schema.clone());
             env.insert("PGX_TABLE".to_string(), table.clone());
-            env.insert(
-                "PGX_OLD".to_string(),
-                serde_json::to_string(old).unwrap_or_default(),
-            );
+            env.insert("PGX_OLD".to_string(), json_or_dash(old));
         }
         WalEvent::Truncate { tables, .. } => {
             env.insert("PGX_TABLES".to_string(), tables.join(","));
@@ -2154,6 +2148,8 @@ pub async fn run(
         let mut rel_cache = RelationCache::new();
         let mut clean_exit = false;
 
+        const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
         loop {
             let ev = tokio::select! {
                 biased;
@@ -2163,6 +2159,15 @@ pub async fn run(
                     info!("Signal received, stopping replication");
                     repl_client.stop();
                     clean_exit = true;
+                    break;
+                }
+
+                // ── Connection stall guard ────────────────────────────────────
+                // If the server stops sending data or TCP silently drops,
+                // break to trigger a reconnect instead of hanging forever.
+                _ = tokio::time::sleep(RECV_TIMEOUT) => {
+                    warn!("Replication stream idle for 60s, reconnecting");
+                    repl_client.stop();
                     break;
                 }
 

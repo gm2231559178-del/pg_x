@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+#[cfg(unix)]
 use async_memcached::AsciiProtocol;
 use async_trait::async_trait;
 use redis::AsyncCommands;
@@ -10,6 +11,7 @@ use super::r#trait::ConsumeSink;
 
 enum KvConnection {
     Redis(redis::aio::MultiplexedConnection),
+    #[cfg(unix)]
     Memcached(async_memcached::Client),
 }
 
@@ -39,6 +41,7 @@ impl KvConsumeSink {
                     .with_context(|| "Failed to connect to Redis")?;
                 KvConnection::Redis(c)
             }
+            #[cfg(unix)]
             "memcached" => {
                 let host = parsed.host_str().unwrap_or("127.0.0.1");
                 let port = parsed.port().unwrap_or(11211);
@@ -47,6 +50,10 @@ impl KvConsumeSink {
                     .await
                     .with_context(|| format!("Failed to connect to Memcached at {}", addr))?;
                 KvConnection::Memcached(c)
+            }
+            #[cfg(not(unix))]
+            "memcached" => {
+                anyhow::bail!("Memcached is not supported on this platform")
             }
             other => {
                 anyhow::bail!(
@@ -105,6 +112,7 @@ impl ConsumeSink for KvConsumeSink {
                         .with_context(|| format!("Redis EXPIRE failed for key '{}'", key))?;
                 }
             }
+            #[cfg(unix)]
             KvConnection::Memcached(ref mut c) => {
                 let ttl = if self.ttl > 0 {
                     Some(self.ttl as i64)

@@ -14,7 +14,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive", "env"] }
 
 # Postgres async driver (control plane: slot management, wal_level check)
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime", "with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 tokio = { version = "1", features = ["full"] }
 
 # TLS for the control-plane connection (optional)
@@ -62,14 +62,19 @@ sha2 = "0.10"
 rand = "0.9"
 
 # RabbitMQ (AMQP) - feature-gated
-lapin = { version = "2", optional = true }
+lapin = { version = "2", default-features = false, features = ["rustls"], optional = true }
 
 # HTTP client for webhook and elasticsearch - feature-gated
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 # Key-Value store sinks (Redis / Memcached) - feature-gated
 redis = { version = "1", default-features = false, features = ["tokio-comp"], optional = true }
-async-memcached = { version = "0.6", optional = true }
+
+# async-memcached uses UnixStream (Unix-only); also transitively pulls in openssl-sys
+# via toxiproxy_rust → reqwest → native-tls. Force vendored OpenSSL for cross-compilation.
+[target.'cfg(unix)'.dependencies]
+async-memcached = "0.6"
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 # Kafka - feature-gated (requires librdkafka system library)
 rdkafka = { version = "0.36", optional = true }
@@ -84,7 +89,7 @@ rabbitmq = ["lapin"]
 kafka = ["rdkafka"]
 webhook = ["reqwest"]
 elasticsearch = ["reqwest"]
-kv = ["redis", "async-memcached"]
+kv = ["redis"]
 
 [profile.release]
 opt-level = 3

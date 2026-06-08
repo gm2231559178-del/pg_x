@@ -190,6 +190,18 @@ pub enum DownstreamSinkKind {
         /// Maximum statements per transaction batch.
         batch_size: Option<u32>,
     },
+
+    /// Write WAL events to Apache Parquet files.
+    Parquet {
+        /// Output directory for Parquet files.
+        output_dir: Option<String>,
+        /// Maximum rows per file before rotation.
+        max_rows: Option<usize>,
+        /// Flush interval in seconds.
+        flush_interval: Option<u64>,
+        /// Compression: snappy, zstd, or none.
+        compression: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

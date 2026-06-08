@@ -9,6 +9,9 @@ use super::{ReplicateArgs, ReplicateDownstreamCommand};
 pub(crate) trait WalSink: Send + Sync {
     fn name(&self) -> &str;
     async fn send_wal(&self, event_json: &str, env: &HashMap<String, String>) -> Result<()>;
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct StdoutSink {
@@ -306,6 +309,16 @@ pub(crate) async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<A
         ReplicateDownstreamCommand::Postgres(_) => {
             Ok(Arc::new(NoopSink))
         }
+
+        #[cfg(feature = "parquet")]
+        ReplicateDownstreamCommand::Parquet(a) => {
+            Ok(Arc::new(super::parquet::ParquetSink::new(a)))
+        }
+
+        #[cfg(not(feature = "parquet"))]
+        ReplicateDownstreamCommand::Parquet(_) => {
+            anyhow::bail!("Parquet sink requires 'parquet' feature (cargo build --features parquet)");
+        }
     }
 }
 
@@ -433,6 +446,28 @@ pub(crate) async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Ar
         DownstreamSinkKind::Postgres { .. } => {
             Ok(Arc::new(NoopSink))
         }
+        DownstreamSinkKind::Parquet {
+            output_dir,
+            max_rows,
+            flush_interval,
+            compression,
+        } => {
+            #[cfg(feature = "parquet")]
+            {
+                let args = super::parquet::ParquetArgs {
+                    output_dir: output_dir.clone().unwrap_or_else(|| "./parquet_output".to_string()),
+                    max_rows: max_rows.unwrap_or(100000),
+                    flush_interval: flush_interval.unwrap_or(300),
+                    compression: compression.clone().unwrap_or_else(|| "snappy".to_string()),
+                };
+                Ok(Arc::new(super::parquet::ParquetSink::new(&args)))
+            }
+            #[cfg(not(feature = "parquet"))]
+            {
+                let _ = (output_dir, max_rows, flush_interval, compression);
+                anyhow::bail!("Parquet sink requires 'parquet' feature");
+            }
+        }
     }
 }
 
@@ -519,9 +554,15 @@ fn parse_sink_string(s: &str) -> Result<DownstreamSinkKind> {
             routing_key: params.get("routing_key").cloned(),
             mode: params.get("mode").cloned(),
         }),
+        "parquet" => Ok(DownstreamSinkKind::Parquet {
+            output_dir: params.get("output_dir").cloned(),
+            max_rows: params.get("max_rows").and_then(|v| v.parse().ok()),
+            flush_interval: params.get("flush_interval").and_then(|v| v.parse().ok()),
+            compression: params.get("compression").cloned(),
+        }),
         other => {
             anyhow::bail!(
-                "Unknown sink type '{other}'. Supported: stdout, shell, webhook, kafka, rabbitmq"
+                "Unknown sink type '{other}'. Supported: stdout, shell, webhook, kafka, rabbitmq, parquet"
             );
         }
     }

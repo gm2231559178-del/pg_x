@@ -193,6 +193,25 @@ pgx -U $DATABASE_URL replicate \
 
 The Kafka message key is set to `schema.table` so events naturally partition by table.
 
+### Downstream: Parquet
+
+```bash
+pgx -U $DATABASE_URL replicate \
+  --slot pgx_slot \
+  --publication my_pub \
+  parquet \
+  --output-dir ./wal_archive \
+  --max-rows 50000 \
+  --compression zstd
+```
+
+Each table gets its own Hive-partitioned directory:
+```
+wal_archive/public/orders/year=2026/month=06/day=08/part-20260608120000-abc123.parquet
+```
+
+Every row has metadata columns (`_pgx_op`, `_pgx_lsn`, `_pgx_old`) plus all user columns as text.
+
 ---
 
 ### Filtering
@@ -617,7 +636,7 @@ src/replication/decoder.rs         decode_pgoutput(data) → WalEvent
 src/commands/replicate.rs          filter (--table, --op) → log → forward
     │
     ▼
-stdout / shell / webhook / rabbitmq / kafka
+stdout / shell / webhook / rabbitmq / kafka / parquet
 ```
 
 ---
@@ -632,3 +651,4 @@ stdout / shell / webhook / rabbitmq / kafka
 | `kafka`    | ❌      | Kafka downstream via `rdkafka` (requires librdkafka) |
 | `tls`      | ❌      | TLS for the tokio-postgres control-plane connection  |
 | `kv`       | ✅      | Redis / Memcached key-value store sink               |
+| `parquet`  | ✅      | Parquet file output via `arrow` + `parquet`           |

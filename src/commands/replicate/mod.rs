@@ -44,11 +44,16 @@
 //!   --schema-map "public.orders=public.orders_archive" --batch-size 500
 //! ```
 //!
-//! ### Apply to PG + forward to Kafka simultaneously
+//! ### Write WAL events to Apache Parquet files
+//! ```bash
+//! pgx replicate --publication my_pub parquet --output-dir ./wal_archive
+//! ```
+//!
+//! ### Apply to PG + archive to Parquet simultaneously
 //! ```bash
 //! pgx replicate --publication my_pub \
 //!   postgres --target-url "postgres://user:pass@replica:5432/db" \
-//!   --sink "kafka:brokers=localhost:9092,topic=pgx-wal"
+//!   --sink "parquet:output_dir=./wal_archive,compression=zstd"
 //! ```
 //!
 //! ### Full pipeline — filter, rename, drop, fan-out
@@ -65,6 +70,7 @@ mod sinks;
 mod filter;
 mod applier;
 mod transforms;
+mod parquet;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -230,6 +236,10 @@ pub enum ReplicateDownstreamCommand {
 
     /// Apply WAL changes directly to a PostgreSQL target database.
     Postgres(PostgresArgs),
+
+    /// Write WAL events to Apache Parquet files.
+    #[cfg(feature = "parquet")]
+    Parquet(parquet::ParquetArgs),
 }
 
 #[derive(Args)]
@@ -909,6 +919,10 @@ pub async fn run(
             },
             "Connection lost, will retry"
         );
+    }
+
+    if let Err(e) = sink.flush().await {
+        warn!(error = %e, "Failed to flush sink on shutdown");
     }
 
     info!("Replication stream closed");

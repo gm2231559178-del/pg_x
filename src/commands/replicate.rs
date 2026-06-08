@@ -106,6 +106,18 @@ pub struct ReplicateArgs {
     #[arg(long = "where")]
     pub filters: Vec<String>,
 
+    /// Column drop rules (repeatable).
+    /// Format: [schema.table:]col1,col2,...
+    /// Example: --drop-cols "public.orders:internal_note,secret_flag"
+    #[arg(long = "drop-cols")]
+    pub drop_cols: Vec<String>,
+
+    /// Column rename rules (repeatable).
+    /// Format: [schema.table:]old_name=new_name,...
+    /// Example: --rename "public.orders:order_id=id,customer_name=name"
+    #[arg(long = "rename")]
+    pub rename: Vec<String>,
+
     /// Additional sinks for fan-out (repeatable).
     /// Format: type:key=val,key=val,...
     /// Types: stdout, shell, webhook, kafka, rabbitmq
@@ -1524,7 +1536,7 @@ impl RowFilter {
 /// Input formats:
 ///     `schema.table:expression` → `Some(("schema", "table")), expr`
 ///     `expression`              → `None, expr`
-pub fn parse_where_arg(arg: &str) -> Result<(Option<(String, String)>, FilterExpr)> {
+pub fn parse_where_arg(arg: &str) -> Result<(TableKey, FilterExpr)> {
     // Check for "schema.table:" prefix — a word with a dot followed by a colon
     let colon_pos = arg.find(':');
     let table_key = match colon_pos {
@@ -1556,6 +1568,111 @@ pub fn parse_where_arg(arg: &str) -> Result<(Option<(String, String)>, FilterExp
     }
     let expr = parse_filter_expr(expr_str)?;
     Ok((table_key, expr))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Column transforms — drop / rename columns before forwarding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-table column transforms.
+#[derive(Debug, Clone, Default)]
+pub struct TableTransform {
+    pub drop_cols: Vec<String>,
+    pub renames: Vec<(String, String)>,
+}
+
+/// Collection of column transforms scoped by table.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnTransforms {
+    /// key = `"schema.table"`, `None` = global
+    entries: Vec<(Option<(String, String)>, TableTransform)>,
+}
+
+impl ColumnTransforms {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(|(_, t)| t.drop_cols.is_empty() && t.renames.is_empty())
+    }
+
+    /// Apply applicable transforms to a WalEvent in-place.
+    pub fn apply(&self, event: &mut WalEvent) {
+        let tn = event.table_name().map(|(s, t)| (s.to_string(), t.to_string()));
+        let (schema, table) = match tn {
+            Some(ref p) => p,
+            None => return,
+        };
+        for (key, t) in &self.entries {
+            let applies = match key {
+                Some((s, t)) => s == schema && t == table,
+                None => true,
+            };
+            if applies {
+                event.apply_transforms(&t.drop_cols, &t.renames);
+            }
+        }
+    }
+}
+
+type TableKey = Option<(String, String)>;
+
+/// Parse a `--drop-cols` argument: `[schema.table:]col1,col2,...`
+pub fn parse_drop_cols_arg(arg: &str) -> Result<(TableKey, Vec<String>)> {
+    let (table_key, rest) = parse_table_prefix(arg)?;
+    let cols: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if cols.is_empty() {
+        bail!("drop-cols: no columns specified in '{arg}'");
+    }
+    Ok((table_key, cols))
+}
+
+/// Parse a `--rename` argument: `[schema.table:]old=new,old2=new2,...`
+pub fn parse_rename_arg(arg: &str) -> Result<(TableKey, Vec<(String, String)>)> {
+    let (table_key, rest) = parse_table_prefix(arg)?;
+    let mut pairs = Vec::new();
+    for part in rest.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let mut eq_split = part.splitn(2, '=');
+        let old = eq_split.next().unwrap().trim().to_string();
+        let new = eq_split.next().ok_or_else(|| {
+            anyhow::anyhow!("rename: expected 'old=new' format, got '{part}'")
+        })?.trim().to_string();
+        if old.is_empty() || new.is_empty() {
+            bail!("rename: empty name in rename pair '{part}'");
+        }
+        pairs.push((old, new));
+    }
+    if pairs.is_empty() {
+        bail!("rename: no rename pairs specified in '{arg}'");
+    }
+    Ok((table_key, pairs))
+}
+
+/// Extract optional `schema.table:` prefix from an argument string.
+/// Returns `(table_key, rest_of_string)`.
+fn parse_table_prefix(arg: &str) -> Result<(TableKey, &str)> {
+    if let Some(pos) = arg.find(':') {
+        let prefix = &arg[..pos];
+        if prefix.is_empty() {
+            bail!("empty table prefix before ':'");
+        }
+        let table_key = if let Some(dot) = prefix.find('.') {
+            Some((prefix[..dot].to_string(), prefix[dot + 1..].to_string()))
+        } else {
+            return Err(anyhow::anyhow!(
+                "prefix must be schema-qualified (e.g. public.orders:...), \
+                 got '{prefix}' — use 'public.{prefix}:...' or omit the prefix for global rules"
+            ));
+        };
+        Ok((table_key, &arg[pos + 1..]))
+    } else {
+        Ok((None, arg))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1709,6 +1826,8 @@ pub async fn run(
     // Merge connection-level defaults into CLI args (CLI wins).
     let mut config_additional_sinks: Vec<DownstreamSinkKind> = Vec::new();
     let mut config_filters: Vec<String> = Vec::new();
+    let mut config_drop_cols: Vec<String> = Vec::new();
+    let mut config_rename: Vec<String> = Vec::new();
     if let Some(cfg) = conn.and_then(|c| c.replicate.as_ref()) {
         if args.slot.is_none() {
             args.slot = cfg.slot.clone();
@@ -1832,6 +1951,8 @@ pub async fn run(
 
         config_additional_sinks = cfg.additional_sinks.clone();
         config_filters = cfg.filters.clone();
+        config_drop_cols = cfg.drop_cols.clone();
+        config_rename = cfg.rename.clone();
     }
 
     let row_filter = {
@@ -1842,6 +1963,30 @@ pub async fn run(
     };
     if !row_filter.is_empty() {
         info!("Row-level WHERE filters active");
+    }
+
+    let transforms = {
+        let mut t = ColumnTransforms::new();
+        for arg in config_drop_cols.iter().chain(args.drop_cols.iter()) {
+            let (key, cols) = parse_drop_cols_arg(arg)?;
+            let entry = t.entries.iter_mut().find(|(k, _)| k == &key);
+            match entry {
+                Some((_, tt)) => tt.drop_cols.extend(cols),
+                None => t.entries.push((key, TableTransform { drop_cols: cols, renames: Vec::new() })),
+            }
+        }
+        for arg in config_rename.iter().chain(args.rename.iter()) {
+            let (key, pairs) = parse_rename_arg(arg)?;
+            let entry = t.entries.iter_mut().find(|(k, _)| k == &key);
+            match entry {
+                Some((_, tt)) => tt.renames.extend(pairs),
+                None => t.entries.push((key, TableTransform { drop_cols: Vec::new(), renames: pairs })),
+            }
+        }
+        t
+    };
+    if !transforms.is_empty() {
+        info!("Column transforms active");
     }
 
     let slot_name = args.slot.clone().unwrap_or_else(|| "pgx_slot".to_string());
@@ -2109,8 +2254,11 @@ pub async fn run(
                         let is_pg_active = pg_applier.is_some();
 
                         match decode_pgoutput(&data, &mut rel_cache) {
-                            Ok(Some(event)) => {
+                            Ok(Some(mut event)) => {
                                 log_event(&event, &lsn_str);
+
+                                // Apply column transforms (drop/rename) before any downstream.
+                                transforms.apply(&mut event);
 
                                 // PG applier: process event (schema sync, buffer DML)
                                 if let Some(ref mut applier) = pg_applier {

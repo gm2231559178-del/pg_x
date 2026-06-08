@@ -195,6 +195,34 @@ impl WalEvent {
             }
         }
     }
+
+    /// Apply column transforms (drop columns, rename columns) in-place.
+    ///
+    /// Renames are processed in order as provided, so `a→b, b→a` swaps correctly.
+    pub fn apply_transforms(&mut self, drop_cols: &[String], renames: &[(String, String)]) {
+        let mut rows = match self {
+            WalEvent::Insert { new, .. } => vec![new],
+            WalEvent::Update { old, new, .. } => {
+                let mut v = vec![new];
+                if let Some(ref mut o) = old {
+                    v.push(o);
+                }
+                v
+            }
+            WalEvent::Delete { old, .. } => vec![old],
+            _ => return,
+        };
+        for row in &mut *rows {
+            for col in drop_cols {
+                row.remove(col);
+            }
+            for (old_name, new_name) in renames {
+                if let Some(val) = row.remove(old_name) {
+                    row.insert(new_name.clone(), val);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

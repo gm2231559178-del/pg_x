@@ -114,6 +114,8 @@ description = "Staging"
 # tables = ["public.orders"]
 # ops = ["insert", "update"]
 # filters = ["public.orders:status = 'active'"]
+# drop_cols = ["public.orders:internal_note,secret_flag"]
+# rename = ["public.orders:order_id=id,customer_name=name"]
 #
 # # Apply to PostgreSQL + forward to Kafka simultaneously
 # [connections.prod.replicate.sink]

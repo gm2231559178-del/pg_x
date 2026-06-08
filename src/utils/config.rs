@@ -89,6 +89,14 @@ pub struct ReplicateSinkConfig {
     #[serde(default)]
     pub filters: Vec<String>,
 
+    /// Column drop rules.
+    #[serde(default)]
+    pub drop_cols: Vec<String>,
+
+    /// Column rename rules.
+    #[serde(default)]
+    pub rename: Vec<String>,
+
     /// Use a temporary slot.
     pub temporary: Option<bool>,
 

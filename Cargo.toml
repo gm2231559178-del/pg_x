@@ -71,8 +71,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 redis = { version = "1", default-features = false, features = ["tokio-comp"], optional = true }
 
 # Parquet output - feature-gated (heavy deps)
-arrow = { version = "53", optional = true }
-parquet = { version = "53", features = ["arrow", "snap", "zstd"], optional = true }
+arrow = { version = "57", optional = true }
+parquet = { version = "57", features = ["arrow", "snap", "zstd"], optional = true }
+
+# Iceberg table format (COW/MOR sink)
+iceberg = { version = "0.9", optional = true }
 
 # Kafka - feature-gated (requires librdkafka system library)
 rdkafka = { version = "0.36", optional = true }
@@ -95,6 +98,10 @@ webhook = ["reqwest"]
 elasticsearch = ["reqwest"]
 kv = ["redis"]
 parquet = ["dep:arrow", "dep:parquet"]
+iceberg = ["dep:iceberg"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

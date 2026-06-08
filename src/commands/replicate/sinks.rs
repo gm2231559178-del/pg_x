@@ -315,9 +315,9 @@ pub(crate) async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<A
             Ok(Arc::new(super::parquet::ParquetSink::new(a)))
         }
 
-        #[cfg(not(feature = "parquet"))]
-        ReplicateDownstreamCommand::Parquet(_) => {
-            anyhow::bail!("Parquet sink requires 'parquet' feature (cargo build --features parquet)");
+        #[cfg(feature = "iceberg")]
+        ReplicateDownstreamCommand::Iceberg(a) => {
+            Ok(Arc::new(super::iceberg::IcebergSink::new(a).await?))
         }
     }
 }

@@ -71,6 +71,8 @@ mod filter;
 mod applier;
 mod transforms;
 mod parquet;
+#[cfg(feature = "iceberg")]
+mod iceberg;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -240,6 +242,10 @@ pub enum ReplicateDownstreamCommand {
     /// Write WAL events to Apache Parquet files.
     #[cfg(feature = "parquet")]
     Parquet(parquet::ParquetArgs),
+
+    /// Write WAL events to Apache Iceberg tables (COW).
+    #[cfg(feature = "iceberg")]
+    Iceberg(iceberg::IcebergArgs),
 }
 
 #[derive(Args)]

@@ -70,9 +70,17 @@ max_reconnect_attempts = 10
 reconnect_base_ms = 1000
 reconnect_max_ms = 60000
 
+# Row-level filters (repeatable):
+# filters = ["public.orders:status = 'active'", "amount > 100"]
+
 [connections.local.replicate.sink]
 type = "stdout"
 pretty = true
+
+# Fan-out to multiple sinks:
+# [[connections.local.replicate.additional_sinks]]
+# type = "webhook"
+# url = "https://hooks.example.com/events"
 
 [connections.staging]
 url = "postgres://user:pass@staging.host:5432/stagingdb"
@@ -105,9 +113,17 @@ description = "Staging"
 # publications = ["prod_pub"]
 # tables = ["public.orders"]
 # ops = ["insert", "update"]
+# filters = ["public.orders:status = 'active'"]
+# drop_cols = ["public.orders:internal_note,secret_flag"]
+# rename = ["public.orders:order_id=id,customer_name=name"]
 #
+# # Apply to PostgreSQL + forward to Kafka simultaneously
 # [connections.prod.replicate.sink]
+# type = "postgres"
+# target_url = "postgres://user:pass@replica:5432/db"
+# batch_size = 500
+#
+# [[connections.prod.replicate.additional_sinks]]
 # type = "kafka"
 # brokers = "kafka-prod:9092"
 # topic = "pgx-wal"
-# mode = "contract"

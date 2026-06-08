@@ -85,6 +85,18 @@ pub struct ReplicateSinkConfig {
     #[serde(default)]
     pub ops: Vec<String>,
 
+    /// Row-level WHERE filters.
+    #[serde(default)]
+    pub filters: Vec<String>,
+
+    /// Column drop rules.
+    #[serde(default)]
+    pub drop_cols: Vec<String>,
+
+    /// Column rename rules.
+    #[serde(default)]
+    pub rename: Vec<String>,
+
     /// Use a temporary slot.
     pub temporary: Option<bool>,
 
@@ -103,11 +115,15 @@ pub struct ReplicateSinkConfig {
     /// Maximum reconnect delay cap in milliseconds. Default: 60000.
     pub reconnect_max_ms: Option<u64>,
 
-    /// Downstream sink kind and its options.
+    /// Primary downstream sink kind and its options.
     pub sink: Option<DownstreamSinkKind>,
+
+    /// Additional downstream sinks for fan-out (repeatable).
+    #[serde(default)]
+    pub additional_sinks: Vec<DownstreamSinkKind>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DownstreamSinkKind {
     /// Print events as JSON to stdout.
@@ -163,6 +179,16 @@ pub enum DownstreamSinkKind {
         id_field: Option<String>,
         /// Schema directory override.
         schema_dir: Option<String>,
+    },
+
+    /// Apply WAL changes directly to another PostgreSQL database.
+    Postgres {
+        /// Target database URL.
+        target_url: String,
+        /// Optional schema/table remapping (src_schema.src_table=tgt_schema.tgt_table).
+        schema_map: Option<Vec<String>>,
+        /// Maximum statements per transaction batch.
+        batch_size: Option<u32>,
     },
 }
 

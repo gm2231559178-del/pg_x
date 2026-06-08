@@ -1414,7 +1414,6 @@ impl<'a> Parser<'a> {
                     '=' => { self.chars.next(); Some("=") }
                     '>' => { self.chars.next(); Some(">") }
                     '<' => { self.chars.next(); Some("<") }
-                    '!' => { self.chars.next(); Some("!") }
                     _ => None,
                 }
             }
@@ -1425,19 +1424,17 @@ impl<'a> Parser<'a> {
         let mut left = self.parse_comparison()?;
         loop {
             self.skip_ws();
-            let word: String = self.chars.clone().take(3).collect::<String>().to_uppercase();
-            match word.as_str() {
-                "AND" => {
-                    self.chars.next(); self.chars.next(); self.chars.next();
-                    let right = self.parse_comparison()?;
-                    left = FilterExpr::And(Box::new(left), Box::new(right));
-                }
-                "OR" => {
-                    self.chars.next(); self.chars.next();
-                    let right = self.parse_comparison()?;
-                    left = FilterExpr::Or(Box::new(left), Box::new(right));
-                }
-                _ => break,
+            let peek: String = self.chars.clone().take(4).collect::<String>().to_uppercase();
+            if peek.starts_with("AND") {
+                self.chars.next(); self.chars.next(); self.chars.next();
+                let right = self.parse_comparison()?;
+                left = FilterExpr::And(Box::new(left), Box::new(right));
+            } else if peek.starts_with("OR") {
+                self.chars.next(); self.chars.next();
+                let right = self.parse_comparison()?;
+                left = FilterExpr::Or(Box::new(left), Box::new(right));
+            } else {
+                break;
             }
         }
         Ok(left)
@@ -1537,10 +1534,14 @@ impl RowFilter {
 ///     `schema.table:expression` → `Some(("schema", "table")), expr`
 ///     `expression`              → `None, expr`
 pub fn parse_where_arg(arg: &str) -> Result<(TableKey, FilterExpr)> {
-    // Check for "schema.table:" prefix — a word with a dot followed by a colon
     let colon_pos = arg.find(':');
+    // Reject bare colon (empty prefix) — likely a typo.
+    if colon_pos == Some(0) {
+        bail!("filter expression starts with ':' but no table prefix before it — \
+               use 'schema.table:expression' or omit the colon for global filters");
+    }
     let table_key = match colon_pos {
-        Some(pos) if pos > 0 => {
+        Some(pos) => {
             let prefix = &arg[..pos];
             if let Some(dot) = prefix.find('.') {
                 // schema.table:expr
@@ -1604,13 +1605,13 @@ impl ColumnTransforms {
             Some(ref p) => p,
             None => return,
         };
-        for (key, t) in &self.entries {
+        for (key, transform) in &self.entries {
             let applies = match key {
-                Some((s, t)) => s == schema && t == table,
+                Some((ref s, ref t)) => s == schema && t == table,
                 None => true,
             };
             if applies {
-                event.apply_transforms(&t.drop_cols, &t.renames);
+                event.apply_transforms(&transform.drop_cols, &transform.renames);
             }
         }
     }
@@ -1709,7 +1710,11 @@ fn should_forward(event: &WalEvent, args: &ReplicateArgs, row_filter: &RowFilter
                 && op_matches(&op, &args.ops)
                 && row_filter.should_forward(event)
         }
-        WalEvent::Truncate { .. } => op_matches("truncate", &args.ops),
+        WalEvent::Truncate { tables, .. } => {
+            op_matches("truncate", &args.ops)
+                && (args.tables.is_empty()
+                    || tables.iter().any(|t| args.tables.iter().any(|f| f == t)))
+        }
         WalEvent::Begin { .. } | WalEvent::Commit { .. } => args.emit_txn_boundaries,
         WalEvent::Relation { .. } => args.emit_schema,
         WalEvent::Keepalive { .. } => false,
@@ -2255,10 +2260,14 @@ pub async fn run(
 
                         match decode_pgoutput(&data, &mut rel_cache) {
                             Ok(Some(mut event)) => {
-                                log_event(&event, &lsn_str);
+                                // Evaluate row filter BEFORE transforms so WHERE expressions
+                                // use the original (pre-rename) column names.
+                                let forward = should_forward(&event, &args, &row_filter);
 
-                                // Apply column transforms (drop/rename) before any downstream.
+                                // Apply column transforms for all downstreams.
                                 transforms.apply(&mut event);
+
+                                log_event(&event, &lsn_str);
 
                                 // PG applier: process event (schema sync, buffer DML)
                                 if let Some(ref mut applier) = pg_applier {
@@ -2268,7 +2277,7 @@ pub async fn run(
                                     }
                                 }
 
-                                if should_forward(&event, &args, &row_filter) {
+                                if forward {
                                     let env = event_env(&event, &lsn_str);
                                     if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
                                         error!(sink = sink.name(), error = %e, "Downstream send failed; LSN not advanced");

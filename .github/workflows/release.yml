@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  BINARY_NAME: pgx
+
+permissions:
+  contents: write   # needed to create the GitHub Release and upload assets
+
+jobs:
+  # ── Build matrix ──────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — use a manylinux-style musl target for broad compatibility
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_name: pgx-linux-x86_64
+            cross: true
+
+          # Linux aarch64 — cross-compiled via cross
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset_name: pgx-linux-aarch64
+            cross: true
+
+          # macOS x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_name: pgx-macos-x86_64
+            cross: false
+
+          # macOS arm64 (Apple Silicon)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: pgx-macos-aarch64
+            cross: false
+
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: pgx-windows-x86_64
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      # cross is a drop-in cargo replacement that handles cross-compilation
+      # and the required Docker images automatically.
+      - name: Install cross (Linux cross-compile targets)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      # ── Stage the artifact with a predictable name ─────────────────────
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/${BINARY_NAME} \
+             ${{ matrix.asset_name }}
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe" `
+                    "${{ matrix.asset_name }}.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.exe
+          if-no-files-found: error
+
+  # ── Publish GitHub Release ────────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd artifacts
+          # Flatten: each artifact was uploaded into its own subdirectory
+          find . -type f \( -name 'pgx-*' \) | sort | while read f; do
+            sha256sum "$f" | sed 's|  \./[^/]*/|  |' >> ../checksums.txt
+          done
+          cat ../checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          # Auto-generate release notes from PRs / commits since last tag.
+          generate_release_notes: true
+          files: |
+            artifacts/**/*
+            checksums.txt

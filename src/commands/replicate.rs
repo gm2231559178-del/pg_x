@@ -952,7 +952,9 @@ async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Arc<dyn WalSi
                 base_env,
             }))
         }
-        DownstreamSinkKind::Webhook { url: _url, headers, .. } => {
+        DownstreamSinkKind::Webhook {
+            url: _url, headers, ..
+        } => {
             let mut h = Vec::new();
             if let Some(hdrs) = headers {
                 for entry in hdrs {

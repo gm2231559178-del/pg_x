@@ -166,10 +166,10 @@ Allow multiple `--sink` flags or a single downstream config that accepts multipl
 
 | Feature | Status | Test strategy |
 |---------|--------|---------------|
-| 1. PostgreSQL sink | Not started | Extend `scripts/test_replicate.sh` with target PG |
-| 2. Row-level WHERE | Not started | Unit tests for `should_forward` with filter expressions |
-| 3. Column remapping | Not started | Unit tests for transform logic on `WalEvent` |
-| 4. Multi-sink fan-out | Not started | Integration test with stdout + shell sinks |
+| 1. PostgreSQL sink | **Done** | `pgx replicate ... postgres --target-url ...` (manual); unit tests for PostgresApplier SQL gen |
+| 2. Row-level WHERE | **Done** | Unit tests for `FilterExpr::evaluate` and `RowFilter`; integration via `--where` |
+| 3. Column remapping | **Done** | 6 unit tests for `WalEvent::apply_transforms` (drop, rename, swap, update, delete, noop) |
+| 4. Multi-sink fan-out | **Done** | `--sink "stdout:pretty=true"` alongside primary subcommand; config `additional_sinks` |
 | 5. DDL replication | Skipped | N/A |
 
 ---

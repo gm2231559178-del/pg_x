@@ -70,16 +70,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Key-Value store sinks (Redis / Memcached) - feature-gated
 redis = { version = "1", default-features = false, features = ["tokio-comp"], optional = true }
 
+# Kafka - feature-gated (requires librdkafka system library)
+rdkafka = { version = "0.36", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing = "0.1.44"
+
 # async-memcached uses UnixStream (Unix-only); also transitively pulls in openssl-sys
 # via toxiproxy_rust → reqwest → native-tls. Force vendored OpenSSL for cross-compilation.
 [target.'cfg(unix)'.dependencies]
 async-memcached = "0.6"
 openssl-sys = { version = "0.9", features = ["vendored"] }
-
-# Kafka - feature-gated (requires librdkafka system library)
-rdkafka = { version = "0.36", optional = true }
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-tracing = "0.1.44"
 
 [features]
 default = ["rabbitmq", "webhook", "excel", "elasticsearch", "kv"]

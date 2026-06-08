@@ -932,9 +932,9 @@ async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<Arc<dyn WalS
 /// Build a single WalSink from a DownstreamSinkKind config.
 async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Arc<dyn WalSink>> {
     match kind {
-        DownstreamSinkKind::Stdout { pretty } => {
-            Ok(Arc::new(StdoutSink { pretty: pretty.unwrap_or(false) }))
-        }
+        DownstreamSinkKind::Stdout { pretty } => Ok(Arc::new(StdoutSink {
+            pretty: pretty.unwrap_or(false),
+        })),
         DownstreamSinkKind::Shell { command, envs, .. } => {
             if command.is_empty() {
                 anyhow::bail!("Shell sink requires command");
@@ -952,7 +952,7 @@ async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Arc<dyn WalSi
                 base_env,
             }))
         }
-        DownstreamSinkKind::Webhook { url, headers, .. } => {
+        DownstreamSinkKind::Webhook { url: _url, headers, .. } => {
             let mut h = Vec::new();
             if let Some(hdrs) = headers {
                 for entry in hdrs {
@@ -963,6 +963,7 @@ async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Arc<dyn WalSi
             }
             #[cfg(feature = "webhook")]
             {
+                let url = _url;
                 Ok(Arc::new(WebhookWalSink {
                     client: reqwest::Client::new(),
                     url: url.clone(),
@@ -980,7 +981,10 @@ async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Arc<dyn WalSi
             {
                 use rdkafka::config::ClientConfig;
                 let producer = ClientConfig::new()
-                    .set("bootstrap.servers", brokers.as_deref().unwrap_or("localhost:9092"))
+                    .set(
+                        "bootstrap.servers",
+                        brokers.as_deref().unwrap_or("localhost:9092"),
+                    )
                     .set("message.timeout.ms", "5000")
                     .create()
                     .context("Failed to create Kafka producer")?;
@@ -995,14 +999,21 @@ async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Arc<dyn WalSi
                 anyhow::bail!("Kafka sink requires 'kafka' feature (rdkafka)");
             }
         }
-        DownstreamSinkKind::Rabbitmq { amqp_url, exchange, routing_key, .. } => {
+        DownstreamSinkKind::Rabbitmq {
+            amqp_url,
+            exchange,
+            routing_key,
+            ..
+        } => {
             #[cfg(feature = "rabbitmq")]
             {
                 use lapin::{
                     options::ExchangeDeclareOptions, types::FieldTable, Connection,
                     ConnectionProperties, ExchangeKind,
                 };
-                let url = amqp_url.clone().unwrap_or_else(|| "amqp://guest:guest@localhost:5672/%2F".to_string());
+                let url = amqp_url
+                    .clone()
+                    .unwrap_or_else(|| "amqp://guest:guest@localhost:5672/%2F".to_string());
                 let conn = Connection::connect(&url, ConnectionProperties::default())
                     .await
                     .context("Failed to connect to RabbitMQ")?;
@@ -1046,7 +1057,10 @@ async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Arc<dyn WalSi
 }
 
 /// Build a FanOutSink from the primary downstream command, --sink args, and config sinks.
-async fn build_fan_out_sink(args: &ReplicateArgs, config_additional: &[DownstreamSinkKind]) -> Result<Arc<dyn WalSink>> {
+async fn build_fan_out_sink(
+    args: &ReplicateArgs,
+    config_additional: &[DownstreamSinkKind],
+) -> Result<Arc<dyn WalSink>> {
     let mut sinks: Vec<Arc<dyn WalSink>> = Vec::new();
 
     // Primary sink from the subcommand
@@ -1150,7 +1164,9 @@ fn parse_sink_string(s: &str) -> Result<DownstreamSinkKind> {
                 .ok_or_else(|| anyhow::anyhow!("shell sink requires command=..."))?;
             Ok(DownstreamSinkKind::Shell {
                 command,
-                envs: params.get("envs").map(|e| e.split(',').map(String::from).collect()),
+                envs: params
+                    .get("envs")
+                    .map(|e| e.split(',').map(String::from).collect()),
                 mode: params.get("mode").cloned(),
             })
         }
@@ -1161,27 +1177,27 @@ fn parse_sink_string(s: &str) -> Result<DownstreamSinkKind> {
                 .ok_or_else(|| anyhow::anyhow!("webhook sink requires url=..."))?;
             Ok(DownstreamSinkKind::Webhook {
                 url,
-                headers: params.get("headers").map(|h| h.split(',').map(String::from).collect()),
+                headers: params
+                    .get("headers")
+                    .map(|h| h.split(',').map(String::from).collect()),
                 mode: params.get("mode").cloned(),
             })
         }
-        "kafka" => {
-            Ok(DownstreamSinkKind::Kafka {
-                brokers: params.get("brokers").cloned(),
-                topic: params.get("topic").cloned(),
-                mode: params.get("mode").cloned(),
-            })
-        }
-        "rabbitmq" => {
-            Ok(DownstreamSinkKind::Rabbitmq {
-                amqp_url: params.get("amqp_url").cloned(),
-                exchange: params.get("exchange").cloned(),
-                routing_key: params.get("routing_key").cloned(),
-                mode: params.get("mode").cloned(),
-            })
-        }
+        "kafka" => Ok(DownstreamSinkKind::Kafka {
+            brokers: params.get("brokers").cloned(),
+            topic: params.get("topic").cloned(),
+            mode: params.get("mode").cloned(),
+        }),
+        "rabbitmq" => Ok(DownstreamSinkKind::Rabbitmq {
+            amqp_url: params.get("amqp_url").cloned(),
+            exchange: params.get("exchange").cloned(),
+            routing_key: params.get("routing_key").cloned(),
+            mode: params.get("mode").cloned(),
+        }),
         other => {
-            anyhow::bail!("Unknown sink type '{other}'. Supported: stdout, shell, webhook, kafka, rabbitmq");
+            anyhow::bail!(
+                "Unknown sink type '{other}'. Supported: stdout, shell, webhook, kafka, rabbitmq"
+            );
         }
     }
 }
@@ -1235,9 +1251,7 @@ impl FilterExpr {
             FilterExpr::Lt(col, val) => cmp_numeric(row, col, |a, b| a < b, *val),
             FilterExpr::Ge(col, val) => cmp_numeric(row, col, |a, b| a >= b, *val),
             FilterExpr::Le(col, val) => cmp_numeric(row, col, |a, b| a <= b, *val),
-            FilterExpr::IsNull(col) => {
-                row.get(col).is_some_and(|cv| matches!(cv, ColVal::Null))
-            }
+            FilterExpr::IsNull(col) => row.get(col).is_some_and(|cv| matches!(cv, ColVal::Null)),
             FilterExpr::IsNotNull(col) => {
                 !row.get(col).is_some_and(|cv| matches!(cv, ColVal::Null))
             }
@@ -1248,11 +1262,12 @@ impl FilterExpr {
 }
 
 fn cmp_numeric(row: &Row, col: &str, cmp: fn(f64, f64) -> bool, rhs: f64) -> bool {
-    row.get(col).and_then(|cv| match cv {
-        ColVal::Text(s) => s.parse::<f64>().ok(),
-        _ => None,
-    })
-    .is_some_and(|lhs| cmp(lhs, rhs))
+    row.get(col)
+        .and_then(|cv| match cv {
+            ColVal::Text(s) => s.parse::<f64>().ok(),
+            _ => None,
+        })
+        .is_some_and(|lhs| cmp(lhs, rhs))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1364,14 +1379,27 @@ impl<'a> Parser<'a> {
                     let ident = self.expect_word()?;
                     // Check for IS NULL / IS NOT NULL
                     self.skip_ws();
-                    let upper: String = self.chars.clone().take(2).collect::<String>().to_uppercase();
+                    let upper: String = self
+                        .chars
+                        .clone()
+                        .take(2)
+                        .collect::<String>()
+                        .to_uppercase();
                     if upper == "IS" {
-                        self.chars.next(); self.chars.next(); // skip I, S
+                        self.chars.next();
+                        self.chars.next(); // skip I, S
                         self.skip_ws();
                         let neg = {
-                            let next: String = self.chars.clone().take(3).collect::<String>().to_uppercase();
+                            let next: String = self
+                                .chars
+                                .clone()
+                                .take(3)
+                                .collect::<String>()
+                                .to_uppercase();
                             if next == "NOT" {
-                                self.chars.next(); self.chars.next(); self.chars.next();
+                                self.chars.next();
+                                self.chars.next();
+                                self.chars.next();
                                 true
                             } else {
                                 false
@@ -1389,7 +1417,9 @@ impl<'a> Parser<'a> {
                         }
                     } else {
                         // Must be followed by an operator
-                        Err(anyhow::anyhow!("expected comparison operator after identifier '{ident}'"))
+                        Err(anyhow::anyhow!(
+                            "expected comparison operator after identifier '{ident}'"
+                        ))
                     }
                 }
             }
@@ -1445,16 +1475,41 @@ impl<'a> Parser<'a> {
             two.push(c2);
         }
         match two.as_str() {
-            ">=" => { self.chars.next(); self.chars.next(); Some(">=") }
-            "<=" => { self.chars.next(); self.chars.next(); Some("<=") }
-            "<>" => { self.chars.next(); self.chars.next(); Some("<>") }
-            "!=" => { self.chars.next(); self.chars.next(); Some("!=") }
+            ">=" => {
+                self.chars.next();
+                self.chars.next();
+                Some(">=")
+            }
+            "<=" => {
+                self.chars.next();
+                self.chars.next();
+                Some("<=")
+            }
+            "<>" => {
+                self.chars.next();
+                self.chars.next();
+                Some("<>")
+            }
+            "!=" => {
+                self.chars.next();
+                self.chars.next();
+                Some("!=")
+            }
             _ => {
                 let one = self.chars.peek().copied()?;
                 match one {
-                    '=' => { self.chars.next(); Some("=") }
-                    '>' => { self.chars.next(); Some(">") }
-                    '<' => { self.chars.next(); Some("<") }
+                    '=' => {
+                        self.chars.next();
+                        Some("=")
+                    }
+                    '>' => {
+                        self.chars.next();
+                        Some(">")
+                    }
+                    '<' => {
+                        self.chars.next();
+                        Some("<")
+                    }
                     _ => None,
                 }
             }
@@ -1465,13 +1520,21 @@ impl<'a> Parser<'a> {
         let mut left = self.parse_comparison()?;
         loop {
             self.skip_ws();
-            let peek: String = self.chars.clone().take(4).collect::<String>().to_uppercase();
+            let peek: String = self
+                .chars
+                .clone()
+                .take(4)
+                .collect::<String>()
+                .to_uppercase();
             if peek.starts_with("AND") {
-                self.chars.next(); self.chars.next(); self.chars.next();
+                self.chars.next();
+                self.chars.next();
+                self.chars.next();
                 let right = self.parse_comparison()?;
                 left = FilterExpr::And(Box::new(left), Box::new(right));
             } else if peek.starts_with("OR") {
-                self.chars.next(); self.chars.next();
+                self.chars.next();
+                self.chars.next();
                 let right = self.parse_comparison()?;
                 left = FilterExpr::Or(Box::new(left), Box::new(right));
             } else {
@@ -1543,9 +1606,15 @@ impl RowFilter {
             return true;
         }
         let (schema, table, row_option) = match event {
-            WalEvent::Insert { schema, table, new, .. } => (schema, table, Some(new)),
-            WalEvent::Update { schema, table, new, .. } => (schema, table, Some(new)),
-            WalEvent::Delete { schema, table, old, .. } => (schema, table, Some(old)),
+            WalEvent::Insert {
+                schema, table, new, ..
+            } => (schema, table, Some(new)),
+            WalEvent::Update {
+                schema, table, new, ..
+            } => (schema, table, Some(new)),
+            WalEvent::Delete {
+                schema, table, old, ..
+            } => (schema, table, Some(old)),
             _ => return true,
         };
         let row = match row_option {
@@ -1578,8 +1647,10 @@ pub fn parse_where_arg(arg: &str) -> Result<(TableKey, FilterExpr)> {
     let colon_pos = arg.find(':');
     // Reject bare colon (empty prefix) — likely a typo.
     if colon_pos == Some(0) {
-        bail!("filter expression starts with ':' but no table prefix before it — \
-               use 'schema.table:expression' or omit the colon for global filters");
+        bail!(
+            "filter expression starts with ':' but no table prefix before it — \
+               use 'schema.table:expression' or omit the colon for global filters"
+        );
     }
     let table_key = match colon_pos {
         Some(pos) => {
@@ -1636,12 +1707,16 @@ impl ColumnTransforms {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.iter().all(|(_, t)| t.drop_cols.is_empty() && t.renames.is_empty())
+        self.entries
+            .iter()
+            .all(|(_, t)| t.drop_cols.is_empty() && t.renames.is_empty())
     }
 
     /// Apply applicable transforms to a WalEvent in-place.
     pub fn apply(&self, event: &mut WalEvent) {
-        let tn = event.table_name().map(|(s, t)| (s.to_string(), t.to_string()));
+        let tn = event
+            .table_name()
+            .map(|(s, t)| (s.to_string(), t.to_string()));
         let (schema, table) = match tn {
             Some(ref p) => p,
             None => return,
@@ -1663,7 +1738,11 @@ type TableKey = Option<(String, String)>;
 /// Parse a `--drop-cols` argument: `[schema.table:]col1,col2,...`
 pub fn parse_drop_cols_arg(arg: &str) -> Result<(TableKey, Vec<String>)> {
     let (table_key, rest) = parse_table_prefix(arg)?;
-    let cols: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let cols: Vec<String> = rest
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     if cols.is_empty() {
         bail!("drop-cols: no columns specified in '{arg}'");
     }
@@ -1681,9 +1760,11 @@ pub fn parse_rename_arg(arg: &str) -> Result<(TableKey, Vec<(String, String)>)> 
         }
         let mut eq_split = part.splitn(2, '=');
         let old = eq_split.next().unwrap().trim().to_string();
-        let new = eq_split.next().ok_or_else(|| {
-            anyhow::anyhow!("rename: expected 'old=new' format, got '{part}'")
-        })?.trim().to_string();
+        let new = eq_split
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("rename: expected 'old=new' format, got '{part}'"))?
+            .trim()
+            .to_string();
         if old.is_empty() || new.is_empty() {
             bail!("rename: empty name in rename pair '{part}'");
         }
@@ -1790,7 +1871,11 @@ fn event_env(event: &WalEvent, lsn_str: &str) -> HashMap<String, String> {
             env.insert("PGX_NEW".to_string(), json_or_dash(new));
         }
         WalEvent::Update {
-            schema, table, new, old, ..
+            schema,
+            table,
+            new,
+            old,
+            ..
         } => {
             env.insert("PGX_SCHEMA".to_string(), schema.clone());
             env.insert("PGX_TABLE".to_string(), table.clone());
@@ -2012,7 +2097,13 @@ pub async fn run(
             let entry = t.entries.iter_mut().find(|(k, _)| k == &key);
             match entry {
                 Some((_, tt)) => tt.drop_cols.extend(cols),
-                None => t.entries.push((key, TableTransform { drop_cols: cols, renames: Vec::new() })),
+                None => t.entries.push((
+                    key,
+                    TableTransform {
+                        drop_cols: cols,
+                        renames: Vec::new(),
+                    },
+                )),
             }
         }
         for arg in config_rename.iter().chain(args.rename.iter()) {
@@ -2020,7 +2111,13 @@ pub async fn run(
             let entry = t.entries.iter_mut().find(|(k, _)| k == &key);
             match entry {
                 Some((_, tt)) => tt.renames.extend(pairs),
-                None => t.entries.push((key, TableTransform { drop_cols: Vec::new(), renames: pairs })),
+                None => t.entries.push((
+                    key,
+                    TableTransform {
+                        drop_cols: Vec::new(),
+                        renames: pairs,
+                    },
+                )),
             }
         }
         t

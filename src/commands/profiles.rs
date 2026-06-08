@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use colored::Colorize;
 
-use crate::utils::config::Config;
+use crate::utils::config::{Config, Connection};
 
 /// Manage pgx connection profiles
 #[derive(Args, Debug)]
@@ -21,12 +21,60 @@ pub enum ProfilesCommands {
         /// Connection profile name
         name: String,
     },
+
+    /// Add a new connection profile
+    Add {
+        /// Connection profile name
+        name: String,
+        /// PostgreSQL connection URL
+        url: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+        /// Set as default connection
+        #[arg(long)]
+        default: bool,
+    },
+
+    /// Update an existing connection profile
+    Edit {
+        /// Connection profile name
+        name: String,
+        /// New PostgreSQL connection URL
+        #[arg(long)]
+        url: Option<String>,
+        /// New description
+        #[arg(long)]
+        description: Option<String>,
+        /// Set as default connection
+        #[arg(long)]
+        default: Option<bool>,
+    },
+
+    /// Delete a connection profile
+    Delete {
+        /// Connection profile name
+        name: String,
+    },
 }
 
 pub fn run(args: &ProfilesArgs) -> Result<()> {
     match &args.command {
         ProfilesCommands::List => cmd_list(),
         ProfilesCommands::Show { name } => cmd_show(name),
+        ProfilesCommands::Add {
+            name,
+            url,
+            description,
+            default,
+        } => cmd_add(name, url, description.as_deref(), *default),
+        ProfilesCommands::Edit {
+            name,
+            url,
+            description,
+            default,
+        } => cmd_edit(name, url.as_deref(), description.as_deref(), *default),
+        ProfilesCommands::Delete { name } => cmd_delete(name),
     }
 }
 
@@ -46,11 +94,8 @@ fn cmd_list() -> Result<()> {
     if cfg.connections.is_empty() {
         println!("  {}", "(no profiles configured)".dimmed());
         println!();
-        println!("  Add profiles in ~/.pgx/config.toml:");
-        println!(
-            "  {}",
-            "  [connections.my_db]\n  url = \"postgres://user:pass@host:5432/db\"".dimmed()
-        );
+        println!("  Add profiles:");
+        println!("    pgx profiles add <name> <url> [--description \"...\"]");
         return Ok(());
     }
 
@@ -153,6 +198,82 @@ fn cmd_show(name: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn cmd_add(name: &str, url: &str, description: Option<&str>, set_default: bool) -> Result<()> {
+    let mut cfg = Config::load()?;
+
+    if cfg.connections.contains_key(name) {
+        anyhow::bail!("Connection profile '{}' already exists", name);
+    }
+
+    cfg.connections.insert(
+        name.to_string(),
+        Connection {
+            url: url.to_string(),
+            description: description.map(|d| d.to_string()),
+            listen: None,
+            replicate: None,
+            consume: None,
+        },
+    );
+
+    if set_default {
+        cfg.default = Some(name.to_string());
+    }
+
+    cfg.save()?;
+    println!("{}", format!("Added profile '{name}'").green().bold());
+    Ok(())
+}
+
+fn cmd_edit(
+    name: &str,
+    url: Option<&str>,
+    description: Option<&str>,
+    set_default: Option<bool>,
+) -> Result<()> {
+    let mut cfg = Config::load()?;
+
+    let conn = cfg
+        .connections
+        .get_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("No connection profile named '{}'", name))?;
+
+    if let Some(u) = url {
+        conn.url = u.to_string();
+    }
+    if let Some(d) = description {
+        conn.description = Some(d.to_string());
+    }
+    if let Some(true) = set_default {
+        cfg.default = Some(name.to_string());
+    } else if let Some(false) = set_default {
+        if cfg.default.as_deref() == Some(name) {
+            cfg.default = None;
+        }
+    }
+
+    cfg.save()?;
+    println!("{}", format!("Updated profile '{name}'").green().bold());
+    Ok(())
+}
+
+fn cmd_delete(name: &str) -> Result<()> {
+    let mut cfg = Config::load()?;
+
+    if !cfg.connections.contains_key(name) {
+        anyhow::bail!("No connection profile named '{}'", name);
+    }
+
+    cfg.connections.remove(name);
+    if cfg.default.as_deref() == Some(name) {
+        cfg.default = None;
+    }
+
+    cfg.save()?;
+    println!("{}", format!("Deleted profile '{name}'").green().bold());
     Ok(())
 }
 

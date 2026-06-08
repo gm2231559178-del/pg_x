@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::dataloader::DataLoader;
-use super::pool::QueryPool;
+use super::pool::QueryConn;
 use super::query::{FieldSelection, NamedQuery};
 use super::row::row_to_json_value;
 use crate::utils::config::ResolverConfig;
@@ -25,7 +25,7 @@ pub async fn execute(
     query: &NamedQuery,
     variables: &HashMap<String, Value>,
     resolvers: &HashMap<String, ResolverConfig>,
-    pool: &QueryPool,
+    pool: &QueryConn,
     max_depth: u32,
 ) -> Result<Value> {
     execute_batched(query, variables, resolvers, pool, max_depth).await
@@ -37,7 +37,7 @@ async fn resolve_children(
     parent_obj: &mut Value,
     child_fields: &[FieldSelection],
     resolvers: &HashMap<String, ResolverConfig>,
-    pool: &QueryPool,
+    pool: &QueryConn,
     max_depth: u32,
 ) -> Result<()> {
     resolve_children_with_depth(parent_obj, child_fields, resolvers, pool, max_depth, 0).await
@@ -47,7 +47,7 @@ async fn resolve_children_with_depth(
     parent_obj: &mut Value,
     child_fields: &[FieldSelection],
     resolvers: &HashMap<String, ResolverConfig>,
-    pool: &QueryPool,
+    pool: &QueryConn,
     max_depth: u32,
     depth: u32,
 ) -> Result<()> {
@@ -162,7 +162,7 @@ async fn execute_batched(
     query: &NamedQuery,
     variables: &HashMap<String, Value>,
     resolvers: &HashMap<String, ResolverConfig>,
-    pool: &QueryPool,
+    pool: &QueryConn,
     max_depth: u32,
 ) -> Result<Value> {
     let root_selection = &query.selection;
@@ -245,7 +245,7 @@ async fn resolve_children_batched(
     parent_objs: &mut [Value],
     child_fields: &[FieldSelection],
     resolvers: &HashMap<String, ResolverConfig>,
-    pool: &QueryPool,
+    pool: &QueryConn,
     max_depth: u32,
 ) -> Result<()> {
     for field in child_fields {

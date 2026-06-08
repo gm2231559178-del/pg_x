@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 
 use crate::consumer::r#trait::{BrokerMessage, ConsumeSink, Consumer};
 use crate::downstream::contract::ContractMessage;
-use crate::graphql::{executor, pool::QueryPool, query::QueryLoader, schema::SchemaRegistry};
+use crate::graphql::{executor, pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
 use crate::utils::config::{Connection, ConsumeSinkKind, ConsumeSourceKind, ResolverConfig};
 
 // ── CLI args ─────────────────────────────────────────────────────────────────
@@ -426,7 +426,7 @@ pub async fn run(
     );
 
     // ── Build GraphQL query pool ─────────────────────────────────────────────
-    let pool = QueryPool::connect(&url, use_tls).await?;
+    let pool = QueryConn::connect(&url, use_tls).await?;
     info!("Connected GraphQL query pool to PostgreSQL");
 
     // ── Resolve default query name (contract mode fallback) ──────────────────
@@ -485,7 +485,7 @@ pub async fn run(
                 let qn = args
                     .query
                     .as_deref()
-                    .expect("--query is required in simple mode")
+                    .ok_or_else(|| anyhow::anyhow!("--query is required in simple mode"))?
                     .to_string();
                 let vars = payload_to_variables(&msg.payload);
                 (qn, vars)

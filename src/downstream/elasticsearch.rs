@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::contract::NotifyEvent;
 use super::sink::Downstream;
-use crate::graphql::{executor, pool::QueryPool, query::QueryLoader, schema::SchemaRegistry};
+use crate::graphql::{executor, pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
 use crate::utils::config::ResolverConfig;
 
 /// Elasticsearch downstream sink.
@@ -17,7 +17,7 @@ pub struct ElasticsearchDownstream {
     index: String,
     id_field: Option<String>,
     client: reqwest::Client,
-    pool: QueryPool,
+    pool: QueryConn,
     queries: QueryLoader,
     resolvers: HashMap<String, ResolverConfig>,
     max_depth: u32,
@@ -29,7 +29,7 @@ impl ElasticsearchDownstream {
         index: &str,
         id_field: Option<String>,
         max_depth: u32,
-        pool: QueryPool,
+        pool: QueryConn,
         resolvers: HashMap<String, ResolverConfig>,
         schema_dir: Option<PathBuf>,
     ) -> Result<Self> {

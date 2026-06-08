@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
-use crate::utils::config::{Connection, DownstreamSinkKind, ResolverConfig};
+use crate::utils::config::{merge_opt, merge_vec, Connection, DownstreamSinkKind, ResolverConfig};
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 use crate::utils::tls;
 
@@ -157,26 +157,16 @@ pub async fn run(
 ) -> Result<()> {
     // Merge connection-level defaults into CLI args (CLI wins).
     if let Some(cfg) = conn.and_then(|c| c.listen.as_ref()) {
-        if args.channels.is_empty() && !cfg.channels.is_empty() {
-            args.channels = cfg.channels.clone();
-        }
-        if args.max_reconnect_attempts.is_none() {
-            args.max_reconnect_attempts = cfg.max_reconnect_attempts;
-        }
-        if args.reconnect_base_ms.is_none() {
-            args.reconnect_base_ms = cfg.reconnect_base_ms;
-        }
-        if args.reconnect_max_ms.is_none() {
-            args.reconnect_max_ms = cfg.reconnect_max_ms;
-        }
+        merge_vec(&mut args.channels, &cfg.channels);
+        merge_opt(&mut args.max_reconnect_attempts, &cfg.max_reconnect_attempts);
+        merge_opt(&mut args.reconnect_base_ms, &cfg.reconnect_base_ms);
+        merge_opt(&mut args.reconnect_max_ms, &cfg.reconnect_max_ms);
 
         // Merge downstream sink defaults from config into CLI subcommand args.
         if let Some(sink_cfg) = &cfg.sink {
             match (&mut args.downstream, sink_cfg) {
                 (DownstreamCommand::Shell(a), DownstreamSinkKind::Shell { command, mode, .. }) => {
-                    if a.command.is_none() {
-                        a.command = Some(command.clone());
-                    }
+                    merge_opt(&mut a.command, &Some(command.clone()));
                     if let Some(m) = mode {
                         if let Ok(fm) = m.parse::<ForwardMode>() {
                             a.mode = fm;
@@ -185,9 +175,7 @@ pub async fn run(
                 }
                 #[cfg(feature = "webhook")]
                 (DownstreamCommand::Webhook(a), DownstreamSinkKind::Webhook { url, mode, .. }) => {
-                    if a.url.is_none() {
-                        a.url = Some(url.clone());
-                    }
+                    merge_opt(&mut a.url, &Some(url.clone()));
                     if let Some(m) = mode {
                         if let Ok(fm) = m.parse::<ForwardMode>() {
                             a.mode = fm;
@@ -250,18 +238,10 @@ pub async fn run(
                         schema_dir,
                     },
                 ) => {
-                    if a.es_url.is_none() {
-                        a.es_url = Some(url.clone());
-                    }
-                    if a.index.is_none() {
-                        a.index = Some(index.clone());
-                    }
-                    if a.id_field.is_none() {
-                        a.id_field = id_field.clone();
-                    }
-                    if a.schema_dir.is_none() {
-                        a.schema_dir = schema_dir.clone();
-                    }
+                    merge_opt(&mut a.es_url, &Some(url.clone()));
+                    merge_opt(&mut a.index, &Some(index.clone()));
+                    merge_opt(&mut a.id_field, id_field);
+                    merge_opt(&mut a.schema_dir, schema_dir);
                 }
                 // Mismatch — CLI subcommand doesn't match config sink type; CLI wins.
                 _ => {}
@@ -548,10 +528,10 @@ async fn build_downstream(
         #[cfg(feature = "elasticsearch")]
         DownstreamCommand::Elasticsearch(a) => {
             use crate::downstream::elasticsearch::ElasticsearchDownstream;
-            use crate::graphql::pool::QueryPool;
+            use crate::graphql::pool::QueryConn;
             use std::path::PathBuf;
 
-            let pool = QueryPool::connect(url, use_tls).await?;
+            let pool = QueryConn::connect(url, use_tls).await?;
             let es_url = a.es_url.as_deref().unwrap_or("http://localhost:9200");
             let index = a.index.as_deref().unwrap_or("pgx");
             let schema_dir = a.schema_dir.as_ref().map(PathBuf::from);

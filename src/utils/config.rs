@@ -255,6 +255,32 @@ pub enum ConsumeSinkKind {
     },
 }
 
+/// Merge a CLI Option field from a config Option (CLI wins).
+pub fn merge_opt<T: Clone>(field: &mut Option<T>, config: &Option<T>) {
+    if field.is_none() {
+        if let Some(val) = config {
+            *field = Some(val.clone());
+        }
+    }
+}
+
+/// Merge a CLI bool field from a config Option<bool> (CLI wins).
+/// Only sets the field to `true` if config says so and CLI hasn't set it.
+pub fn merge_bool(field: &mut bool, config: Option<bool>) {
+    if !*field {
+        if let Some(true) = config {
+            *field = true;
+        }
+    }
+}
+
+/// Merge a CLI Vec field from a config Vec (CLI wins).
+pub fn merge_vec<T: Clone>(field: &mut Vec<T>, config: &[T]) {
+    if field.is_empty() && !config.is_empty() {
+        *field = config.to_vec();
+    }
+}
+
 impl Config {
     pub fn path() -> Result<PathBuf> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
@@ -275,6 +301,21 @@ impl Config {
     /// Look up a named connection profile.
     pub fn get(&self, name: &str) -> Option<&Connection> {
         self.connections.get(name)
+    }
+
+    /// Save the config back to ~/.pgx/config.toml.
+    /// Creates the parent directory if it doesn't exist.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Cannot create config directory: {}", parent.display()))?;
+        }
+        let raw = toml::to_string_pretty(self).context("Cannot serialize config")?;
+        std::fs::write(&path, raw)
+            .with_context(|| format!("Cannot write config: {}", path.display()))?;
+        tracing::debug!(path = %path.display(), "Config saved");
+        Ok(())
     }
 
     /// Look up a named connection URL.
@@ -317,5 +358,109 @@ impl Config {
             "No database URL supplied.\n\
              Use -U <url>, set DATABASE_URL, or add a default in ~/.pgx/config.toml"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_opt_cli_wins() {
+        let mut field: Option<String> = Some("cli".to_string());
+        let config = Some("config".to_string());
+        merge_opt(&mut field, &config);
+        assert_eq!(field, Some("cli".to_string()));
+    }
+
+    #[test]
+    fn merge_opt_config_fills() {
+        let mut field: Option<String> = None;
+        let config = Some("config".to_string());
+        merge_opt(&mut field, &config);
+        assert_eq!(field, Some("config".to_string()));
+    }
+
+    #[test]
+    fn merge_opt_both_none() {
+        let mut field: Option<String> = None;
+        let config: Option<String> = None;
+        merge_opt(&mut field, &config);
+        assert_eq!(field, None);
+    }
+
+    #[test]
+    fn merge_bool_false_with_config_true() {
+        let mut field = false;
+        merge_bool(&mut field, Some(true));
+        assert!(field);
+    }
+
+    #[test]
+    fn merge_bool_already_true() {
+        let mut field = true;
+        merge_bool(&mut field, Some(false));
+        assert!(field);
+    }
+
+    #[test]
+    fn merge_vec_empty_fills() {
+        let mut field: Vec<String> = vec![];
+        let config = vec!["a".to_string(), "b".to_string()];
+        merge_vec(&mut field, &config);
+        assert_eq!(field, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn merge_vec_cli_wins() {
+        let mut field = vec!["cli".to_string()];
+        let config = vec!["config".to_string()];
+        merge_vec(&mut field, &config);
+        assert_eq!(field, vec!["cli"]);
+    }
+
+    #[test]
+    fn config_default_is_empty() {
+        let cfg = Config::default();
+        assert!(cfg.connections.is_empty());
+        assert!(cfg.default.is_none());
+    }
+
+    #[test]
+    fn resolve_from_url_flag_wins() {
+        let cfg = Config::default();
+        let (url, name) = cfg
+            .resolve_from(Some("postgres://cli".to_string()), None)
+            .unwrap();
+        assert_eq!(url, "postgres://cli");
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn with_connection_serde_roundtrip() {
+        let conn = Connection {
+            url: "postgres://user:pass@localhost:5432/db".to_string(),
+            description: Some("test".to_string()),
+            listen: None,
+            replicate: None,
+            consume: None,
+        };
+        let toml_str = toml::to_string_pretty(&conn).expect("serialize");
+        let back: Connection = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(conn.url, back.url);
+        assert_eq!(conn.description, back.description);
+    }
+
+    #[test]
+    fn downstream_sink_kind_stdout_roundtrip() {
+        let kind = DownstreamSinkKind::Stdout {
+            pretty: Some(true),
+        };
+        let toml_str = toml::to_string(&kind).expect("serialize");
+        let back: DownstreamSinkKind = toml::from_str(&toml_str).expect("deserialize");
+        assert!(matches!(
+            back,
+            DownstreamSinkKind::Stdout { pretty: Some(true) }
+        ));
     }
 }

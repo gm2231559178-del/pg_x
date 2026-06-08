@@ -3,7 +3,7 @@ use clap::{Args, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::graphql::{executor, pool::QueryPool, query::QueryLoader, schema::SchemaRegistry};
+use crate::graphql::{executor, pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
 use crate::utils::config::{Config, ResolverConfig};
 use crate::utils::db::connect;
 
@@ -197,7 +197,7 @@ async fn run_query(
     }
 
     // Connect and execute
-    let pool: QueryPool = QueryPool::connect(&url, use_tls).await?;
+    let pool: QueryConn = QueryConn::connect(&url, use_tls).await?;
     let resolvers: &HashMap<String, crate::utils::config::ResolverConfig> = &config.resolvers;
 
     let result: serde_json::Value =

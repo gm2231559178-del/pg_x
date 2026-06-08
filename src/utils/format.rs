@@ -99,6 +99,71 @@ impl RowSet {
     }
 }
 
+/// Convert a Postgres cell to a `serde_json::Value`, preserving type information.
+/// Numeric types become JSON numbers, NULL becomes `Value::Null`.
+pub fn pg_cell_to_json(row: &Row, idx: usize) -> Value {
+    let col_type = row.columns()[idx].type_().name();
+
+    macro_rules! get {
+        ($t:ty) => {
+            match row.try_get::<_, Option<$t>>(idx) {
+                Ok(Some(v)) => return Value::from(v),
+                Ok(None) => return Value::Null,
+                Err(_) => {}
+            }
+        };
+    }
+
+    match col_type {
+        "bool" => get!(bool),
+        "int2" => get!(i16),
+        "int4" => get!(i32),
+        "int8" | "oid" => get!(i64),
+        "float4" => get!(f32),
+        "float8" | "numeric" => get!(f64),
+        "text" | "varchar" | "char" | "bpchar" | "name" | "citext" => get!(String),
+        "json" | "jsonb" => match row.try_get::<_, Option<Value>>(idx) {
+            Ok(Some(v)) => return v,
+            Ok(None) => return Value::Null,
+            Err(_) => {}
+        },
+        "uuid" => match row.try_get::<_, Option<uuid::Uuid>>(idx) {
+            Ok(Some(v)) => return Value::String(v.to_string()),
+            Ok(None) => return Value::Null,
+            Err(_) => {}
+        },
+        "timestamp" | "timestamptz" => {
+            match row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
+                Ok(Some(v)) => {
+                    return Value::String(v.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
+                }
+                Ok(None) => return Value::Null,
+                Err(_) => {}
+            }
+            match row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
+                Ok(Some(v)) => {
+                    return Value::String(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+                }
+                Ok(None) => return Value::Null,
+                Err(_) => {}
+            }
+        }
+        "date" => match row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
+            Ok(Some(v)) => return Value::String(v.to_string()),
+            Ok(None) => return Value::Null,
+            Err(_) => {}
+        },
+        _ => {}
+    }
+
+    // Fallback: try String
+    match row.try_get::<_, Option<String>>(idx) {
+        Ok(Some(v)) => Value::String(v),
+        Ok(None) => Value::Null,
+        Err(_) => Value::String(format!("<{col_type}>")),
+    }
+}
+
 /// Try to extract a human-readable string for any supported Postgres column type.
 fn pg_cell_to_string(row: &Row, idx: usize) -> String {
     let col_type = row.columns()[idx].type_().name();

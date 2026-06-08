@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::pool::QueryPool;
+use super::pool::QueryConn;
 use super::row::cell_as_string;
 
 type Key = String;
@@ -45,7 +45,7 @@ impl DataLoader {
     }
 
     /// Execute the batched SQL query and group results by key.
-    pub async fn execute(&mut self, pool: &QueryPool) -> Result<()> {
+    pub async fn execute(&mut self, pool: &QueryConn) -> Result<()> {
         if self.resolved {
             return Ok(());
         }

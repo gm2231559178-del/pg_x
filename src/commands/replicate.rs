@@ -717,14 +717,35 @@ fn gen_insert_sql(
         .cloned()
         .unwrap_or_else(|| (schema.to_string(), table.to_string()));
 
-    let mut cols: Vec<&String> = new.keys().collect();
+    // Exclude Unchanged columns: pgoutput did not send their values (TOAST or
+    // non-replica-identity), so we must not insert NULL in their place.
+    // Run `ALTER TABLE t REPLICA IDENTITY FULL` to receive every column.
+    let mut cols: Vec<&String> = new
+        .iter()
+        .filter(|(_, v)| !matches!(v, ColVal::Unchanged))
+        .map(|(c, _)| c)
+        .collect();
     cols.sort();
+
+    if cols.is_empty() {
+        // All columns were Unchanged — this should not happen on INSERT but
+        // guard defensively; the resulting SQL is a safe no-op.
+        tracing::warn!(
+            schema = %schema,
+            table = %table,
+            "INSERT row has no sendable columns — all Unchanged.              Consider ALTER TABLE ... REPLICA IDENTITY FULL."
+        );
+        let qualified = format!("{}.{}", quote_ident(&tgt_schema), quote_ident(&tgt_table));
+        return format!("SELECT 1 WHERE FALSE -- SKIPPED INSERT {qualified} (no columns)");
+    }
 
     let col_names: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
     let col_vals: Vec<String> = cols.iter().map(|c| colval_to_sql(&new[*c])).collect();
 
+    // No ON CONFLICT clause: a duplicate-key error surfaces replication
+    // divergence rather than silently discarding the row.
     format!(
-        "INSERT INTO {}.{} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
+        "INSERT INTO {}.{} ({}) VALUES ({})",
         quote_ident(&tgt_schema),
         quote_ident(&tgt_table),
         col_names.join(", "),
@@ -746,7 +767,11 @@ fn gen_update_sql(
 
     let qualified = format!("{}.{}", quote_ident(&tgt_schema), quote_ident(&tgt_table));
 
-    let mut set_cols: Vec<&String> = new.keys().collect();
+    let mut set_cols: Vec<&String> = new
+        .iter()
+        .filter(|(_, v)| !matches!(v, ColVal::Unchanged))
+        .map(|(c, _)| c)
+        .collect();
     set_cols.sort();
     let set_clauses: Vec<String> = set_cols
         .iter()
@@ -759,11 +784,20 @@ fn gen_update_sql(
         .map(|(c, v)| format!("{} = {}", quote_ident(c), colval_to_sql(v)))
         .collect();
 
+    if set_clauses.is_empty() {
+        tracing::warn!(
+            schema = %schema,
+            table = %table,
+            "Skipping UPDATE: no sendable columns in new tuple — all Unchanged."
+        );
+        return format!("SELECT 1 WHERE FALSE -- SKIPPED UPDATE {qualified}");
+    }
+
     if where_clauses.is_empty() {
         tracing::warn!(
-            "Cannot generate safe UPDATE for {} — no usable WHERE columns in old tuple. \
-             Use REPLICA IDENTITY FULL to receive all columns.",
-            qualified,
+            schema = %schema,
+            table = %table,
+            "Skipping UPDATE: no usable WHERE columns in old tuple.              Run ALTER TABLE ... REPLICA IDENTITY FULL to fix this."
         );
         return format!("SELECT 1 WHERE FALSE -- SKIPPED UPDATE {qualified}");
     }
@@ -797,8 +831,9 @@ fn gen_delete_sql(
 
     if where_clauses.is_empty() {
         tracing::warn!(
-            "Cannot generate safe DELETE for {} — no usable WHERE columns in old tuple",
-            qualified,
+            schema = %schema,
+            table = %table,
+            "Skipping DELETE: no usable WHERE columns in old tuple.              Run ALTER TABLE ... REPLICA IDENTITY FULL to fix this."
         );
         return format!("SELECT 1 WHERE FALSE -- SKIPPED DELETE {qualified}");
     }
@@ -1118,10 +1153,22 @@ impl WalSink for FanOutSink {
     }
 
     async fn send_wal(&self, event_json: &str, env: &HashMap<String, String>) -> Result<()> {
+        // Try every sink regardless of failures so one broken sink does not
+        // silently block all others. Collect errors and return the first one
+        // after all sinks have been attempted.
+        let mut first_err: Option<anyhow::Error> = None;
         for sink in &self.sinks {
-            sink.send_wal(event_json, env).await?;
+            if let Err(e) = sink.send_wal(event_json, env).await {
+                tracing::error!(sink = sink.name(), error = %e, "Fan-out sink failed");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -2460,9 +2507,22 @@ pub async fn run(
             break;
         }
 
-        // Unplanned disconnect \u2014 increment and loop back to backoff + reconnect.
-        warn!(attempt, "Connection lost, will retry");
+        // Unplanned disconnect — reset the counter when the session made progress
+        // (resume_lsn advanced), matching listen.rs: only *consecutive* failures
+        // count toward max_reconnect_attempts, not lifetime reconnects.
+        if resume_lsn != initial_lsn {
+            attempt = 0;
+        }
         attempt += 1;
+        warn!(
+            attempt,
+            max_attempts = if max_reconnect_attempts == 0 {
+                "\u{221e}".to_string()
+            } else {
+                max_reconnect_attempts.to_string()
+            },
+            "Connection lost, will retry"
+        );
     }
 
     info!("Replication stream closed");

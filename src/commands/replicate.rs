@@ -18,6 +18,47 @@
 //! -- The user must have the REPLICATION role attribute:
 //! ALTER USER myuser REPLICATION;
 //! ```
+//!
+//! ## CLI examples
+//!
+//! ### Stream decoded WAL to stdout
+//! ```bash
+//! pgx replicate --publication my_pub stdout
+//! ```
+//!
+//! ### Filter by table and operation
+//! ```bash
+//! pgx replicate --publication my_pub --table public.orders --op insert --op update stdout
+//! ```
+//!
+//! ### Row-level WHERE filter
+//! ```bash
+//! pgx replicate --publication my_pub --table public.orders \
+//!   --where "public.orders:status = 'active' AND amount > 100" stdout
+//! ```
+//!
+//! ### Apply changes to another PostgreSQL
+//! ```bash
+//! pgx replicate --publication my_pub \
+//!   postgres --target-url "postgres://user:pass@replica:5432/db" \
+//!   --schema-map "public.orders=public.orders_archive" --batch-size 500
+//! ```
+//!
+//! ### Apply to PG + forward to Kafka simultaneously
+//! ```bash
+//! pgx replicate --publication my_pub \
+//!   postgres --target-url "postgres://user:pass@replica:5432/db" \
+//!   --sink "kafka:brokers=localhost:9092,topic=pgx-wal"
+//! ```
+//!
+//! ### Full pipeline — filter, rename, drop, fan-out
+//! ```bash
+//! pgx replicate --publication my_pub --table public.orders \
+//!   --drop-cols "public.orders:ssn,credit_card" \
+//!   --rename "public.orders:order_id=id,customer_name=name" \
+//!   --where "public.orders:status = 'active'" \
+//!   stdout --pretty \
+//!   --sink "webhook:url=https://hooks.example.com/orders"
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};

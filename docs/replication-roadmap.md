@@ -174,10 +174,73 @@ Allow multiple `--sink` flags or a single downstream config that accepts multipl
 
 ---
 
-## 7. Order of Implementation
+## 7. CLI Examples
 
-1. **PostgreSQL sink** — highest value, fills the biggest gap
-2. **Multi-sink fan-out** — needed to use PG sink alongside existing sinks
-3. **Row-level WHERE** — independent, adds precision
-4. **Column remapping** — independent, adds flexibility
+### Basic: stream to stdout
+```bash
+pgx replicate --publication my_pub stdout
+pgx replicate --publication my_pub stdout --pretty
+```
+
+### Table and operation filters
+```bash
+pgx replicate \
+  --publication my_pub \
+  --table public.orders \
+  --table public.inventory \
+  --op insert --op update \
+  stdout
+```
+
+### Row-level WHERE filter
+```bash
+pgx replicate \
+  --publication my_pub \
+  --table public.orders \
+  --where "public.orders:status = 'active' AND amount > 100" \
+  stdout
+```
+
+### Apply to a replica PostgreSQL
+```bash
+pgx replicate \
+  --publication my_pub \
+  --table public.orders \
+  postgres \
+    --target-url "postgres://user:pass@replica:5432/db" \
+    --schema-map "public.orders=public.orders_archive" \
+    --batch-size 500
+```
+
+### PostgreSQL apply + fan-out to Kafka
+```bash
+pgx replicate \
+  --publication my_pub \
+  postgres \
+    --target-url "postgres://user:pass@replica:5432/db" \
+  --sink "kafka:brokers=localhost:9092,topic=pgx-wal"
+```
+
+### Fan-out to multiple sinks with column transforms
+```bash
+pgx replicate \
+  --publication my_pub \
+  --table public.orders \
+  --drop-cols "public.orders:ssn,credit_card" \
+  --rename "public.orders:order_id=id,customer_name=name" \
+  --where "public.orders:status = 'active'" \
+  stdout \
+  --sink "webhook:url=https://hooks.example.com/orders" \
+  --sink "kafka:brokers=localhost:9092,topic=pgx-orders" \
+  --pretty
+```
+
+---
+
+## 8. Order of Implementation (historical)
+
+1. ~~**PostgreSQL sink**~~ — ✅
+2. ~~**Multi-sink fan-out**~~ — ✅
+3. ~~**Row-level WHERE**~~ — ✅
+4. ~~**Column remapping**~~ — ✅
 5. **DDL replication** — blocked upstream

@@ -103,11 +103,15 @@ pub struct ReplicateSinkConfig {
     /// Maximum reconnect delay cap in milliseconds. Default: 60000.
     pub reconnect_max_ms: Option<u64>,
 
-    /// Downstream sink kind and its options.
+    /// Primary downstream sink kind and its options.
     pub sink: Option<DownstreamSinkKind>,
+
+    /// Additional downstream sinks for fan-out (repeatable).
+    #[serde(default)]
+    pub additional_sinks: Vec<DownstreamSinkKind>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DownstreamSinkKind {
     /// Print events as JSON to stdout.

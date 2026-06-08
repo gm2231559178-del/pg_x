@@ -74,6 +74,11 @@ reconnect_max_ms = 60000
 type = "stdout"
 pretty = true
 
+# Fan-out to multiple sinks:
+# [[connections.local.replicate.additional_sinks]]
+# type = "webhook"
+# url = "https://hooks.example.com/events"
+
 [connections.staging]
 url = "postgres://user:pass@staging.host:5432/stagingdb"
 description = "Staging"
@@ -106,8 +111,13 @@ description = "Staging"
 # tables = ["public.orders"]
 # ops = ["insert", "update"]
 #
+# # Apply to PostgreSQL + forward to Kafka simultaneously
 # [connections.prod.replicate.sink]
+# type = "postgres"
+# target_url = "postgres://user:pass@replica:5432/db"
+# batch_size = 500
+#
+# [[connections.prod.replicate.additional_sinks]]
 # type = "kafka"
 # brokers = "kafka-prod:9092"
 # topic = "pgx-wal"
-# mode = "contract"

@@ -95,6 +95,14 @@ pub struct ReplicateArgs {
     #[arg(long, env = "PGX_REPLICATE_RECONNECT_MAX_MS")]
     pub reconnect_max_ms: Option<u64>,
 
+    /// Additional sinks for fan-out (repeatable).
+    /// Format: type:key=val,key=val,...
+    /// Types: stdout, shell, webhook, kafka, rabbitmq
+    /// Example: --sink "webhook:url=https://hooks.example.com/events"
+    ///          --sink "kafka:brokers=localhost:9092,topic=pgx-wal"
+    #[arg(long = "sink")]
+    pub additional_sinks: Vec<String>,
+
     #[command(subcommand)]
     pub downstream: ReplicateDownstreamCommand,
 }
@@ -857,6 +865,150 @@ async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<Arc<dyn WalS
     }
 }
 
+/// Build a single WalSink from a DownstreamSinkKind config.
+async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Arc<dyn WalSink>> {
+    match kind {
+        DownstreamSinkKind::Stdout { pretty } => {
+            Ok(Arc::new(StdoutSink { pretty: pretty.unwrap_or(false) }))
+        }
+        DownstreamSinkKind::Shell { command, envs, .. } => {
+            if command.is_empty() {
+                anyhow::bail!("Shell sink requires command");
+            }
+            let mut base_env = HashMap::new();
+            if let Some(env_list) = envs {
+                for e in env_list {
+                    if let Some((k, v)) = e.split_once('=') {
+                        base_env.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+            Ok(Arc::new(ShellWalSink {
+                command: command.clone(),
+                base_env,
+            }))
+        }
+        DownstreamSinkKind::Webhook { url, headers, .. } => {
+            let mut h = Vec::new();
+            if let Some(hdrs) = headers {
+                for entry in hdrs {
+                    if let Some((k, v)) = entry.split_once('=') {
+                        h.push((k.to_string(), v.to_string()));
+                    }
+                }
+            }
+            #[cfg(feature = "webhook")]
+            {
+                Ok(Arc::new(WebhookWalSink {
+                    client: reqwest::Client::new(),
+                    url: url.clone(),
+                    default_headers: h.into_iter().collect(),
+                }))
+            }
+            #[cfg(not(feature = "webhook"))]
+            {
+                let _ = h;
+                anyhow::bail!("Webhook sink requires 'webhook' feature (reqwest)");
+            }
+        }
+        DownstreamSinkKind::Kafka { brokers, topic, .. } => {
+            #[cfg(feature = "kafka")]
+            {
+                use rdkafka::config::ClientConfig;
+                let producer = ClientConfig::new()
+                    .set("bootstrap.servers", brokers.as_deref().unwrap_or("localhost:9092"))
+                    .set("message.timeout.ms", "5000")
+                    .create()
+                    .context("Failed to create Kafka producer")?;
+                Ok(Arc::new(KafkaWalSink {
+                    producer,
+                    topic: topic.clone().unwrap_or_else(|| "pgx-wal".to_string()),
+                }))
+            }
+            #[cfg(not(feature = "kafka"))]
+            {
+                let _ = (brokers, topic);
+                anyhow::bail!("Kafka sink requires 'kafka' feature (rdkafka)");
+            }
+        }
+        DownstreamSinkKind::Rabbitmq { amqp_url, exchange, routing_key, .. } => {
+            #[cfg(feature = "rabbitmq")]
+            {
+                use lapin::{
+                    options::ExchangeDeclareOptions, types::FieldTable, Connection,
+                    ConnectionProperties, ExchangeKind,
+                };
+                let url = amqp_url.clone().unwrap_or_else(|| "amqp://guest:guest@localhost:5672/%2F".to_string());
+                let conn = Connection::connect(&url, ConnectionProperties::default())
+                    .await
+                    .context("Failed to connect to RabbitMQ")?;
+                let channel = conn
+                    .create_channel()
+                    .await
+                    .context("Failed to open AMQP channel")?;
+                let exch = exchange.clone().unwrap_or_else(|| "pgx".to_string());
+                channel
+                    .exchange_declare(
+                        &exch,
+                        ExchangeKind::Topic,
+                        ExchangeDeclareOptions {
+                            durable: true,
+                            ..Default::default()
+                        },
+                        FieldTable::default(),
+                    )
+                    .await
+                    .context("Failed to declare exchange")?;
+                Ok(Arc::new(RabbitmqWalSink {
+                    channel,
+                    exchange: exch,
+                    routing_key: routing_key.clone().unwrap_or_else(|| "pgx.wal".to_string()),
+                }))
+            }
+            #[cfg(not(feature = "rabbitmq"))]
+            {
+                let _ = (amqp_url, exchange, routing_key);
+                anyhow::bail!("RabbitMQ sink requires 'rabbitmq' feature (lapin)");
+            }
+        }
+        DownstreamSinkKind::Elasticsearch { .. } => {
+            anyhow::bail!("Elasticsearch sink is not supported for replication; use 'listen elasticsearch' instead");
+        }
+        DownstreamSinkKind::Postgres { .. } => {
+            // PG applier is initialized separately; use no-op for the WS path.
+            Ok(Arc::new(NoopSink))
+        }
+    }
+}
+
+/// Build a FanOutSink from the primary downstream command, --sink args, and config sinks.
+async fn build_fan_out_sink(args: &ReplicateArgs, config_additional: &[DownstreamSinkKind]) -> Result<Arc<dyn WalSink>> {
+    let mut sinks: Vec<Arc<dyn WalSink>> = Vec::new();
+
+    // Primary sink from the subcommand
+    let primary = build_wal_sink(&args.downstream).await?;
+    sinks.push(primary);
+
+    // Additional sinks from --sink flags (CLI)
+    for s in &args.additional_sinks {
+        let kind = parse_sink_string(s)?;
+        let sink = build_sink_from_kind(&kind).await?;
+        sinks.push(sink);
+    }
+
+    // Additional sinks from config file
+    for kind in config_additional {
+        let sink = build_sink_from_kind(kind).await?;
+        sinks.push(sink);
+    }
+
+    if sinks.len() == 1 {
+        Ok(sinks.into_iter().next().unwrap())
+    } else {
+        Ok(Arc::new(FanOutSink { sinks }))
+    }
+}
+
 /// A no-op sink used when the real work is done by the PostgresApplier.
 struct NoopSink;
 
@@ -867,6 +1019,106 @@ impl WalSink for NoopSink {
     }
     async fn send_wal(&self, _event_json: &str, _env: &HashMap<String, String>) -> Result<()> {
         Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fan-out: forward events to multiple sinks simultaneously
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wraps multiple WalSinks and fans out events to all of them.
+struct FanOutSink {
+    sinks: Vec<Arc<dyn WalSink>>,
+}
+
+#[async_trait::async_trait]
+impl WalSink for FanOutSink {
+    fn name(&self) -> &str {
+        "fan-out"
+    }
+
+    async fn send_wal(&self, event_json: &str, env: &HashMap<String, String>) -> Result<()> {
+        for sink in &self.sinks {
+            sink.send_wal(event_json, env).await?;
+        }
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parse --sink strings into DownstreamSinkKind
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse a sink descriptor string into a DownstreamSinkKind.
+///
+/// Format: `type:key=val,key=val,...`
+///
+/// Examples:
+///   stdout
+///   stdout:pretty=true
+///   webhook:url=https://hooks.example.com/events
+///   kafka:brokers=localhost:9092,topic=pgx-wal
+///   rabbitmq:amqp_url=amqp://guest:guest@localhost:5672/%2F
+///   shell:command=echo $PGX_OP
+fn parse_sink_string(s: &str) -> Result<DownstreamSinkKind> {
+    let (sink_type, rest) = match s.split_once(':') {
+        Some((t, r)) => (t.to_lowercase(), r),
+        None => (s.to_lowercase(), ""),
+    };
+
+    let mut params: HashMap<String, String> = HashMap::new();
+    if !rest.is_empty() {
+        for pair in rest.split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                params.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+
+    match sink_type.as_str() {
+        "stdout" => Ok(DownstreamSinkKind::Stdout {
+            pretty: params.get("pretty").map(|v| v == "true"),
+        }),
+        "shell" => {
+            let command = params
+                .get("command")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("shell sink requires command=..."))?;
+            Ok(DownstreamSinkKind::Shell {
+                command,
+                envs: params.get("envs").map(|e| e.split(',').map(String::from).collect()),
+                mode: params.get("mode").cloned(),
+            })
+        }
+        "webhook" => {
+            let url = params
+                .get("url")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("webhook sink requires url=..."))?;
+            Ok(DownstreamSinkKind::Webhook {
+                url,
+                headers: params.get("headers").map(|h| h.split(',').map(String::from).collect()),
+                mode: params.get("mode").cloned(),
+            })
+        }
+        "kafka" => {
+            Ok(DownstreamSinkKind::Kafka {
+                brokers: params.get("brokers").cloned(),
+                topic: params.get("topic").cloned(),
+                mode: params.get("mode").cloned(),
+            })
+        }
+        "rabbitmq" => {
+            Ok(DownstreamSinkKind::Rabbitmq {
+                amqp_url: params.get("amqp_url").cloned(),
+                exchange: params.get("exchange").cloned(),
+                routing_key: params.get("routing_key").cloned(),
+                mode: params.get("mode").cloned(),
+            })
+        }
+        other => {
+            anyhow::bail!("Unknown sink type '{other}'. Supported: stdout, shell, webhook, kafka, rabbitmq");
+        }
     }
 }
 
@@ -1033,6 +1285,7 @@ pub async fn run(
     use_tls: bool,
 ) -> Result<()> {
     // Merge connection-level defaults into CLI args (CLI wins).
+    let mut config_additional_sinks: Vec<DownstreamSinkKind> = Vec::new();
     if let Some(cfg) = conn.and_then(|c| c.replicate.as_ref()) {
         if args.slot.is_none() {
             args.slot = cfg.slot.clone();
@@ -1153,13 +1406,15 @@ pub async fn run(
                 _ => {}
             }
         }
+
+        config_additional_sinks = cfg.additional_sinks.clone();
     }
 
     let slot_name = args.slot.clone().unwrap_or_else(|| "pgx_slot".to_string());
     let max_reconnect_attempts = args.max_reconnect_attempts.unwrap_or(0);
     let reconnect_base_ms = args.reconnect_base_ms.unwrap_or(1000);
     let reconnect_max_ms = args.reconnect_max_ms.unwrap_or(60000);
-    let sink = build_wal_sink(&args.downstream).await?;
+    let sink = build_fan_out_sink(&args, &config_additional_sinks).await?;
 
     // ── Initialize PostgresApplier if Postgres sink is selected ─────────────
     let mut pg_applier: Option<PostgresApplier> = match &args.downstream {

@@ -560,10 +560,7 @@ async fn export_to_iceberg(
         }
     }
 
-    let arrays: Vec<ArrayRef> = builders
-        .into_iter()
-        .map(|mut b| b.finish())
-        .collect();
+    let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
 
     let batch = RecordBatch::try_new(Arc::clone(&id_arrow_schema), arrays)
         .context("Failed to create RecordBatch")?;

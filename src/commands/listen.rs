@@ -158,7 +158,10 @@ pub async fn run(
     // Merge connection-level defaults into CLI args (CLI wins).
     if let Some(cfg) = conn.and_then(|c| c.listen.as_ref()) {
         merge_vec(&mut args.channels, &cfg.channels);
-        merge_opt(&mut args.max_reconnect_attempts, &cfg.max_reconnect_attempts);
+        merge_opt(
+            &mut args.max_reconnect_attempts,
+            &cfg.max_reconnect_attempts,
+        );
         merge_opt(&mut args.reconnect_base_ms, &cfg.reconnect_base_ms);
         merge_opt(&mut args.reconnect_max_ms, &cfg.reconnect_max_ms);
 

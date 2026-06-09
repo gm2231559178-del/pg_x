@@ -134,16 +134,12 @@ pub fn pg_cell_to_json(row: &Row, idx: usize) -> Value {
         },
         "timestamp" | "timestamptz" => {
             match row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
-                Ok(Some(v)) => {
-                    return Value::String(v.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
-                }
+                Ok(Some(v)) => return Value::String(v.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()),
                 Ok(None) => return Value::Null,
                 Err(_) => {}
             }
             match row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
-                Ok(Some(v)) => {
-                    return Value::String(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
-                }
+                Ok(Some(v)) => return Value::String(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
                 Ok(None) => return Value::Null,
                 Err(_) => {}
             }

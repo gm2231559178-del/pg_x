@@ -8,8 +8,8 @@ use chrono::Utc;
 use tracing::{debug, error};
 use uuid::Uuid;
 
-use crate::replication::event::{ColVal, WalEvent};
 use super::sinks::WalSink;
+use crate::replication::event::{ColVal, WalEvent};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ParquetArgs {
@@ -78,10 +78,7 @@ impl ParquetSink {
         if total_rows == 0 {
             return Ok(());
         }
-        let any_full = inner
-            .buffers
-            .values()
-            .any(|v| v.len() >= self.max_rows);
+        let any_full = inner.buffers.values().any(|v| v.len() >= self.max_rows);
         if !any_full && elapsed < self.flush_interval {
             return Ok(());
         }
@@ -109,8 +106,14 @@ impl ParquetSink {
         inner.last_flush = Instant::now();
         drop(inner);
         for ((schema, table), events) in buffers {
-            flush_table(&self.output_dir, &schema, &table, &events, &self.compression)
-                .with_context(|| format!("Failed to flush {schema}.{table}"))?;
+            flush_table(
+                &self.output_dir,
+                &schema,
+                &table,
+                &events,
+                &self.compression,
+            )
+            .with_context(|| format!("Failed to flush {schema}.{table}"))?;
         }
         Ok(())
     }
@@ -125,10 +128,7 @@ impl WalSink for ParquetSink {
     async fn send_wal(&self, event_json: &str, _env: &HashMap<String, String>) -> Result<()> {
         let event: WalEvent = serde_json::from_str(event_json)
             .with_context(|| "Failed to parse WAL event JSON in parquet sink")?;
-        let lsn = _env
-            .get("PGX_LSN")
-            .cloned()
-            .unwrap_or_default();
+        let lsn = _env.get("PGX_LSN").cloned().unwrap_or_default();
         self.accumulate(event, lsn)?;
         self.maybe_flush()
     }
@@ -207,9 +207,7 @@ fn flush_table(
         for ae in events {
             let (op, new_row, old_row) = match &ae.event {
                 WalEvent::Insert { new, .. } => ("insert", Some(new), None),
-                WalEvent::Update { new, old, .. } => {
-                    ("update", Some(new), old.as_ref())
-                }
+                WalEvent::Update { new, old, .. } => ("update", Some(new), old.as_ref()),
                 WalEvent::Delete { old, .. } => ("delete", None, Some(old)),
                 _ => unreachable!(),
             };
@@ -274,9 +272,7 @@ fn flush_table(
         writer
             .write(&batch)
             .context("Failed to write RecordBatch to parquet")?;
-        writer
-            .close()
-            .context("Failed to close parquet writer")?;
+        writer.close().context("Failed to close parquet writer")?;
 
         let row_count = events.len();
         debug!(path = %file_path.display(), rows = row_count, schema = %schema, table = %table, "Wrote parquet file");

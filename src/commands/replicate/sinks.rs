@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::utils::config::DownstreamSinkKind;
 use super::{ReplicateArgs, ReplicateDownstreamCommand};
+use crate::utils::config::DownstreamSinkKind;
 
 #[async_trait::async_trait]
 pub(crate) trait WalSink: Send + Sync {
@@ -306,14 +306,10 @@ pub(crate) async fn build_wal_sink(cmd: &ReplicateDownstreamCommand) -> Result<A
             }))
         }
 
-        ReplicateDownstreamCommand::Postgres(_) => {
-            Ok(Arc::new(NoopSink))
-        }
+        ReplicateDownstreamCommand::Postgres(_) => Ok(Arc::new(NoopSink)),
 
         #[cfg(feature = "parquet")]
-        ReplicateDownstreamCommand::Parquet(a) => {
-            Ok(Arc::new(super::parquet::ParquetSink::new(a)))
-        }
+        ReplicateDownstreamCommand::Parquet(a) => Ok(Arc::new(super::parquet::ParquetSink::new(a))),
 
         #[cfg(feature = "iceberg")]
         ReplicateDownstreamCommand::Iceberg(a) => {
@@ -443,9 +439,7 @@ pub(crate) async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Ar
         DownstreamSinkKind::Elasticsearch { .. } => {
             anyhow::bail!("Elasticsearch sink is not supported for replication; use 'listen elasticsearch' instead");
         }
-        DownstreamSinkKind::Postgres { .. } => {
-            Ok(Arc::new(NoopSink))
-        }
+        DownstreamSinkKind::Postgres { .. } => Ok(Arc::new(NoopSink)),
         DownstreamSinkKind::Parquet {
             output_dir,
             max_rows,
@@ -455,7 +449,9 @@ pub(crate) async fn build_sink_from_kind(kind: &DownstreamSinkKind) -> Result<Ar
             #[cfg(feature = "parquet")]
             {
                 let args = super::parquet::ParquetArgs {
-                    output_dir: output_dir.clone().unwrap_or_else(|| "./parquet_output".to_string()),
+                    output_dir: output_dir
+                        .clone()
+                        .unwrap_or_else(|| "./parquet_output".to_string()),
                     max_rows: max_rows.unwrap_or(100000),
                     flush_interval: flush_interval.unwrap_or(300),
                     compression: compression.clone().unwrap_or_else(|| "snappy".to_string()),

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
-use crate::replication::event::{ColVal, Row, WalEvent};
 use super::PostgresArgs;
+use crate::replication::event::{ColVal, Row, WalEvent};
 
 pub(crate) struct PostgresApplier {
     client: tokio_postgres::Client,
@@ -93,9 +93,7 @@ impl PostgresApplier {
 
     pub(crate) async fn handle_event(&mut self, event: &WalEvent) -> Result<()> {
         match event {
-            WalEvent::Relation { .. } => {
-                Ok(())
-            }
+            WalEvent::Relation { .. } => Ok(()),
 
             WalEvent::Insert {
                 schema, table, new, ..
@@ -167,9 +165,7 @@ impl PostgresApplier {
                 Ok(())
             }
 
-            WalEvent::Begin { .. } | WalEvent::Commit { .. } | WalEvent::Keepalive { .. } => {
-                Ok(())
-            }
+            WalEvent::Begin { .. } | WalEvent::Commit { .. } | WalEvent::Keepalive { .. } => Ok(()),
         }
     }
 }

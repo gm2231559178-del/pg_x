@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::{debug, error};
 
-use crate::replication::event::{ColVal, WalEvent};
 use super::sinks::WalSink;
+use crate::replication::event::{ColVal, WalEvent};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct IcebergArgs {
@@ -231,9 +231,8 @@ async fn flush_table_to_iceberg(
 
     // Convert to Iceberg schema (auto-assigns field IDs) and back to Arrow schema,
     // which embeds PARQUET:field_id metadata — required by the Iceberg writer pipeline.
-    let iceberg_schema =
-        arrow_schema_to_schema_auto_assign_ids(&schema_no_ids)
-            .context("Failed to convert Arrow schema to Iceberg schema")?;
+    let iceberg_schema = arrow_schema_to_schema_auto_assign_ids(&schema_no_ids)
+        .context("Failed to convert Arrow schema to Iceberg schema")?;
     let arrow_schema = Arc::new(
         schema_to_arrow_schema(&iceberg_schema)
             .context("Failed to convert Iceberg schema back to Arrow schema")?,
@@ -324,14 +323,10 @@ async fn flush_table_to_iceberg(
     };
 
     // Build writer pipeline.
-    let location_generator =
-        DefaultLocationGenerator::new(iceberg_table.metadata().clone())
-            .context("Failed to create location generator")?;
-    let file_name_generator = DefaultFileNameGenerator::new(
-        format!("{schema}.{table}"),
-        None,
-        DataFileFormat::Parquet,
-    );
+    let location_generator = DefaultLocationGenerator::new(iceberg_table.metadata().clone())
+        .context("Failed to create location generator")?;
+    let file_name_generator =
+        DefaultFileNameGenerator::new(format!("{schema}.{table}"), None, DataFileFormat::Parquet);
 
     let writer_props = if compression == "zstd" {
         WriterProperties::builder()
@@ -349,8 +344,10 @@ async fn flush_table_to_iceberg(
             .build()
     };
 
-    let parquet_writer_builder =
-        ParquetWriterBuilder::new(writer_props, iceberg_table.metadata().current_schema().clone());
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        writer_props,
+        iceberg_table.metadata().current_schema().clone(),
+    );
 
     let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer_builder,
@@ -359,8 +356,7 @@ async fn flush_table_to_iceberg(
         file_name_generator.clone(),
     );
 
-    let data_file_writer_builder =
-        DataFileWriterBuilder::new(rolling_writer_builder);
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
     let mut writer = data_file_writer_builder.build(None).await?;
     writer.write(batch).await?;
@@ -471,10 +467,16 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("PGX_LSN".into(), "0/12345".into());
 
-        sink.send_wal(&make_insert("users", &[("name", "Alice"), ("city", "NYC")]), &env)
-            .await?;
-        sink.send_wal(&make_insert("users", &[("name", "Bob"), ("city", "SF")]), &env)
-            .await?;
+        sink.send_wal(
+            &make_insert("users", &[("name", "Alice"), ("city", "NYC")]),
+            &env,
+        )
+        .await?;
+        sink.send_wal(
+            &make_insert("users", &[("name", "Bob"), ("city", "SF")]),
+            &env,
+        )
+        .await?;
         sink.send_wal(
             &make_update(
                 "users",
@@ -484,8 +486,11 @@ mod tests {
             &env,
         )
         .await?;
-        sink.send_wal(&make_delete("users", &[("name", "Bob"), ("city", "SF")]), &env)
-            .await?;
+        sink.send_wal(
+            &make_delete("users", &[("name", "Bob"), ("city", "SF")]),
+            &env,
+        )
+        .await?;
 
         sink.flush().await?;
 
@@ -502,7 +507,10 @@ mod tests {
         let batches: Vec<arrow::record_batch::RecordBatch> = stream.try_collect().await?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 4, "expected 4 rows (2 inserts + 1 update + 1 delete)");
+        assert_eq!(
+            total_rows, 4,
+            "expected 4 rows (2 inserts + 1 update + 1 delete)"
+        );
 
         // Verify schema has expected columns
         let schema = batches[0].schema();
@@ -542,24 +550,28 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("PGX_LSN".into(), "0/AAA".into());
 
-        sink.send_wal(&make_insert("orders", &[("id", "1"), ("amount", "100")]), &env)
-            .await?;
-        sink.send_wal(&make_insert("products", &[("sku", "P1"), ("price", "50")]), &env)
-            .await?;
-        sink.send_wal(&make_insert("orders", &[("id", "2"), ("amount", "200")]), &env)
-            .await?;
+        sink.send_wal(
+            &make_insert("orders", &[("id", "1"), ("amount", "100")]),
+            &env,
+        )
+        .await?;
+        sink.send_wal(
+            &make_insert("products", &[("sku", "P1"), ("price", "50")]),
+            &env,
+        )
+        .await?;
+        sink.send_wal(
+            &make_insert("orders", &[("id", "2"), ("amount", "200")]),
+            &env,
+        )
+        .await?;
 
         sink.flush().await?;
 
         // Verify orders table has 2 rows, products has 1
         let orders_ident = iceberg::TableIdent::from_strs(["test", "public.orders"])?;
         let orders_table = sink.catalog.load_table(&orders_ident).await?;
-        let orders_stream = orders_table
-            .scan()
-            .select_all()
-            .build()?
-            .to_arrow()
-            .await?;
+        let orders_stream = orders_table.scan().select_all().build()?.to_arrow().await?;
         let orders_batches: Vec<_> = orders_stream.try_collect().await?;
         let orders_rows: usize = orders_batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(orders_rows, 2);

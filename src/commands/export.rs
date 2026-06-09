@@ -435,7 +435,7 @@ fn append_cell(
             match row.try_get::<_, Option<chrono::NaiveDate>>(idx) {
                 Ok(Some(v)) => {
                     let days = v.num_days_from_ce() - 719_163;
-                    b.append_value(days as i32);
+                    b.append_value(days);
                 }
                 Ok(None) => b.append_null(),
                 Err(e) => {
@@ -562,7 +562,7 @@ async fn export_to_iceberg(
 
     let arrays: Vec<ArrayRef> = builders
         .into_iter()
-        .map(|mut b| b.finish().into())
+        .map(|mut b| b.finish())
         .collect();
 
     let batch = RecordBatch::try_new(Arc::clone(&id_arrow_schema), arrays)

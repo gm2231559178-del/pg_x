@@ -98,7 +98,7 @@ webhook = ["reqwest"]
 elasticsearch = ["reqwest"]
 kv = ["redis"]
 parquet = ["dep:arrow", "dep:parquet"]
-iceberg = ["dep:iceberg"]
+iceberg = ["dep:iceberg", "parquet"]
 
 [dev-dependencies]
 tempfile = "3"

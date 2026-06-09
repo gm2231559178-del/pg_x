@@ -465,9 +465,7 @@ mod tests {
 
     #[test]
     fn downstream_sink_kind_stdout_roundtrip() {
-        let kind = DownstreamSinkKind::Stdout {
-            pretty: Some(true),
-        };
+        let kind = DownstreamSinkKind::Stdout { pretty: Some(true) };
         let toml_str = toml::to_string(&kind).expect("serialize");
         let back: DownstreamSinkKind = toml::from_str(&toml_str).expect("deserialize");
         assert!(matches!(

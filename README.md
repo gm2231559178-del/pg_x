@@ -569,6 +569,10 @@ pgx -U $DATABASE_URL export -q "SELECT * FROM orders" -o orders.xlsx
 # Export to CSV
 pgx -U $DATABASE_URL export -q "SELECT * FROM orders" -m csv -o orders.csv
 
+# Export to Iceberg (requires --features iceberg)
+pgx -U $DATABASE_URL export -q "SELECT * FROM orders" -m iceberg \
+  --iceberg-table public.orders_snapshot --warehouse-path ./wh
+
 # Multi-sheet Excel from a .sql file (each `-- sheet:` starts a new sheet)
 pgx -U $DATABASE_URL export -f reports.sql -o report.xlsx
 # reports.sql:
@@ -652,3 +656,4 @@ stdout / shell / webhook / rabbitmq / kafka / parquet
 | `tls`      | ❌      | TLS for the tokio-postgres control-plane connection  |
 | `kv`       | ✅      | Redis / Memcached key-value store sink               |
 | `parquet`  | ✅      | Parquet file output via `arrow` + `parquet`           |
+| `iceberg`  | ❌      | Apache Iceberg table output (export + replicate)      |

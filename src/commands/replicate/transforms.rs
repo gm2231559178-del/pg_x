@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 
-use crate::replication::event::WalEvent;
 use super::filter::TableKey;
+use crate::replication::event::WalEvent;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TableTransform {

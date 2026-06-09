@@ -66,13 +66,14 @@
 //!   --sink "webhook:url=https://hooks.example.com/orders"
 //! ```
 
-mod sinks;
-mod filter;
 mod applier;
-mod transforms;
-mod parquet;
+mod filter;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+#[cfg(feature = "parquet")]
+mod parquet;
+mod sinks;
+mod transforms;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -91,10 +92,10 @@ use crate::utils::config::{merge_bool, merge_opt, merge_vec, Connection, Downstr
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 use crate::utils::tls;
 
-use self::sinks::build_fan_out_sink;
-use self::filter::RowFilter;
 use self::applier::PostgresApplier;
-use self::transforms::{ColumnTransforms, TableTransform, parse_drop_cols_arg, parse_rename_arg};
+use self::filter::RowFilter;
+use self::sinks::build_fan_out_sink;
+use self::transforms::{parse_drop_cols_arg, parse_rename_arg, ColumnTransforms, TableTransform};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI argument structs
@@ -508,7 +509,10 @@ pub async fn run(
         merge_bool(&mut args.temporary, cfg.temporary);
         merge_bool(&mut args.emit_txn_boundaries, cfg.emit_txn_boundaries);
         merge_bool(&mut args.emit_schema, cfg.emit_schema);
-        merge_opt(&mut args.max_reconnect_attempts, &cfg.max_reconnect_attempts);
+        merge_opt(
+            &mut args.max_reconnect_attempts,
+            &cfg.max_reconnect_attempts,
+        );
         merge_opt(&mut args.reconnect_base_ms, &cfg.reconnect_base_ms);
         merge_opt(&mut args.reconnect_max_ms, &cfg.reconnect_max_ms);
 
@@ -521,7 +525,10 @@ pub async fn run(
                 ) => {
                     a.pretty = *p;
                 }
-                (ReplicateDownstreamCommand::Stdout(_), DownstreamSinkKind::Stdout { pretty: None }) => {}
+                (
+                    ReplicateDownstreamCommand::Stdout(_),
+                    DownstreamSinkKind::Stdout { pretty: None },
+                ) => {}
                 (
                     ReplicateDownstreamCommand::Shell(a),
                     DownstreamSinkKind::Shell { command, .. },
@@ -538,7 +545,12 @@ pub async fn run(
                 #[cfg(feature = "rabbitmq")]
                 (
                     ReplicateDownstreamCommand::Rabbitmq(a),
-                    DownstreamSinkKind::Rabbitmq { amqp_url, exchange, routing_key, .. },
+                    DownstreamSinkKind::Rabbitmq {
+                        amqp_url,
+                        exchange,
+                        routing_key,
+                        ..
+                    },
                 ) => {
                     if let Some(u) = amqp_url {
                         a.amqp_url = u.clone();
@@ -564,7 +576,12 @@ pub async fn run(
                 }
                 (
                     ReplicateDownstreamCommand::Postgres(a),
-                    DownstreamSinkKind::Postgres { target_url, schema_map, batch_size, .. },
+                    DownstreamSinkKind::Postgres {
+                        target_url,
+                        schema_map,
+                        batch_size,
+                        ..
+                    },
                 ) => {
                     merge_opt(&mut a.target_url, &Some(target_url.clone()));
                     if a.schema_map.is_empty() {

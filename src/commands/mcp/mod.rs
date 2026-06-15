@@ -1,10 +1,24 @@
+use std::sync::Arc;
+
 use anyhow::Result;
+use axum::{
+    extract::{Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware,
+    response::Response,
+    routing::get,
+    Router,
+};
 use clap::Args;
+use jsonwebtoken::{decode_header, jwk::JwkSet, DecodingKey, Validation};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content},
     schemars, tool, tool_router,
     transport::stdio,
+    transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    },
     ErrorData as McpError, ServiceExt,
 };
 use serde::Deserialize;
@@ -26,6 +40,60 @@ pub struct McpArgs {
     /// Port to bind (SSE transport only)
     #[arg(long, default_value_t = 3100)]
     pub port: u16,
+
+    /// Bearer token for authorization (SSE transport only)
+    #[arg(long)]
+    pub token: Option<String>,
+
+    /// OIDC issuer URL for JWT validation via JWKS (SSE transport only).
+    /// Example: https://keycloak.example.com/realms/myrealm
+    #[arg(long)]
+    pub oauth_issuer: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OidcConfig {
+    jwks_uri: String,
+    issuer: String,
+}
+
+struct OAuthValidator {
+    jwks: JwkSet,
+    issuer: String,
+}
+
+impl OAuthValidator {
+    async fn discover(issuer: &str) -> Result<Self> {
+        let issuer = issuer.trim_end_matches('/').to_string();
+        let config_url = format!("{}/.well-known/openid-configuration", issuer);
+        let oidc: OidcConfig = reqwest::get(&config_url).await?.json().await?;
+        if oidc.issuer.trim_end_matches('/') != issuer {
+            anyhow::bail!(
+                "OIDC issuer mismatch: provider reports '{}', expected '{}'",
+                oidc.issuer,
+                issuer
+            );
+        }
+        let jwks_json = reqwest::get(&oidc.jwks_uri).await?.text().await?;
+        let jwks: JwkSet = serde_json::from_str(&jwks_json)?;
+        eprintln!("Loaded {} JWK(s) from {}", jwks.keys.len(), oidc.jwks_uri);
+        Ok(Self { jwks, issuer })
+    }
+
+    fn validate(&self, token: &str) -> Result<(), StatusCode> {
+        let header = decode_header(token).map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let kid = header.kid.as_deref();
+        let jwk = kid
+            .and_then(|k| self.jwks.find(k))
+            .or_else(|| self.jwks.keys.first())
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let key = DecodingKey::from_jwk(jwk).map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let mut validation = Validation::new(header.alg);
+        validation.set_issuer(&[&self.issuer]);
+        jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -255,16 +323,91 @@ impl PgxMcpHandler {
     }
 }
 
-pub async fn run(url: String, args: McpArgs, use_tls: bool) -> Result<()> {
-    let handler = PgxMcpHandler { url, tls: use_tls };
+async fn static_token_middleware(
+    State(expected_token): State<String>,
+    headers: HeaderMap,
+    request: Request,
+    next: middleware::Next,
+) -> Result<Response, StatusCode> {
+    match headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        Some(token) if token == expected_token => Ok(next.run(request).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
 
+async fn oauth_middleware(
+    State(validator): State<Arc<OAuthValidator>>,
+    headers: HeaderMap,
+    request: Request,
+    next: middleware::Next,
+) -> Result<Response, StatusCode> {
+    let token = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    validator.validate(token)?;
+    Ok(next.run(request).await)
+}
+
+pub async fn run(url: String, args: McpArgs, use_tls: bool) -> Result<()> {
     match args.transport.as_str() {
         "stdio" => {
+            let handler = PgxMcpHandler { url, tls: use_tls };
             let service = handler.serve(stdio()).await?;
             eprintln!("pgx MCP server ready (stdio transport)");
             service.waiting().await?;
         }
-        other => anyhow::bail!("Unsupported transport: {other}. Supported: stdio"),
+        "sse" => {
+            let addr = format!("{}:{}", args.host, args.port);
+
+            let mcp_service = StreamableHttpService::new(
+                move || {
+                    Ok(PgxMcpHandler {
+                        url: url.clone(),
+                        tls: use_tls,
+                    })
+                },
+                LocalSessionManager::default().into(),
+                StreamableHttpServerConfig::default(),
+            );
+
+            let mut app = Router::new().route("/health", get(|| async { "OK" }));
+
+            // Auth: --oauth-issuer > --token > no auth
+            if let Some(issuer) = args.oauth_issuer {
+                let validator = Arc::new(OAuthValidator::discover(&issuer).await?);
+                eprintln!("OIDC issuer: {}", issuer);
+                let protected = Router::new()
+                    .nest_service("/mcp", mcp_service)
+                    .layer(middleware::from_fn_with_state(validator, oauth_middleware));
+                app = app.merge(protected);
+            } else if let Some(bearer_token) = args.token {
+                let protected = Router::new().nest_service("/mcp", mcp_service).layer(
+                    middleware::from_fn_with_state(bearer_token, static_token_middleware),
+                );
+                app = app.merge(protected);
+            } else {
+                app = app.nest_service("/mcp", mcp_service);
+            }
+
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            eprintln!(
+                "pgx MCP server ready (SSE transport, listening on {})",
+                addr
+            );
+
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    tokio::signal::ctrl_c().await.ok();
+                })
+                .await?;
+        }
+        other => anyhow::bail!("Unsupported transport: {other}. Supported: stdio, sse"),
     }
 
     Ok(())

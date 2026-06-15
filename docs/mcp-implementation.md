@@ -27,9 +27,27 @@ Add MCP (Model Context Protocol) server support to pgx, allowing LLMs (Claude, e
 ### 4. Verify compilation
 - `cargo build --features mcp`
 
-## Future Enhancements (not in scope v1)
-- SSE/Streamable HTTP transport for remote access
-- OAuth2 authorization for remote transport
+### 5. Add Streamable HTTP transport (SSE) + optional Bearer token auth
+- Add `transport-streamable-http-server` feature to `rmcp` dependency
+- Add `axum` HTTP framework (optional, behind `mcp` feature)
+- Create `StreamableHttpService` from handler factory via `|| Ok(handler.clone())`
+- Mount at `/mcp` using `axum::Router::nest_service`
+- Add `/health` endpoint
+- Optional `--token` CLI arg enables Bearer token auth middleware on `/mcp`
+- Verify: `cargo build --features mcp && cargo run --features mcp -- mcp --transport sse`
+
+### 6. Add OIDC/JWKS token validation
+- Add `jsonwebtoken` crate + enable `reqwest` under `mcp` feature
+- Add `--oauth-issuer` CLI arg for OIDC provider URL (e.g. Keycloak)
+- On startup: auto-discover `jwks_uri` from `/.well-known/openid-configuration`
+- Fetch and cache JWKS keys; per-request: validate JWT signature, `exp`, `iss`
+- Falls back to first JWK key if `kid` absent in JWT header
+- Auth precedence: `--oauth-issuer` > `--token` > none
+- Verify: `cargo build --features mcp`
+
+## Future Enhancements (not in scope v2)
+- Full OAuth2 authorization server (token endpoint, refresh tokens, client registration)
+- JWKS key rotation (re-fetch on validation failure)
 - Connection pooling (deadpool-postgres)
 - More tools: `export_data`, `explain_query`, `pg_dump`-like
 - MCP resources (schema definitions, table data)

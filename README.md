@@ -632,9 +632,24 @@ Add to `claude_desktop_config.json`:
 
 ### Transports
 
-| Transport | Use case        | Auth     |
-| --------- | --------------- | -------- |
-| `stdio`   | Local AI clients | None     |
+| Transport | Use case        | Auth                                             |
+| --------- | --------------- | ------------------------------------------------ |
+| `stdio`   | Local AI clients | None                                             |
+| `sse`     | Remote clients   | Static token (`--token`) or OIDC JWKS (`--oauth-issuer`) |
+
+For the SSE transport, start the server on a TCP port:
+
+```bash
+# Without auth
+pgx -U postgres://user:pass@localhost:5432/mydb mcp --transport sse --host 0.0.0.0 --port 3100
+
+# With static Bearer token auth
+pgx -U postgres://user:pass@localhost:5432/mydb mcp --transport sse --host 0.0.0.0 --port 3100 --token my-secret
+
+# With OIDC/JWKS validation (e.g. Keycloak)
+pgx -U postgres://user:pass@localhost:5432/mydb mcp --transport sse --host 0.0.0.0 --port 3100 \
+  --oauth-issuer https://keycloak.example.com/realms/myrealm
+```
 
 ---
 

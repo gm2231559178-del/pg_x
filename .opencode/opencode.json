@@ -9,6 +9,20 @@
         "DATABASE_URL": "postgres://postgres:postgres@localhost:5432/postgres"
       },
       "timeout": 10000
+    },
+    "pgx-remote": {
+      "type": "remote",
+      "url": "http://127.0.0.1:3100/mcp",
+      "enabled": false,
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    },
+    "pgx-oidc": {
+      "type": "remote",
+      "url": "http://127.0.0.1:3100/mcp",
+      "enabled": false,
+      "oauth": {}
     }
   }
 }

@@ -7,6 +7,8 @@ mod utils;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+#[cfg(feature = "mcp")]
+use commands::mcp;
 use commands::{consume, doctor, export, info, listen, profiles, psql, query, replicate};
 use utils::config::Config;
 
@@ -79,6 +81,10 @@ enum Commands {
 
     /// Consume messages from a broker, compose GraphQL, and sink downstream
     Consume(commands::consume::ConsumeArgs),
+
+    /// Start an MCP (Model Context Protocol) server
+    #[cfg(feature = "mcp")]
+    Mcp(mcp::McpArgs),
 }
 
 #[tokio::main]
@@ -97,11 +103,13 @@ async fn main() -> Result<()> {
             .with_env_filter(env_filter)
             .with_current_span(false)
             .with_span_list(false)
+            .with_writer(std::io::stderr)
             .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_target(false)
+            .with_writer(std::io::stderr)
             .init();
     }
 
@@ -116,6 +124,11 @@ async fn main() -> Result<()> {
             return doctor::run(d, cli.url.clone(), cli.connection.clone()).await
         }
         Commands::Profiles(p) => return profiles::run(p),
+        #[cfg(feature = "mcp")]
+        Commands::Mcp(m) => {
+            let (url, _conn_name) = cfg.resolve_from(cli.url, cli.connection)?;
+            return mcp::run(url, m.clone(), cli.tls).await;
+        }
         _ => {}
     }
 

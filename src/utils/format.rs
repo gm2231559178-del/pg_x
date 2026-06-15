@@ -161,7 +161,7 @@ pub fn pg_cell_to_json(row: &Row, idx: usize) -> Value {
 }
 
 /// Try to extract a human-readable string for any supported Postgres column type.
-fn pg_cell_to_string(row: &Row, idx: usize) -> String {
+pub fn pg_cell_to_string(row: &Row, idx: usize) -> String {
     let col_type = row.columns()[idx].type_().name();
 
     // Sentinel used to distinguish SQL NULL from the literal string "NULL".

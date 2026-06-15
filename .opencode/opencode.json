@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "pgx": {
+      "type": "local",
+      "command": ["./target/release/pgx", "mcp", "--transport", "stdio"],
+      "enabled": true,
+      "environment": {
+        "DATABASE_URL": "postgres://postgres:postgres@localhost:5432/postgres"
+      },
+      "timeout": 10000
+    }
+  }
+}

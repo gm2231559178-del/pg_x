@@ -8,3 +8,6 @@ pub mod profiles;
 pub mod psql;
 pub mod query;
 pub mod replicate;
+
+#[cfg(feature = "mcp")]
+pub mod mcp;

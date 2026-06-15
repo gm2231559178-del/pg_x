@@ -12,6 +12,7 @@ A feature-rich PostgreSQL CLI tool — beyond psql.
 | `listen`    | Subscribe to NOTIFY channels and forward to downstream sinks      |
 | `replicate` | Stream WAL changes via logical replication (INSERT/UPDATE/DELETE) |
 | `graphql`   | Validate and run named GraphQL queries with batched SQL resolvers |
+| `mcp`       | MCP server — expose pgx as tools for AI assistants (Claude, etc.) |
 
 ---
 
@@ -587,14 +588,80 @@ pgx -U $DATABASE_URL info --version --databases --tables
 
 ---
 
+---
+
+## mcp — Model Context Protocol Server
+
+Run pgx as an MCP server, exposing PostgreSQL operations as tools that AI
+assistants (Claude Desktop, Claude Code, etc.) can call.
+
+> Requires building with `--features mcp`.
+
+```bash
+# Build
+cargo build --release --features mcp
+
+# Start server (stdio transport — for Claude Desktop)
+pgx -U postgres://user:pass@localhost:5432/mydb mcp --transport stdio
+```
+
+### Claude Desktop config
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "pgx": {
+      "command": "pgx",
+      "args": ["mcp", "--transport", "stdio", "--url", "postgres://user:pass@localhost:5432/mydb"]
+    }
+  }
+}
+```
+
+### Available tools
+
+| Tool             | Description                                    | Parameters                         |
+| ---------------- | ---------------------------------------------- | ---------------------------------- |
+| `query`          | Execute a SQL query and return formatted rows   | `sql` (required)                   |
+| `list_tables`    | List database tables, optionally by schema      | `schema` (optional)                |
+| `describe_table` | Show column info for a table                    | `table` (required), `schema` (opt) |
+| `db_info`        | Show PostgreSQL version and current database    | —                                  |
+| `list_profiles`  | List named connection profiles from config      | —                                  |
+
+### Transports
+
+| Transport | Use case        | Auth                                             |
+| --------- | --------------- | ------------------------------------------------ |
+| `stdio`   | Local AI clients | None                                             |
+| `sse`     | Remote clients   | Static token (`--token`) or OIDC JWKS (`--oauth-issuer`) |
+
+For the SSE transport, start the server on a TCP port:
+
+```bash
+# Without auth
+pgx -U postgres://user:pass@localhost:5432/mydb mcp --transport sse --host 0.0.0.0 --port 3100
+
+# With static Bearer token auth
+pgx -U postgres://user:pass@localhost:5432/mydb mcp --transport sse --host 0.0.0.0 --port 3100 --token my-secret
+
+# With OIDC/JWKS validation (e.g. Keycloak)
+pgx -U postgres://user:pass@localhost:5432/mydb mcp --transport sse --host 0.0.0.0 --port 3100 \
+  --oauth-issuer https://keycloak.example.com/realms/myrealm
+```
+
+---
+
 ## Architecture
 
 ```
 src/
 ├── main.rs                        # CLI entry-point, command dispatch
 ├── commands/
-│   ├── replicate.rs               # `replicate` command + all downstream sinks
+│   ├── replicate/                  # `replicate` command + all downstream sinks
 │   ├── listen.rs                  # `listen` command
+│   ├── mcp/                       # `mcp` command (requires --features mcp)
 │   ├── export.rs
 │   ├── query.rs
 │   └── info.rs
@@ -657,3 +724,4 @@ stdout / shell / webhook / rabbitmq / kafka / parquet
 | `kv`       | ✅      | Redis / Memcached key-value store sink               |
 | `parquet`  | ✅      | Parquet file output via `arrow` + `parquet`           |
 | `iceberg`  | ❌      | Apache Iceberg table output (export + replicate)      |
+| `mcp`      | ❌      | MCP (Model Context Protocol) server for AI assistants |

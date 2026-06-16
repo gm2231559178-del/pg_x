@@ -11,15 +11,24 @@ pub type TlsConnector = tokio_postgres_rustls::MakeRustlsConnect;
 #[cfg(not(feature = "tls"))]
 pub type TlsConnector = tokio_postgres::NoTls;
 
+/// Build a root certificate store populated with Mozilla's root CA certificates.
+#[cfg(feature = "tls")]
+pub fn build_root_store() -> rustls::RootCertStore {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject,
+            ta.spki,
+            ta.name_constraints,
+        )
+    }));
+    root_store
+}
+
 /// Build a TLS connector.
 ///
-/// When the `tls` feature is enabled:
-/// - `use_tls = true` — returns a rustls connector (mandatory TLS).
-/// - `use_tls = false` — returns a rustls connector that sends SSLRequest but
-///   falls back to plaintext if the server rejects it (opportunistic TLS).
-///   An empty root store is used since we only need server-side certificate
-///   validation when the caller explicitly requests it, which this tool
-///   doesn't currently support beyond the basic handshake.
+/// When the `tls` feature is enabled, the root store is populated with
+/// Mozilla's root CA certificates (via `webpki-roots`).
 ///
 /// When the `tls` feature is disabled:
 /// - `use_tls = false` — returns `NoTls`.
@@ -43,7 +52,7 @@ pub fn build_tls(use_tls: bool) -> anyhow::Result<TlsConnector> {
     {
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
-            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_root_certificates(build_root_store())
             .with_no_client_auth();
         Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
     }

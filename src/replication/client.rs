@@ -344,7 +344,7 @@ impl Worker {
 
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
-            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_root_certificates(crate::utils::tls::build_root_store())
             .with_no_client_auth();
 
         let connector = RustlsTlsConnector::from(Arc::new(config));

@@ -11,6 +11,7 @@ RUN cargo build --release --all-features  --target=x86_64-unknown-linux-musl
 
 FROM alpine AS runtime
 
+RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/pgx /usr/bin/
 

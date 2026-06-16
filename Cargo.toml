@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["full"] }
 # TLS for the control-plane connection (optional)
 tokio-postgres-rustls = { version = "0.10", optional = true }
 rustls = { version = "0.21", optional = true }
+webpki-roots = { version = "0.25", optional = true }
 
 # TLS for the replication stream (optional, shares `tls` feature)
 tokio-rustls = { version = "0.24", optional = true }
@@ -97,10 +98,11 @@ tracing = "0.1.44"
 async-memcached = "0.6"
 openssl-sys = { version = "0.9", features = ["vendored"] }
 
+
 [features]
 default = ["rabbitmq", "webhook", "excel", "elasticsearch", "kv", "parquet"]
 excel = ["rust_xlsxwriter"]
-tls = ["tokio-postgres-rustls", "rustls", "tokio-rustls"]
+tls = ["tokio-postgres-rustls", "rustls", "tokio-rustls", "webpki-roots"]
 rabbitmq = ["lapin"]
 kafka = ["rdkafka"]
 webhook = ["dep:reqwest"]

@@ -143,64 +143,63 @@ pub mod rabbitmq {
 
         async fn send(&self, event: &NotifyEvent) -> Result<()> {
             // Try to parse a ContractMessage; fall back to raw payload.
-            let (exchange, routing_key, amqp_headers, body) = if let Some(contract) =
-                ContractMessage::try_parse(&event.payload)
-            {
-                let r = &contract.meta.routing;
+            let (exchange, routing_key, amqp_headers, body) =
+                if let Some(contract) = ContractMessage::try_parse(&event.payload) {
+                    let r = &contract.meta.routing;
 
-                let exchange = r
-                    .rabbitmq_exchange
-                    .clone()
-                    .unwrap_or_else(|| self.default_exchange.clone());
+                    let exchange = r
+                        .rabbitmq_exchange
+                        .clone()
+                        .unwrap_or_else(|| self.default_exchange.clone());
 
-                let routing_key = r
-                    .rabbitmq_routing_key
-                    .clone()
-                    .unwrap_or_else(|| self.default_routing_key.clone());
+                    let routing_key = r
+                        .rabbitmq_routing_key
+                        .clone()
+                        .unwrap_or_else(|| self.default_routing_key.clone());
 
-                // Build AMQP FieldTable from the contract headers.
+                    // Build AMQP FieldTable from the contract headers.
 
-                let mut fields: BTreeMap<ShortString, AMQPValue> = BTreeMap::new();
+                    let mut fields: BTreeMap<ShortString, AMQPValue> = BTreeMap::new();
 
-                for (k, v) in &r.rabbitmq_headers {
+                    for (k, v) in &r.rabbitmq_headers {
+                        fields.insert(
+                            ShortString::from(k.clone()),
+                            AMQPValue::LongString(v.clone().into()),
+                        );
+                    }
+
+                    // Inject envelope metadata
+                    if let Some(et) = &contract.meta.event_type {
+                        fields.insert(
+                            ShortString::from("x-event-type"),
+                            AMQPValue::LongString(et.clone().into()),
+                        );
+                    }
+
                     fields.insert(
-                        ShortString::from(k.clone()),
-                        AMQPValue::LongString(v.clone().into()),
+                        ShortString::from("x-pg-channel"),
+                        AMQPValue::LongString(event.channel.clone().into()),
                     );
-                }
 
-                // Inject envelope metadata
-                if let Some(et) = &contract.meta.event_type {
                     fields.insert(
-                        ShortString::from("x-event-type"),
-                        AMQPValue::LongString(et.clone().into()),
+                        ShortString::from("x-schema-version"),
+                        AMQPValue::LongString(contract.meta.schema_version.clone().into()),
                     );
-                }
 
-                fields.insert(
-                    ShortString::from("x-pg-channel"),
-                    AMQPValue::LongString(event.channel.clone().into()),
-                );
+                    let body = event.payload.as_bytes().to_vec();
 
-                fields.insert(
-                    ShortString::from("x-schema-version"),
-                    AMQPValue::LongString(contract.meta.schema_version.clone().into()),
-                );
-
-                let body = serde_json::to_vec(&contract.data).context("Serialise contract data")?;
-
-                (exchange, routing_key, FieldTable::from(fields), body)
-            } else {
-                // Plain payload — envelope it so consumers get consistent shape.
-                let msg = SimpleMessage::from(event);
-                let body = serde_json::to_vec(&msg).context("Serialise SimpleMessage")?;
-                (
-                    self.default_exchange.clone(),
-                    self.default_routing_key.clone(),
-                    FieldTable::default(),
-                    body,
-                )
-            };
+                    (exchange, routing_key, FieldTable::from(fields), body)
+                } else {
+                    // Plain payload — envelope it so consumers get consistent shape.
+                    let msg = SimpleMessage::from(event);
+                    let body = serde_json::to_vec(&msg).context("Serialise SimpleMessage")?;
+                    (
+                        self.default_exchange.clone(),
+                        self.default_routing_key.clone(),
+                        FieldTable::default(),
+                        body,
+                    )
+                };
 
             self.channel
                 .basic_publish(

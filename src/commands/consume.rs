@@ -11,6 +11,7 @@ use crate::consumer::r#trait::{BrokerMessage, ConsumeSink, Consumer};
 use crate::downstream::contract::ContractMessage;
 use crate::graphql::{executor, pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
 use crate::utils::config::{Connection, ConsumeSinkKind, ConsumeSourceKind, ResolverConfig};
+use crate::utils::signal::shutdown_signal;
 
 // ── CLI args ─────────────────────────────────────────────────────────────────
 
@@ -442,12 +443,27 @@ pub async fn run(
         args.query_mode, args.on_error
     );
 
+    tokio::pin!(let shutdown = shutdown_signal(););
+
     loop {
-        let msg: BrokerMessage = match consumer.recv().await {
-            Some(m) => m,
-            None => {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
+        let msg: BrokerMessage = loop {
+            tokio::select! {
+                biased;
+
+                _ = &mut shutdown => {
+                    info!("Signal received, shutting down cleanly");
+                    return Ok(());
+                }
+
+                maybe_msg = consumer.recv() => {
+                    match maybe_msg {
+                        Some(m) => break m,
+                        None => {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                }
             }
         };
 

@@ -548,8 +548,8 @@ mod tests {
             ChannelFullBehavior::DropOldest,
             ChannelFullBehavior::Grow,
         ] {
-            let toml_str = toml::to_string(behavior).expect("serialize");
-            let back: ChannelFullBehavior = toml::from_str(&toml_str).expect("deserialize");
+            let json_str = serde_json::to_string(behavior).expect("serialize");
+            let back: ChannelFullBehavior = serde_json::from_str(&json_str).expect("deserialize");
             assert_eq!(*behavior, back);
         }
     }

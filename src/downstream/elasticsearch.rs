@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use super::bulk::{spawn_bulk_flusher, BulkBuffer};
 use super::contract::NotifyEvent;
 use super::sink::Downstream;
 use crate::graphql::{executor, pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
@@ -13,14 +15,18 @@ use crate::utils::config::ResolverConfig;
 /// Receives NOTIFY events with a ContractMessage containing query name and variables,
 /// executes the named GraphQL query, and pushes the assembled document to Elasticsearch.
 pub struct ElasticsearchDownstream {
+    #[allow(dead_code)]
     es_url: String,
     index: String,
     id_field: Option<String>,
+    #[allow(dead_code)]
     client: reqwest::Client,
     pool: QueryConn,
     queries: QueryLoader,
     resolvers: HashMap<String, ResolverConfig>,
     max_depth: u32,
+    bulk_buffer: Arc<BulkBuffer>,
+    _flush_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl ElasticsearchDownstream {
@@ -47,8 +53,13 @@ impl ElasticsearchDownstream {
         };
         let queries = QueryLoader::load(&schema)?;
 
+        let es_url = es_url.trim_end_matches('/').to_string();
+        let bulk_buffer = BulkBuffer::new(client.clone(), es_url.clone(), 500);
+        let (flush_tx, flush_rx) = tokio::sync::watch::channel(false);
+        spawn_bulk_flusher(Arc::clone(&bulk_buffer), 5, flush_rx);
+
         Ok(Self {
-            es_url: es_url.trim_end_matches('/').to_string(),
+            es_url,
             index: index.to_string(),
             id_field,
             max_depth,
@@ -56,6 +67,8 @@ impl ElasticsearchDownstream {
             pool,
             queries,
             resolvers,
+            bulk_buffer,
+            _flush_shutdown: flush_tx,
         })
     }
 }
@@ -111,31 +124,9 @@ impl Downstream for ElasticsearchDownstream {
             _ => None,
         });
 
-        let url = if let Some(ref id) = doc_id {
-            format!("{}/{}/_doc/{}", self.es_url, self.index, id)
-        } else {
-            format!("{}/{}/_doc", self.es_url, self.index)
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&result)
-            .send()
-            .await
-            .with_context(|| format!("ES POST failed to {}", url))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "ES document index failed (HTTP {}) for query '{}' at {}: {}",
-                status,
-                query_name,
-                url,
-                text,
-            );
-        }
+        self.bulk_buffer
+            .push(&self.index, doc_id.as_deref(), &result)
+            .await?;
 
         Ok(())
     }

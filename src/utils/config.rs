@@ -18,6 +18,43 @@ pub struct Config {
     pub resolvers: HashMap<String, ResolverConfig>,
 }
 
+/// Behavior when the notification channel is full.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelFullBehavior {
+    /// Block the drainer until the downstream consumes a notification.
+    Block,
+    /// Drop the oldest notification in the channel (current default).
+    #[default]
+    DropOldest,
+    /// Grow the channel capacity (unbounded — use with caution).
+    Grow,
+}
+
+impl std::fmt::Display for ChannelFullBehavior {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Block => write!(f, "block"),
+            Self::DropOldest => write!(f, "drop_oldest"),
+            Self::Grow => write!(f, "grow"),
+        }
+    }
+}
+
+impl std::str::FromStr for ChannelFullBehavior {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "block" => Ok(Self::Block),
+            "drop_oldest" => Ok(Self::DropOldest),
+            "grow" => Ok(Self::Grow),
+            other => Err(format!(
+                "unknown channel_full_behavior '{other}'; expected block|drop_oldest|grow"
+            )),
+        }
+    }
+}
+
 /// Configuration for a single resolver — maps a GraphQL field to SQL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolverConfig {
@@ -63,6 +100,10 @@ pub struct ListenSinkConfig {
 
     /// Maximum reconnect delay cap in milliseconds.
     pub reconnect_max_ms: Option<u64>,
+
+    /// Behavior when the internal notification channel is full.
+    /// Options: "block", "drop_oldest" (default), "grow".
+    pub channel_full_behavior: Option<ChannelFullBehavior>,
 
     /// Downstream sink kind and its options.
     pub sink: Option<DownstreamSinkKind>,
@@ -472,5 +513,70 @@ mod tests {
             back,
             DownstreamSinkKind::Stdout { pretty: Some(true) }
         ));
+    }
+
+    // ── ChannelFullBehavior tests ───────────────────────────────────────────
+
+    #[test]
+    fn channel_full_behavior_from_str() {
+        assert_eq!(
+            "block".parse::<ChannelFullBehavior>().unwrap(),
+            ChannelFullBehavior::Block
+        );
+        assert_eq!(
+            "drop_oldest".parse::<ChannelFullBehavior>().unwrap(),
+            ChannelFullBehavior::DropOldest
+        );
+        assert_eq!(
+            "grow".parse::<ChannelFullBehavior>().unwrap(),
+            ChannelFullBehavior::Grow
+        );
+        assert!("invalid".parse::<ChannelFullBehavior>().is_err());
+    }
+
+    #[test]
+    fn channel_full_behavior_display() {
+        assert_eq!(ChannelFullBehavior::Block.to_string(), "block");
+        assert_eq!(ChannelFullBehavior::DropOldest.to_string(), "drop_oldest");
+        assert_eq!(ChannelFullBehavior::Grow.to_string(), "grow");
+    }
+
+    #[test]
+    fn channel_full_behavior_serde_roundtrip() {
+        for behavior in &[
+            ChannelFullBehavior::Block,
+            ChannelFullBehavior::DropOldest,
+            ChannelFullBehavior::Grow,
+        ] {
+            let toml_str = toml::to_string(behavior).expect("serialize");
+            let back: ChannelFullBehavior = toml::from_str(&toml_str).expect("deserialize");
+            assert_eq!(*behavior, back);
+        }
+    }
+
+    #[test]
+    fn channel_full_behavior_default() {
+        assert_eq!(
+            ChannelFullBehavior::default(),
+            ChannelFullBehavior::DropOldest
+        );
+    }
+
+    // ── ListenSinkConfig with channel_full_behavior ─────────────────────────
+
+    #[test]
+    fn listen_sink_config_with_channel_behavior() {
+        let toml_str = r#"
+        channels = ["orders"]
+        channel_full_behavior = "block"
+        [sink]
+        type = "shell"
+        command = "echo test"
+        "#;
+        let config: ListenSinkConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(
+            config.channel_full_behavior,
+            Some(ChannelFullBehavior::Block)
+        );
     }
 }

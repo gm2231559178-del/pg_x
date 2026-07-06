@@ -6,7 +6,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::downstream::{contract::NotifyEvent, sink::Downstream};
-use crate::utils::config::{merge_opt, merge_vec, Connection, DownstreamSinkKind, ResolverConfig};
+use crate::utils::config::{
+    merge_opt, merge_vec, ChannelFullBehavior, Connection, DownstreamSinkKind, ResolverConfig,
+};
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 use crate::utils::tls;
 
@@ -29,6 +31,11 @@ pub struct ListenArgs {
     /// Maximum reconnect delay cap in milliseconds (default 60000).
     #[arg(long, env = "PGX_RECONNECT_MAX_MS")]
     pub reconnect_max_ms: Option<u64>,
+
+    /// Behavior when the internal notification channel is full.
+    /// Options: block (waits for space), drop_oldest (drops oldest), grow (unbounded).
+    #[arg(long, default_value = "drop_oldest")]
+    pub channel_full_behavior: ChannelFullBehavior,
 
     #[command(subcommand)]
     pub downstream: DownstreamCommand,
@@ -164,6 +171,16 @@ pub async fn run(
         );
         merge_opt(&mut args.reconnect_base_ms, &cfg.reconnect_base_ms);
         merge_opt(&mut args.reconnect_max_ms, &cfg.reconnect_max_ms);
+
+        // Merge channel_full_behavior from config (CLI default is "drop_oldest",
+        // but config file may override it).
+        if let Some(behavior) = &cfg.channel_full_behavior {
+            // CLI arg has a default, so it's always Some. Only override if the
+            // config value differs from the implicit default.
+            if args.channel_full_behavior == ChannelFullBehavior::default() {
+                args.channel_full_behavior = behavior.clone();
+            }
+        }
 
         // Merge downstream sink defaults from config into CLI subcommand args.
         if let Some(sink_cfg) = &cfg.sink {
@@ -332,8 +349,13 @@ pub async fn run(
         // The original code did `let tx = tx.clone()` inside spawn while keeping
         // the original tx alive in this scope. That left a live sender dangling
         // so rx.recv() would hang forever after the Drainer exited.
-        // Using a bounded channel to prevent unbounded memory growth.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio_postgres::Notification>(1024);
+        let behavior = args.channel_full_behavior.clone();
+        let channel_capacity = match behavior {
+            ChannelFullBehavior::Grow => 100_000,
+            _ => 1024,
+        };
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<tokio_postgres::Notification>(channel_capacity);
 
         let drain_handle = tokio::spawn(async move {
             use std::future::Future;
@@ -343,6 +365,7 @@ pub async fn run(
             struct Drainer<S> {
                 conn: tokio_postgres::Connection<tokio_postgres::Socket, S>,
                 tx: tokio::sync::mpsc::Sender<tokio_postgres::Notification>,
+                behavior: ChannelFullBehavior,
             }
 
             impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Future for Drainer<S> {
@@ -354,12 +377,25 @@ pub async fn run(
                             Poll::Ready(None) => return Poll::Ready(()),
                             Poll::Ready(Some(Ok(tokio_postgres::AsyncMessage::Notification(
                                 n,
-                            )))) => {
-                                if self.tx.try_send(n).is_err() {
-                                    // Channel full — downstream is slow, drop oldest to
-                                    // apply backpressure rather than blocking.
+                            )))) => match self.behavior {
+                                ChannelFullBehavior::DropOldest => {
+                                    if self.tx.try_send(n).is_err() {
+                                        // Channel full — downstream is slow, drop
+                                        // oldest to apply backpressure.
+                                    }
                                 }
-                            }
+                                ChannelFullBehavior::Block => {
+                                    if self.tx.try_send(n).is_err() {
+                                        // Channel full — wait for space by returning
+                                        // Pending. The waker will be notified when
+                                        // the downstream consumes.
+                                        return Poll::Pending;
+                                    }
+                                }
+                                ChannelFullBehavior::Grow => {
+                                    let _ = self.tx.try_send(n);
+                                }
+                            },
                             Poll::Ready(Some(Ok(_))) => {}
                             Poll::Ready(Some(Err(e))) => {
                                 error!(error = %e, "PostgreSQL connection error");
@@ -374,6 +410,7 @@ pub async fn run(
             Drainer {
                 conn: connection,
                 tx,
+                behavior,
             }
             .await
         });

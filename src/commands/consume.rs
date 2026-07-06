@@ -134,10 +134,14 @@ impl ConsumeSink for StdoutConsumeSink {
 
 #[cfg(feature = "elasticsearch")]
 struct ElasticsearchConsumeSink {
+    #[allow(dead_code)]
     es_url: String,
     index: String,
     id_field: Option<String>,
+    #[allow(dead_code)]
     client: reqwest::Client,
+    bulk_buffer: Arc<crate::downstream::bulk::BulkBuffer>,
+    _flush_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[cfg(feature = "elasticsearch")]
@@ -153,30 +157,9 @@ impl ConsumeSink for ElasticsearchConsumeSink {
             _ => None,
         });
 
-        let url = if let Some(ref id) = doc_id {
-            format!("{}/{}/_doc/{}", self.es_url, self.index, id)
-        } else {
-            format!("{}/{}/_doc", self.es_url, self.index)
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .json(doc)
-            .send()
-            .await
-            .with_context(|| format!("ES POST failed to {}", url))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "ES document index failed (HTTP {}) at {}: {}",
-                status,
-                url,
-                text,
-            );
-        }
+        self.bulk_buffer
+            .push(&self.index, doc_id.as_deref(), doc)
+            .await?;
 
         Ok(())
     }
@@ -238,11 +221,17 @@ async fn build_sink(args: &ConsumeArgs) -> Result<Arc<dyn ConsumeSink>> {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?;
+            let bulk_buffer =
+                crate::downstream::bulk::BulkBuffer::new(client.clone(), es_url.clone(), 500);
+            let (flush_tx, flush_rx) = tokio::sync::watch::channel(false);
+            crate::downstream::bulk::spawn_bulk_flusher(Arc::clone(&bulk_buffer), 5, flush_rx);
             Ok(Arc::new(ElasticsearchConsumeSink {
                 es_url,
                 index,
                 id_field: args.id_field.clone(),
                 client,
+                bulk_buffer,
+                _flush_shutdown: flush_tx,
             }))
         }
 

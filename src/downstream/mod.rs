@@ -1,3 +1,4 @@
+pub mod bulk;
 pub mod contract;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;

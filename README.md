@@ -362,6 +362,28 @@ downstream sink. Unlike `replicate`, this requires the application to call
 | `simple`   | Pass the raw NOTIFY payload as the message body                                    |
 | `contract` | Parse the payload as a structured `ContractMessage` and use embedded routing hints |
 
+### Configuration
+
+| Flag                       | Description                                                     | Default        |
+| -------------------------- | --------------------------------------------------------------- | -------------- |
+| `-C`, `--channel`          | NOTIFY channel(s) to subscribe to (repeatable)                  | —              |
+| `--channel-full-behavior`  | What to do when the channel buffer is full: `block`, `drop_oldest`, `grow` | `drop_oldest` |
+
+The same `channel_full_behavior` option can be set in the config file under
+`[connections.<name>.listen]`:
+
+```toml
+[connections.local.listen]
+channels = ["orders"]
+channel_full_behavior = "block"
+```
+
+| Behavior      | Description                                                              |
+| ------------- | ------------------------------------------------------------------------ |
+| `block`       | Block the NOTIFY listener until the downstream catches up. Backpressure propagates to PostgreSQL. |
+| `drop_oldest` | Drop the oldest undelivered message from the buffer. Never blocks.      |
+| `grow`        | Grow the channel buffer unboundedly. May cause OOM under sustained load. |
+
 ### Downstream: RabbitMQ
 
 ```bash
@@ -471,6 +493,29 @@ pgx -U $DATABASE_URL consume \
   --sink stdout
 ```
 
+### GraphQL Resolvers
+
+Resolvers map GraphQL fields to batched SQL queries. Define them in the config
+file under `[resolvers.<field_name>]`:
+
+```toml
+[resolvers.material]
+sql = "SELECT mat_no, name, description FROM materials WHERE mat_no = ANY($1)"
+param = "mat_no"
+batch_by = "mat_no"
+```
+
+| Option    | Description                                                   |
+| --------- | ------------------------------------------------------------- |
+| `sql`     | SQL query. Use `$1` for the batched parameter array.          |
+| `param`   | Column in the parent result to extract as the parameter.      |
+| `batch_by`| Column in the SQL result to key the child result. **Required for optimal performance.** |
+
+> **N+1 detection:** If a resolver is missing `batch_by`, a runtime warning is
+> emitted (`WARN pgx::graphql::executor: resolver <field> has no batch_by —
+> falling back to N+1 query pattern`). Always set `batch_by` to avoid
+> per-parent-row queries.
+
 ### Query modes
 
 | Mode       | Description                                                                     |
@@ -504,6 +549,10 @@ pgx -U $DATABASE_URL consume \
   --index materials \
   --id-field mat_no
 ```
+
+> **Performance:** Documents are buffered and indexed in bulk (500 docs or every
+> 5 seconds, whichever comes first). This avoids per-document HTTP overhead and
+> significantly improves throughput under load.
 
 #### webhook
 
@@ -679,6 +728,8 @@ src/
 ├── downstream/                    # listen command downstream sinks
 │   ├── sink.rs                    # Downstream trait
 │   ├── contract.rs                # NotifyEvent, ContractMessage
+│   ├── bulk.rs                    # BulkBuffer — doc-level batching for ES
+│   ├── elasticsearch.rs           # ES downstream (replicate)
 │   ├── rabbitmq.rs
 │   ├── kafka.rs
 │   ├── webhook.rs

@@ -19,6 +19,7 @@ description = "Local dev database"
 
 [connections.local.listen]
 channels = ["user_updates"]
+channel_full_behavior = "drop_oldest"
 max_reconnect_attempts = 5
 reconnect_base_ms = 2000
 reconnect_max_ms = 60000

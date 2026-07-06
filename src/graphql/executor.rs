@@ -43,6 +43,8 @@ async fn resolve_children(
     resolve_children_with_depth(parent_obj, child_fields, resolvers, pool, max_depth, 0).await
 }
 
+/// Resolve sibling child fields concurrently.
+/// Sibling fields have no data dependencies, so they can run in parallel.
 async fn resolve_children_with_depth(
     parent_obj: &mut Value,
     child_fields: &[FieldSelection],
@@ -58,72 +60,84 @@ async fn resolve_children_with_depth(
         );
     }
 
-    for field in child_fields {
-        let field_name = field
-            .field_name
-            .split('(')
-            .next()
-            .unwrap_or(&field.field_name);
+    // Phase 1: collect task parameters (immutable borrow of parent_obj)
+    let tasks: Vec<_> = child_fields
+        .iter()
+        .filter_map(|field| {
+            let field_name = field
+                .field_name
+                .split('(')
+                .next()
+                .unwrap_or(&field.field_name)
+                .to_string();
 
-        let resolver = match resolvers.get(field_name) {
-            Some(r) => r,
-            None => {
-                if field.is_leaf {
-                    continue;
+            let resolver = resolvers.get(&field_name)?.clone();
+
+            if field.is_leaf || field.children.is_empty() {
+                return None;
+            }
+
+            let param_name = resolver.param.as_deref().unwrap_or(&field_name).to_string();
+            let param_value = match parent_obj {
+                Value::Object(ref m) => m.get(&param_name).cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            let children = field.children.clone();
+            let is_to_many = resolver.batch_by.is_some();
+
+            // Warn on N+1: non-batched to-many resolver
+            if !is_to_many && depth > 0 {
+                tracing::warn!(
+                    field = %field_name,
+                    "to-many resolver lacks batch_by — this causes N+1 queries. Add batch_by to the resolver config for this field.",
+                );
+            }
+
+            Some(async move {
+                let param_str = value_to_param(&param_value);
+                let param_vec = vec![param_str];
+                let rows = pool
+                    .query_cached(&resolver.sql, &[&param_vec])
+                    .await
+                    .with_context(|| format!("Child resolver SQL failed for '{}'", field_name))?;
+
+                let mut resolved = Vec::new();
+                for row in &rows {
+                    let mut child_obj = row_to_json_value(row)?;
+                    if !children.is_empty() {
+                        Box::pin(resolve_children_with_depth(
+                            &mut child_obj,
+                            &children,
+                            resolvers,
+                            pool,
+                            max_depth,
+                            depth + 1,
+                        ))
+                        .await?;
+                    }
+                    resolved.push(child_obj);
                 }
-                tracing::warn!("No resolver for child field '{}'", field_name);
-                continue;
-            }
-        };
+                Ok::<_, anyhow::Error>((field_name, resolver, resolved))
+            })
+        })
+        .collect();
 
-        if field.is_leaf || field.children.is_empty() {
-            continue;
-        }
+    // Phase 2: run all sibling queries concurrently
+    let results = futures::future::join_all(tasks).await;
 
-        let param_name = resolver.param.as_deref().unwrap_or(field_name);
-        let param_value = match parent_obj {
-            Value::Object(ref m) => m.get(param_name).cloned().unwrap_or(Value::Null),
-            _ => Value::Null,
-        };
-
-        let client = pool.get().await?;
-        let param_str = value_to_param(&param_value);
-        // Single-string param — wrap in vec for ANY($1) compatibility
-        let param_vec = vec![param_str];
-        let rows = client
-            .query(&resolver.sql, &[&param_vec])
-            .await
-            .with_context(|| format!("Child resolver SQL failed for '{}'", field_name))?;
-
-        let mut children = Vec::new();
-        for row in &rows {
-            let mut child_obj = row_to_json_value(row)?;
-            if !field.children.is_empty() {
-                Box::pin(resolve_children_with_depth(
-                    &mut child_obj,
-                    &field.children,
-                    resolvers,
-                    pool,
-                    max_depth,
-                    depth + 1,
-                ))
-                .await?;
-            }
-            children.push(child_obj);
-        }
-
+    // Phase 3: apply results to parent_obj (mutable borrow)
+    for result in results {
+        let (field_name, resolver, children) = result?;
         if let Value::Object(ref mut m) = parent_obj {
-            m.insert(
-                field_name.to_string(),
-                if children.len() == 1 && !is_to_many(resolver) {
-                    let val = children.into_iter().next().ok_or_else(|| {
-                        anyhow::anyhow!("expected 1 child, got 0 for field '{}'", field_name)
-                    })?;
-                    val
-                } else {
-                    Value::Array(children)
-                },
-            );
+            let name = field_name;
+            let val = if children.len() == 1 && !is_to_many(&resolver) {
+                children.into_iter().next().ok_or_else(|| {
+                    anyhow::anyhow!("expected 1 child, got 0 for field '{}'", name)
+                })?
+            } else {
+                Value::Array(children)
+            };
+            m.insert(name, val);
         }
     }
 
@@ -200,10 +214,9 @@ async fn execute_batched(
             Value::Null
         };
 
-        let client = pool.get().await?;
         let param_str = value_to_param(&param_value);
-        let rows = client
-            .query(&resolver.sql, &[&param_str])
+        let rows = pool
+            .query_cached(&resolver.sql, &[&param_str])
             .await
             .with_context(|| format!("Resolver SQL failed for '{}'", field_name))?;
 
@@ -273,7 +286,8 @@ async fn resolve_children_batched(
         // If resolver has batch_by, use DataLoader
         if let Some(batch_by) = &resolver.batch_by {
             let param_name = resolver.param.as_deref().unwrap_or(field_name);
-            let mut loader = DataLoader::new(&resolver.sql, batch_by);
+            let mut loader =
+                DataLoader::new(&resolver.sql, batch_by).with_global_cache(pool.global_cache());
 
             // Collect keys from parent objects
             for obj in parent_objs.iter() {
@@ -315,36 +329,61 @@ async fn resolve_children_batched(
                 }
             }
         } else {
-            // No batching — use single-param resolution per parent
-            let param_name = resolver.param.as_deref().unwrap_or(field_name);
-            for obj in parent_objs.iter_mut() {
-                let param_value = obj.get(param_name).cloned().unwrap_or(Value::Null);
+            // No batching — run parent queries concurrently via join_all
+            let param_name = resolver.param.as_deref().unwrap_or(field_name).to_string();
+            let children = field.children.clone();
 
-                let client = pool.get().await?;
-                let param_str = value_to_param(&param_value);
-                let param_vec = vec![param_str];
-                let rows = client
-                    .query(&resolver.sql, &[&param_vec])
-                    .await
-                    .with_context(|| format!("Child resolver SQL failed for '{}'", field_name))?;
+            tracing::warn!(
+                field = %field_name,
+                parent_count = parent_objs.len(),
+                "to-many resolver lacks batch_by — N+1 queries executed. Add batch_by to the resolver config.",
+            );
 
-                let mut children = Vec::new();
-                for row in &rows {
-                    let mut child_obj = row_to_json_value(row)?;
-                    if !field.children.is_empty() {
-                        resolve_children_with_depth(
-                            &mut child_obj,
-                            &field.children,
-                            resolvers,
-                            pool,
-                            max_depth,
-                            0,
-                        )
-                        .await?;
+            let tasks: Vec<_> = parent_objs
+                .iter()
+                .map(|obj| {
+                    let param_value = match obj {
+                        Value::Object(ref m) => m.get(&param_name).cloned().unwrap_or(Value::Null),
+                        _ => Value::Null,
+                    };
+                    let children = children.clone();
+                    async move {
+                        let param_str = value_to_param(&param_value);
+                        let param_vec = vec![param_str];
+                        let rows = pool
+                            .query_cached(&resolver.sql, &[&param_vec])
+                            .await
+                            .with_context(|| {
+                                format!("Child resolver SQL failed for '{}'", field_name)
+                            })?;
+
+                        let mut resolved = Vec::new();
+                        for row in &rows {
+                            let mut child_obj = row_to_json_value(row)?;
+                            if !children.is_empty() {
+                                resolve_children_with_depth(
+                                    &mut child_obj,
+                                    &children,
+                                    resolvers,
+                                    pool,
+                                    max_depth,
+                                    0,
+                                )
+                                .await?;
+                            }
+                            resolved.push(child_obj);
+                        }
+                        Ok::<_, anyhow::Error>(resolved)
                     }
-                    children.push(child_obj);
-                }
+                })
+                .collect();
 
+            let all_children: Vec<Vec<Value>> = futures::future::join_all(tasks)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+            for (obj, children) in parent_objs.iter_mut().zip(all_children) {
                 if let Value::Object(ref mut m) = obj {
                     m.insert(field_name.to_string(), Value::Array(children));
                 }

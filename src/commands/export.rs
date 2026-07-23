@@ -119,7 +119,7 @@ pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
 
     for (i, block) in blocks.iter().enumerate() {
         if multi {
-            println!("{} {} «{}»", "▶ Query".cyan().bold(), i + 1, &block.sheet);
+            println!("{} {} «{}»", "▶ Query".cyan().bold(), i + 1, block.sheet);
         }
         println!("{} {}", "▶ SQL:".cyan().bold(), block.sql.trim().dimmed());
     }

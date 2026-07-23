@@ -62,6 +62,17 @@ pub struct ConsumeArgs {
     #[arg(long, value_enum, default_value_t = ConsumeErrorMode::Lenient)]
     pub on_error: ConsumeErrorMode,
 
+    // ── Reconnection ──
+    /// Max reconnect attempts (0 = infinite)
+    #[arg(long, default_value_t = 0)]
+    pub max_reconnect_attempts: u32,
+    /// Reconnect backoff base in milliseconds
+    #[arg(long, default_value_t = 1000)]
+    pub reconnect_base_ms: u64,
+    /// Reconnect backoff max in milliseconds
+    #[arg(long, default_value_t = 30000)]
+    pub reconnect_max_ms: u64,
+
     // ── Sink: Elasticsearch ──
     #[arg(long, env = "ES_URL")]
     pub es_url: Option<String>,
@@ -401,11 +412,7 @@ pub async fn run(
         anyhow::bail!("Simple query mode requires --query <name> or consume.query in config");
     }
 
-    // ── Build consumer ───────────────────────────────────────────────────────
-    let consumer: Arc<dyn Consumer> = build_consumer(&args).await?;
-    info!("Connected to {} consumer", consumer.name());
-
-    // ── Load schema and queries ──────────────────────────────────────────────
+    // ── Load schema and queries (once, outside reconnection loop) ────────────
     let schema_dir = resolve_schema_dir(args.schema_dir.as_deref())?;
     let schema = SchemaRegistry::load_from_dir(&schema_dir)?;
     let queries = QueryLoader::load(&schema)?;
@@ -415,18 +422,18 @@ pub async fn run(
         queries.queries.len()
     );
 
-    // ── Build GraphQL query pool ─────────────────────────────────────────────
+    // ── Build GraphQL query pool (once) ──────────────────────────────────────
     let pool = QueryConn::connect(&url, use_tls).await?;
     info!("Connected GraphQL query pool to PostgreSQL");
 
     // ── Resolve default query name (contract mode fallback) ──────────────────
     let default_query = args.query.clone().unwrap_or_else(|| "default".to_string());
 
-    // ── Build sink ───────────────────────────────────────────────────────────
+    // ── Build sink (once) ────────────────────────────────────────────────────
     let sink: Arc<dyn ConsumeSink> = build_sink(&args).await?;
     info!("Using {} sink", sink.name());
 
-    // ── Consume loop ─────────────────────────────────────────────────────────
+    // ── Consume loop with reconnection ───────────────────────────────────────
     info!(
         "Starting consume loop (mode={:?}, error={:?})",
         args.query_mode, args.on_error
@@ -434,44 +441,152 @@ pub async fn run(
 
     tokio::pin!(let shutdown = shutdown_signal(););
 
+    let mut consecutive_failures: u32 = 0;
+
+    let max_reconnect_attempts = args.max_reconnect_attempts;
+    let reconnect_base_ms = args.reconnect_base_ms;
+    let reconnect_max_ms = args.reconnect_max_ms;
+
     loop {
-        let msg: BrokerMessage = loop {
+        // ── Backoff (skipped on first attempt) ────────────────────────────────
+        if consecutive_failures > 0 {
+            let infinite = max_reconnect_attempts == 0;
+
+            if !infinite && consecutive_failures >= max_reconnect_attempts {
+                error!(
+                    consecutive_failures,
+                    max = max_reconnect_attempts,
+                    "Max reconnect attempts reached"
+                );
+                return Err(anyhow::anyhow!(
+                    "Max reconnect attempts ({}) reached",
+                    max_reconnect_attempts
+                ));
+            }
+
+            let delay = crate::utils::backoff::delay(
+                consecutive_failures,
+                reconnect_base_ms,
+                reconnect_max_ms,
+            );
+
+            warn!(
+                consecutive_failures,
+                delay_secs = delay.as_secs_f32(),
+                max_attempts = if infinite {
+                    "∞".to_string()
+                } else {
+                    max_reconnect_attempts.to_string()
+                },
+                "Reconnecting…"
+            );
+
             tokio::select! {
                 biased;
-
                 _ = &mut shutdown => {
-                    info!("Signal received, shutting down cleanly");
+                    info!("Signal received during backoff, shutting down cleanly");
                     return Ok(());
                 }
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
 
-                maybe_msg = consumer.recv() => {
-                    match maybe_msg {
-                        Some(m) => break m,
-                        None => {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            continue;
+        // ── Build consumer ───────────────────────────────────────────────────
+        let consumer: Arc<dyn Consumer> = match build_consumer(&args).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!(error = %e, "Failed to connect consumer");
+                consecutive_failures += 1;
+                continue;
+            }
+        };
+        info!("Connected to {} consumer", consumer.name());
+
+        // ── Inner consume loop ────────────────────────────────────────────────
+        let mut session_failed = false;
+
+        let processing_result: Result<()> = loop {
+            let maybe_msg: Option<BrokerMessage> = loop {
+                tokio::select! {
+                    biased;
+
+                    _ = &mut shutdown => {
+                        info!("Signal received, shutting down cleanly");
+                        return Ok(());
+                    }
+
+                    maybe_msg = consumer.recv() => {
+                        match maybe_msg {
+                            Some(m) => break Some(m),
+                            None => {
+                                // recv returned None — channel may be closed
+                                // (e.g. broker ack timeout triggered PRECONDITION_FAILED).
+                                if !consumer.is_connected() {
+                                    warn!("Consumer disconnected (channel closed by broker)");
+                                    session_failed = true;
+                                    break None;
+                                }
+                                // Transient — brief pause then retry
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                continue;
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
 
-        let tag = msg.delivery_tag;
-        let topic = msg.topic.clone();
+            let msg = match maybe_msg {
+                Some(m) => m,
+                None if session_failed => break Ok(()),
+                None => unreachable!(),
+            };
 
-        // ── Resolve query name and variables ─────────────────────────────────
-        let (query_name, variables) = match args.query_mode {
-            ConsumeQueryMode::Contract => match ContractMessage::try_parse(&msg.payload) {
-                Some(contract) => {
-                    let qn = contract
-                        .meta
-                        .event_type
-                        .unwrap_or_else(|| default_query.clone());
-                    let vars = data_to_variables(&contract.data);
+            let tag = msg.delivery_tag;
+            let topic = msg.topic.clone();
+
+            // ── Resolve query name and variables ─────────────────────────────
+            let (query_name, variables) = match args.query_mode {
+                ConsumeQueryMode::Contract => match ContractMessage::try_parse(&msg.payload) {
+                    Some(contract) => {
+                        let qn = contract
+                            .meta
+                            .event_type
+                            .unwrap_or_else(|| default_query.clone());
+                        let vars = data_to_variables(&contract.data);
+                        (qn, vars)
+                    }
+                    None => {
+                        let msg = "Message is not a valid ContractMessage";
+                        match args.on_error {
+                            ConsumeErrorMode::Lenient => {
+                                warn!("{}. Skipping message (topic={})", msg, topic);
+                                let _ = consumer.nack(tag, false).await;
+                                continue;
+                            }
+                            ConsumeErrorMode::Strict => {
+                                error!("{} (topic={})", msg, topic);
+                                let _ = consumer.nack(tag, true).await;
+                                break Err(anyhow::anyhow!("{}: topic={}", msg, topic));
+                            }
+                        }
+                    }
+                },
+                ConsumeQueryMode::Simple => {
+                    let qn = args
+                        .query
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("--query is required in simple mode"))?
+                        .to_string();
+                    let vars = payload_to_variables(&msg.payload);
                     (qn, vars)
                 }
+            };
+
+            // ── Look up the query ────────────────────────────────────────────
+            let query = match queries.get(&query_name) {
+                Some(q) => q,
                 None => {
-                    let msg = "Message is not a valid ContractMessage";
+                    let msg = format!("No named query '{}' found", query_name);
                     match args.on_error {
                         ConsumeErrorMode::Lenient => {
                             warn!("{}. Skipping message (topic={})", msg, topic);
@@ -481,79 +596,73 @@ pub async fn run(
                         ConsumeErrorMode::Strict => {
                             error!("{} (topic={})", msg, topic);
                             let _ = consumer.nack(tag, true).await;
-                            anyhow::bail!("{}: topic={}", msg, topic);
+                            break Err(anyhow::anyhow!("{}", msg));
                         }
                     }
                 }
-            },
-            ConsumeQueryMode::Simple => {
-                let qn = args
-                    .query
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--query is required in simple mode"))?
-                    .to_string();
-                let vars = payload_to_variables(&msg.payload);
-                (qn, vars)
-            }
-        };
+            };
 
-        // ── Look up the query ────────────────────────────────────────────────
-        let query = match queries.get(&query_name) {
-            Some(q) => q,
-            None => {
-                let msg = format!("No named query '{}' found", query_name);
-                match args.on_error {
+            // ── Execute GraphQL composition ──────────────────────────────────
+            let doc = executor::execute(query, &variables, resolvers, &pool, args.max_depth).await;
+
+            match doc {
+                Ok(doc) => {
+                    // ── Send to sink ─────────────────────────────────────────
+                    if let Err(e) = sink.send(&doc).await {
+                        match args.on_error {
+                            ConsumeErrorMode::Lenient => {
+                                warn!(error = %e, topic = %topic, query = %query_name, "Sink failed, skipping message");
+                                let _ = consumer.nack(tag, false).await;
+                                continue;
+                            }
+                            ConsumeErrorMode::Strict => {
+                                error!(error = %e, topic = %topic, query = %query_name, "Sink failed");
+                                let _ = consumer.nack(tag, true).await;
+                                break Err(e);
+                            }
+                        }
+                    }
+
+                    // ── Acknowledge ──────────────────────────────────────────
+                    if let Err(e) = consumer.ack(tag).await {
+                        error!(error = %e, "Failed to ack message — channel may be closed");
+                        // Channel is likely dead after a failed ack.
+                        // Break so the outer loop can reconnect.
+                        if !consumer.is_connected() {
+                            session_failed = true;
+                            break Ok(());
+                        }
+                    }
+                }
+                Err(e) => match args.on_error {
                     ConsumeErrorMode::Lenient => {
-                        warn!("{}. Skipping message (topic={})", msg, topic);
+                        warn!(error = %e, topic = %topic, query = %query_name, "GraphQL execution failed, skipping message");
                         let _ = consumer.nack(tag, false).await;
-                        continue;
                     }
                     ConsumeErrorMode::Strict => {
-                        error!("{} (topic={})", msg, topic);
+                        error!(error = %e, topic = %topic, query = %query_name, "GraphQL execution failed");
                         let _ = consumer.nack(tag, true).await;
-                        anyhow::bail!("{}", msg);
+                        break Err(e);
                     }
-                }
+                },
             }
         };
 
-        // ── Execute GraphQL composition ──────────────────────────────────────
-        let doc = executor::execute(query, &variables, resolvers, &pool, args.max_depth).await;
-
-        match doc {
-            Ok(doc) => {
-                // ── Send to sink ─────────────────────────────────────────────
-                if let Err(e) = sink.send(&doc).await {
-                    match args.on_error {
-                        ConsumeErrorMode::Lenient => {
-                            warn!(error = %e, topic = %topic, query = %query_name, "Sink failed, skipping message");
-                            let _ = consumer.nack(tag, false).await;
-                            continue;
-                        }
-                        ConsumeErrorMode::Strict => {
-                            error!(error = %e, topic = %topic, query = %query_name, "Sink failed");
-                            let _ = consumer.nack(tag, true).await;
-                            return Err(e);
-                        }
-                    }
-                }
-
-                // ── Acknowledge ──────────────────────────────────────────────
-                if let Err(e) = consumer.ack(tag).await {
-                    error!(error = %e, "Failed to ack message");
-                }
+        // ── Handle inner loop exit ────────────────────────────────────────────
+        match processing_result {
+            Ok(()) if session_failed => {
+                // Channel closed — reconnect with backoff
+                consecutive_failures += 1;
+                continue;
             }
-            Err(e) => match args.on_error {
-                ConsumeErrorMode::Lenient => {
-                    warn!(error = %e, topic = %topic, query = %query_name, "GraphQL execution failed, skipping message");
-                    let _ = consumer.nack(tag, false).await;
-                }
-                ConsumeErrorMode::Strict => {
-                    error!(error = %e, topic = %topic, query = %query_name, "GraphQL execution failed");
-                    let _ = consumer.nack(tag, true).await;
-                    return Err(e);
-                }
-            },
+            Ok(()) => {
+                // Clean shutdown signal
+                return Ok(());
+            }
+            Err(e) => {
+                // Fatal error in strict mode — abort
+                return Err(e);
+            }
         }
     }
 }

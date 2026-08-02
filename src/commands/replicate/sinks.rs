@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{ReplicateArgs, ReplicateDownstreamCommand};
+use super::{
+    ReplicateArgs, ReplicateDownstreamCommand, PGX_LSN, PGX_OP, PGX_PAYLOAD, PGX_SCHEMA, PGX_TABLE,
+};
 use crate::utils::config::DownstreamSinkKind;
 
 #[async_trait::async_trait]
@@ -53,7 +55,7 @@ impl WalSink for ShellWalSink {
     async fn send_wal(&self, event_json: &str, extra_env: &HashMap<String, String>) -> Result<()> {
         let mut env = self.base_env.clone();
         env.extend(extra_env.clone());
-        env.insert("PGX_PAYLOAD".to_string(), event_json.to_string());
+        env.insert(PGX_PAYLOAD.to_string(), event_json.to_string());
 
         let status = tokio::process::Command::new("sh")
             .arg("-c")
@@ -134,7 +136,7 @@ impl WalSink for RabbitmqWalSink {
         use std::collections::BTreeMap;
 
         let mut headers: BTreeMap<ShortString, AMQPValue> = BTreeMap::new();
-        for key in ["PGX_OP", "PGX_SCHEMA", "PGX_TABLE", "PGX_LSN"] {
+        for key in [PGX_OP, PGX_SCHEMA, PGX_TABLE, PGX_LSN] {
             if let Some(val) = env.get(key) {
                 let header_key = key.to_lowercase().replace('_', "-");
                 headers.insert(
@@ -176,10 +178,7 @@ impl WalSink for KafkaWalSink {
     async fn send_wal(&self, event_json: &str, env: &HashMap<String, String>) -> Result<()> {
         use rdkafka::producer::FutureRecord;
 
-        let key = env
-            .get("PGX_TABLE")
-            .map(|s| s.as_str())
-            .unwrap_or("pgx-wal");
+        let key = env.get(PGX_TABLE).map(|s| s.as_str()).unwrap_or("pgx-wal");
         self.producer
             .send(
                 FutureRecord::to(&self.topic).key(key).payload(event_json),

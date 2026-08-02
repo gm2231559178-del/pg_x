@@ -9,7 +9,8 @@ use tracing::{debug, error};
 use uuid::Uuid;
 
 use super::sinks::WalSink;
-use crate::replication::event::{ColVal, WalEvent};
+use super::PGX_LSN;
+use crate::replication::event::{qualified_name, ColVal, WalEvent};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ParquetArgs {
@@ -113,7 +114,7 @@ impl ParquetSink {
                 &events,
                 &self.compression,
             )
-            .with_context(|| format!("Failed to flush {schema}.{table}"))?;
+            .with_context(|| format!("Failed to flush {}", qualified_name(&schema, &table)))?;
         }
         Ok(())
     }
@@ -128,7 +129,7 @@ impl WalSink for ParquetSink {
     async fn send_wal(&self, event_json: &str, _env: &HashMap<String, String>) -> Result<()> {
         let event: WalEvent = serde_json::from_str(event_json)
             .with_context(|| "Failed to parse WAL event JSON in parquet sink")?;
-        let lsn = _env.get("PGX_LSN").cloned().unwrap_or_default();
+        let lsn = _env.get(PGX_LSN).cloned().unwrap_or_default();
         self.accumulate(event, lsn)?;
         self.maybe_flush()
     }

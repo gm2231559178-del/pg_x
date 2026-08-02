@@ -1,32 +1,28 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use super::bulk::{spawn_bulk_flusher, BulkBuffer};
 use super::contract::NotifyEvent;
+use super::delivery::elasticsearch::Elasticsearch;
 use super::sink::Downstream;
-use crate::graphql::{executor, pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
+use crate::graphql::{executor, pool::QueryConn, query::QueryLoader};
 use crate::utils::config::ResolverConfig;
 
 /// Elasticsearch downstream sink.
 /// Receives NOTIFY events with a ContractMessage containing query name and variables,
 /// executes the named GraphQL query, and pushes the assembled document to Elasticsearch.
+///
+/// The query pool, query loader, and resolvers come from the caller; the seam
+/// only owns the ES transport (bulk buffer) and the composition step.
 pub struct ElasticsearchDownstream {
-    #[allow(dead_code)]
-    es_url: String,
     index: String,
     id_field: Option<String>,
-    #[allow(dead_code)]
-    client: reqwest::Client,
-    pool: QueryConn,
-    queries: QueryLoader,
-    resolvers: HashMap<String, ResolverConfig>,
     max_depth: u32,
-    bulk_buffer: Arc<BulkBuffer>,
-    _flush_shutdown: tokio::sync::watch::Sender<bool>,
+    pool: Arc<QueryConn>,
+    queries: Arc<QueryLoader>,
+    resolvers: Arc<HashMap<String, ResolverConfig>>,
+    es: Elasticsearch,
 }
 
 impl ElasticsearchDownstream {
@@ -35,40 +31,18 @@ impl ElasticsearchDownstream {
         index: &str,
         id_field: Option<String>,
         max_depth: u32,
-        pool: QueryConn,
-        resolvers: HashMap<String, ResolverConfig>,
-        schema_dir: Option<PathBuf>,
+        pool: Arc<QueryConn>,
+        queries: Arc<QueryLoader>,
+        resolvers: Arc<HashMap<String, ResolverConfig>>,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
-
-        let schema = match schema_dir {
-            Some(ref p) => SchemaRegistry::load_from_dir(p)?,
-            None => {
-                let home = dirs::home_dir().context("Cannot determine home directory")?;
-                let p = home.join(".pgx").join("schema");
-                SchemaRegistry::load_from_dir(&p)?
-            }
-        };
-        let queries = QueryLoader::load(&schema)?;
-
-        let es_url = es_url.trim_end_matches('/').to_string();
-        let bulk_buffer = BulkBuffer::new(client.clone(), es_url.clone(), 500);
-        let (flush_tx, flush_rx) = tokio::sync::watch::channel(false);
-        spawn_bulk_flusher(Arc::clone(&bulk_buffer), 5, flush_rx);
-
         Ok(Self {
-            es_url,
             index: index.to_string(),
             id_field,
             max_depth,
-            client,
             pool,
             queries,
             resolvers,
-            bulk_buffer,
-            _flush_shutdown: flush_tx,
+            es: Elasticsearch::new(es_url)?,
         })
     }
 }
@@ -117,14 +91,9 @@ impl Downstream for ElasticsearchDownstream {
         )
         .await?;
 
-        let doc_id = self.id_field.as_ref().and_then(|idf| match &result {
-            serde_json::Value::Object(m) => {
-                m.get(idf).and_then(|v| v.as_str().map(|s| s.to_string()))
-            }
-            _ => None,
-        });
+        let doc_id = Elasticsearch::doc_id(self.id_field.as_deref(), &result, None);
 
-        self.bulk_buffer
+        self.es
             .push(&self.index, doc_id.as_deref(), &result)
             .await?;
 

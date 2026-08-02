@@ -1,11 +1,12 @@
 #[allow(clippy::module_inception)]
 pub mod shell {
-    use anyhow::{Context, Result};
+    use anyhow::Result;
     use async_trait::async_trait;
     use std::collections::HashMap;
 
     use crate::downstream::{
         contract::{ContractMessage, NotifyEvent},
+        delivery::shell::Shell,
         sink::Downstream,
     };
 
@@ -15,8 +16,7 @@ pub mod shell {
     /// and pid via `PGX_PID`.  Any extra environment variables from the
     /// `RoutingSpec.shell_env` map are also injected when using contract mode.
     pub struct ShellDownstream {
-        /// The shell command to execute (run via `sh -c <command>`).
-        command: String,
+        shell: Shell,
         /// Static env vars set at construction time (merged with event-level ones).
         base_env: HashMap<String, String>,
         /// When true, the payload is attempted to be parsed as a ContractMessage.
@@ -30,7 +30,7 @@ pub mod shell {
             contract_mode: bool,
         ) -> Self {
             Self {
-                command: command.into(),
+                shell: Shell::new(command),
                 base_env,
                 contract_mode,
             }
@@ -78,23 +78,7 @@ pub mod shell {
 
             env.insert("PGX_PAYLOAD".to_string(), payload_for_proc);
 
-            // Run the command asynchronously using tokio::process.
-            let status = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&self.command)
-                .envs(&env)
-                .status()
-                .await
-                .context("Failed to spawn shell command")?;
-
-            if !status.success() {
-                anyhow::bail!(
-                    "Shell command exited with status: {}",
-                    status.code().unwrap_or(-1)
-                );
-            }
-
-            Ok(())
+            self.shell.run(&env).await
         }
     }
 }

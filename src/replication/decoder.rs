@@ -4,8 +4,6 @@
 //!
 //! | Byte | Message   |
 //! |------|-----------|
-//! | `B`  | Begin     |
-//! | `C`  | Commit    |
 //! | `R`  | Relation  |
 //! | `I`  | Insert    |
 //! | `U`  | Update    |
@@ -14,6 +12,10 @@
 //! | `O`  | Origin    |  (skipped)
 //! | `Y`  | Type      |  (skipped)
 //! | `M`  | Message   |  (skipped)
+//!
+//! `B` (Begin) and `C` (Commit) are not decoded here: the replication client
+//! intercepts them with `parse_pgoutput_boundary` (proto.rs) and surfaces them
+//! as typed `ReplicationEvent::Begin`/`ReplicationEvent::Commit`.
 //!
 //! ## Tuple column kinds
 //!
@@ -29,7 +31,7 @@
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 
-use super::event::{ColVal, ColumnDef, Row, WalEvent};
+use super::event::{qualified_name, ColVal, ColumnDef, Row, WalEvent};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Low-level byte reader
@@ -77,26 +79,6 @@ impl<'a> Buf<'a> {
                 .expect("ensure(4) guarantees 4 bytes"),
         );
         self.pos += 4;
-        Ok(v)
-    }
-    fn read_u64(&mut self) -> Result<u64> {
-        self.ensure(8)?;
-        let v = u64::from_be_bytes(
-            self.data[self.pos..self.pos + 8]
-                .try_into()
-                .expect("ensure(8) guarantees 8 bytes"),
-        );
-        self.pos += 8;
-        Ok(v)
-    }
-    fn read_i64(&mut self) -> Result<i64> {
-        self.ensure(8)?;
-        let v = i64::from_be_bytes(
-            self.data[self.pos..self.pos + 8]
-                .try_into()
-                .expect("ensure(8) guarantees 8 bytes"),
-        );
-        self.pos += 8;
         Ok(v)
     }
     fn read_cstring(&mut self) -> Result<String> {
@@ -169,8 +151,8 @@ pub fn decode_pgoutput(data: &[u8], rel_cache: &mut RelationCache) -> Result<Opt
 fn dispatch(buf: &mut Buf<'_>, rel_cache: &mut RelationCache) -> Result<Option<WalEvent>> {
     let tag = buf.read_u8()?;
     match tag {
-        b'B' => decode_begin(buf),
-        b'C' => decode_commit(buf),
+        // Begin/Commit never reach the decoder: the client intercepts them via
+        // parse_pgoutput_boundary before forwarding the payload here.
         b'R' => decode_relation(buf, rel_cache),
         b'I' => decode_insert(buf, rel_cache),
         b'U' => decode_update(buf, rel_cache),
@@ -183,33 +165,6 @@ fn dispatch(buf: &mut Buf<'_>, rel_cache: &mut RelationCache) -> Result<Option<W
             other as char
         ),
     }
-}
-
-// ── Begin ──────────────────────────────────────────────────────────────────
-
-fn decode_begin(buf: &mut Buf<'_>) -> Result<Option<WalEvent>> {
-    let lsn = buf.read_u64()?;
-    let commit_time = buf.read_i64()?;
-    let xid = buf.read_u32()?;
-    Ok(Some(WalEvent::Begin {
-        lsn: fmt_lsn(lsn),
-        commit_time,
-        xid,
-    }))
-}
-
-// ── Commit ─────────────────────────────────────────────────────────────────
-
-fn decode_commit(buf: &mut Buf<'_>) -> Result<Option<WalEvent>> {
-    let _flags = buf.read_u8()? as i8;
-    let lsn = buf.read_u64()?;
-    let end_lsn = buf.read_u64()?;
-    let commit_time = buf.read_i64()?;
-    Ok(Some(WalEvent::Commit {
-        lsn: fmt_lsn(lsn),
-        end_lsn: fmt_lsn(end_lsn),
-        commit_time,
-    }))
 }
 
 // ── Relation ───────────────────────────────────────────────────────────────
@@ -378,7 +333,7 @@ fn decode_truncate(buf: &mut Buf<'_>, rel_cache: &RelationCache) -> Result<Optio
         let rid = buf.read_u32()?;
         rel_ids.push(rid);
         match rel_cache.get(&rid) {
-            Some(info) => tables.push(format!("{}.{}", info.schema, info.table)),
+            Some(info) => tables.push(qualified_name(&info.schema, &info.table)),
             None => tables.push(format!("<rel:{rid}>")),
         }
     }
@@ -389,12 +344,4 @@ fn decode_truncate(buf: &mut Buf<'_>, rel_cache: &RelationCache) -> Result<Optio
         cascade,
         restart_seqs,
     }))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-pub fn fmt_lsn(lsn: u64) -> String {
-    format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)
 }

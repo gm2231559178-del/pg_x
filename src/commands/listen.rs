@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 
 use std::collections::HashMap;
@@ -9,6 +9,7 @@ use crate::downstream::{contract::NotifyEvent, sink::Downstream};
 use crate::utils::config::{
     merge_opt, merge_vec, ChannelFullBehavior, Connection, DownstreamSinkKind, ResolverConfig,
 };
+use crate::utils::session_loop::{self, ReconnectConfig, SessionExit};
 use crate::utils::signal::{parse_key_val, shutdown_signal};
 use crate::utils::tls;
 
@@ -277,221 +278,193 @@ pub async fn run(
     let sink: Arc<dyn Downstream> =
         build_downstream(&args.downstream, &url, use_tls, resolvers).await?;
 
-    tokio::pin!(let shutdown = shutdown_signal(););
+    let reconnect = ReconnectConfig {
+        max_attempts: max_reconnect_attempts,
+        base_ms: reconnect_base_ms,
+        max_ms: reconnect_max_ms,
+    };
 
-    // Counts *consecutive* failures only — resets to 0 after each successful
-    // session so a brief drop after hours of healthy operation doesn't exhaust
-    // a stale retry budget.
-    let mut consecutive_failures: u32 = 0;
+    let args = Arc::new(args);
 
-    loop {
-        // ── Backoff (skipped on first attempt) ────────────────────────────────
-        if consecutive_failures > 0 {
-            let infinite = max_reconnect_attempts == 0;
+    // ── Session-loop: connect, forward events, reconnect with backoff ────────
+    session_loop::run(
+        move |shutdown| {
+            let args = args.clone();
+            let sink = sink.clone();
+            let url = url.clone();
+            let use_tls = use_tls;
+            async move {
+                let mut shutdown = shutdown;
 
-            if !infinite && consecutive_failures >= max_reconnect_attempts {
-                error!(
-                    consecutive_failures,
-                    max = max_reconnect_attempts,
-                    "Max reconnect attempts reached"
+                // ── Connect ───────────────────────────────────────────────────
+                info!("Connecting to PostgreSQL…");
+
+                let connector = match tls::build_tls(use_tls) {
+                    Ok(c) => c,
+                    Err(e) => return SessionExit::Fatal(e),
+                };
+                let (client, connection) = match tokio_postgres::connect(&url, connector).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        error!(error = %e, "Connection failed");
+                        return SessionExit::Reconnect;
+                    }
+                };
+
+                // ── Drainer task ──────────────────────────────────────────────
+                // THE BUG FIX: do NOT clone tx before spawning. Move the only sender
+                // into the Drainer. When the Drainer exits (connection dies), the sole
+                // tx is dropped, rx.recv() returns None, and the event loop breaks.
+                //
+                // The original code did `let tx = tx.clone()` inside spawn while keeping
+                // the original tx alive in this scope. That left a live sender dangling
+                // so rx.recv() would hang forever after the Drainer exited.
+                let behavior = args.channel_full_behavior.clone();
+                let channel_capacity = match behavior {
+                    ChannelFullBehavior::Grow => 100_000,
+                    _ => 1024,
+                };
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<tokio_postgres::Notification>(channel_capacity);
+
+                let drain_handle = tokio::spawn(async move {
+                    use std::future::Future;
+                    use std::pin::Pin;
+                    use std::task::{Context as Cx, Poll};
+
+                    struct Drainer<S> {
+                        conn: tokio_postgres::Connection<tokio_postgres::Socket, S>,
+                        tx: tokio::sync::mpsc::Sender<tokio_postgres::Notification>,
+                        behavior: ChannelFullBehavior,
+                    }
+
+                    impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Future for Drainer<S> {
+                        type Output = ();
+                        fn poll(mut self: Pin<&mut Self>, cx: &mut Cx<'_>) -> Poll<()> {
+                            loop {
+                                match self.conn.poll_message(cx) {
+                                    Poll::Pending => return Poll::Pending,
+                                    Poll::Ready(None) => return Poll::Ready(()),
+                                    Poll::Ready(Some(Ok(tokio_postgres::AsyncMessage::Notification(
+                                        n,
+                                    )))) => match self.behavior {
+                                        ChannelFullBehavior::DropOldest => {
+                                            if self.tx.try_send(n).is_err() {
+                                                // Channel full — downstream is slow, drop
+                                                // oldest to apply backpressure.
+                                            }
+                                        }
+                                        ChannelFullBehavior::Block => {
+                                            if self.tx.try_send(n).is_err() {
+                                                // Channel full — wait for space by returning
+                                                // Pending. The waker will be notified when
+                                                // the downstream consumes.
+                                                return Poll::Pending;
+                                            }
+                                        }
+                                        ChannelFullBehavior::Grow => {
+                                            let _ = self.tx.try_send(n);
+                                        }
+                                    },
+                                    Poll::Ready(Some(Ok(_))) => {}
+                                    Poll::Ready(Some(Err(e))) => {
+                                        error!(error = %e, "PostgreSQL connection error");
+                                        return Poll::Ready(());
+                                        // Drainer drops here -> tx dropped -> rx.recv() = None
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Drainer {
+                        conn: connection,
+                        tx,
+                        behavior,
+                    }
+                    .await
+                });
+                // tx is fully moved into spawn — no copy remains in this scope.
+
+                // ── LISTEN ────────────────────────────────────────────────────
+                let mut listen_ok = true;
+                for ch in &args.channels {
+                    let escaped = escape_channel(ch);
+                    match client.execute(&format!("LISTEN \"{escaped}\""), &[]).await {
+                        Ok(_) => info!(channel = %ch, "Listening on channel"),
+                        Err(e) => {
+                            error!(channel = %ch, error = %e, "LISTEN failed");
+                            listen_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !listen_ok {
+                    return SessionExit::Reconnect;
+                }
+
+                info!(
+                    sink = sink.name(),
+                    "Forwarding events — Ctrl-C / SIGTERM to stop"
                 );
-                return Err(anyhow::anyhow!(
-                    "Max reconnect attempts ({}) reached",
-                    max_reconnect_attempts
-                ));
-            }
 
-            let delay = crate::utils::backoff::delay(
-                consecutive_failures,
-                reconnect_base_ms,
-                reconnect_max_ms,
-            );
+                // ── Event loop ────────────────────────────────────────────────
+                loop {
+                    tokio::select! {
+                        biased;
 
-            warn!(
-                consecutive_failures,
-                delay_secs = delay.as_secs_f32(),
-                max_attempts = if infinite {
-                    "∞".to_string()
-                } else {
-                    max_reconnect_attempts.to_string()
-                },
-                "Connection lost, reconnecting…"
-            );
+                        _ = shutdown.wait() => {
+                            info!("Signal received, shutting down cleanly");
+                            return SessionExit::Shutdown;
+                        }
 
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => {
-                    info!("Signal received during backoff, shutting down cleanly");
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(delay) => {}
-            }
-        }
+                        maybe_n = rx.recv() => {
+                            match maybe_n {
+                                None => {
+                                    // tx was dropped (Drainer exited) — connection is dead.
+                                    warn!("Drainer channel closed — connection lost");
+                                    break;
+                                }
+                                Some(n) => {
+                                    let event = NotifyEvent {
+                                        channel: n.channel().to_string(),
+                                        payload: n.payload().to_string(),
+                                        pid: n.process_id(),
+                                    };
 
-        // ── Connect ───────────────────────────────────────────────────────────
-        info!("Connecting to PostgreSQL…");
+                                    debug!(
+                                        channel = %event.channel,
+                                        pid = event.pid,
+                                        payload = %event.payload,
+                                        "NOTIFY received"
+                                    );
 
-        let connector = tls::build_tls(use_tls)?;
-        let (client, connection) = match tokio_postgres::connect(&url, connector).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                error!(error = %e, "Connection failed");
-                consecutive_failures += 1;
-                continue;
-            }
-        };
-
-        // ── Drainer task ──────────────────────────────────────────────────────
-        // THE BUG FIX: do NOT clone tx before spawning. Move the only sender
-        // into the Drainer. When the Drainer exits (connection dies), the sole
-        // tx is dropped, rx.recv() returns None, and the event loop breaks.
-        //
-        // The original code did `let tx = tx.clone()` inside spawn while keeping
-        // the original tx alive in this scope. That left a live sender dangling
-        // so rx.recv() would hang forever after the Drainer exited.
-        let behavior = args.channel_full_behavior.clone();
-        let channel_capacity = match behavior {
-            ChannelFullBehavior::Grow => 100_000,
-            _ => 1024,
-        };
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<tokio_postgres::Notification>(channel_capacity);
-
-        let drain_handle = tokio::spawn(async move {
-            use std::future::Future;
-            use std::pin::Pin;
-            use std::task::{Context as Cx, Poll};
-
-            struct Drainer<S> {
-                conn: tokio_postgres::Connection<tokio_postgres::Socket, S>,
-                tx: tokio::sync::mpsc::Sender<tokio_postgres::Notification>,
-                behavior: ChannelFullBehavior,
-            }
-
-            impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Future for Drainer<S> {
-                type Output = ();
-                fn poll(mut self: Pin<&mut Self>, cx: &mut Cx<'_>) -> Poll<()> {
-                    loop {
-                        match self.conn.poll_message(cx) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(None) => return Poll::Ready(()),
-                            Poll::Ready(Some(Ok(tokio_postgres::AsyncMessage::Notification(
-                                n,
-                            )))) => match self.behavior {
-                                ChannelFullBehavior::DropOldest => {
-                                    if self.tx.try_send(n).is_err() {
-                                        // Channel full — downstream is slow, drop
-                                        // oldest to apply backpressure.
+                                    if let Err(e) = sink.send(&event).await {
+                                        error!(sink = sink.name(), error = %e, "Downstream send failed");
                                     }
                                 }
-                                ChannelFullBehavior::Block => {
-                                    if self.tx.try_send(n).is_err() {
-                                        // Channel full — wait for space by returning
-                                        // Pending. The waker will be notified when
-                                        // the downstream consumes.
-                                        return Poll::Pending;
-                                    }
-                                }
-                                ChannelFullBehavior::Grow => {
-                                    let _ = self.tx.try_send(n);
-                                }
-                            },
-                            Poll::Ready(Some(Ok(_))) => {}
-                            Poll::Ready(Some(Err(e))) => {
-                                error!(error = %e, "PostgreSQL connection error");
-                                return Poll::Ready(());
-                                // Drainer drops here -> tx dropped -> rx.recv() = None
                             }
                         }
                     }
                 }
-            }
 
-            Drainer {
-                conn: connection,
-                tx,
-                behavior,
-            }
-            .await
-        });
-        // tx is fully moved into spawn — no copy remains in this scope.
-
-        // ── LISTEN ────────────────────────────────────────────────────────────
-        let mut listen_ok = true;
-        for ch in &args.channels {
-            let escaped = escape_channel(ch);
-            match client.execute(&format!("LISTEN \"{escaped}\""), &[]).await {
-                Ok(_) => info!(channel = %ch, "Listening on channel"),
-                Err(e) => {
-                    error!(channel = %ch, error = %e, "LISTEN failed");
-                    listen_ok = false;
-                    break;
-                }
-            }
-        }
-        if !listen_ok {
-            consecutive_failures += 1;
-            continue;
-        }
-
-        // ── Successful session — reset failure counter ────────────────────────
-        consecutive_failures = 0;
-        info!(
-            sink = sink.name(),
-            "Forwarding events — Ctrl-C / SIGTERM to stop"
-        );
-
-        // ── Event loop ────────────────────────────────────────────────────────
-        let session_dropped = loop {
-            tokio::select! {
-                biased;
-
-                _ = &mut shutdown => {
-                    info!("Signal received, shutting down cleanly");
-                    return Ok(());
-                }
-
-                maybe_n = rx.recv() => {
-                    match maybe_n {
-                        None => {
-                            // tx was dropped (Drainer exited) — connection is dead.
-                            warn!("Drainer channel closed — connection lost");
-                            break true;
-                        }
-                        Some(n) => {
-                            let event = NotifyEvent {
-                                channel: n.channel().to_string(),
-                                payload: n.payload().to_string(),
-                                pid: n.process_id(),
-                            };
-
-                            debug!(
-                                channel = %event.channel,
-                                pid = event.pid,
-                                payload = %event.payload,
-                                "NOTIFY received"
-                            );
-
-                            if let Err(e) = sink.send(&event).await {
-                                error!(sink = sink.name(), error = %e, "Downstream send failed");
-                            }
-                        }
+                // Drainer task completed — check for panics
+                if drain_handle.is_finished() {
+                    if let Err(e) = drain_handle.await {
+                        error!("Drainer task panicked: {e}");
                     }
                 }
-            }
-        };
 
-        if session_dropped {
-            consecutive_failures += 1;
-        }
-
-        // Drainer task completed — check for panics
-        if drain_handle.is_finished() {
-            if let Err(e) = drain_handle.await {
-                error!("Drainer task panicked: {e}");
+                // The session ran healthily and then the connection was lost —
+                // reset the failure counter so a stale retry budget is not
+                // exhausted by a fresh drop.
+                SessionExit::ReconnectAfterHealthy
             }
-        }
-    }
+        },
+        shutdown_signal(),
+        &reconnect,
+    )
+    .await
 }
 
 #[allow(unused_variables)]
@@ -568,21 +541,33 @@ async fn build_downstream(
         #[cfg(feature = "elasticsearch")]
         DownstreamCommand::Elasticsearch(a) => {
             use crate::downstream::elasticsearch::ElasticsearchDownstream;
-            use crate::graphql::pool::QueryConn;
+            use crate::graphql::{pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
             use std::path::PathBuf;
+            use std::sync::Arc;
 
-            let pool = QueryConn::connect(url, use_tls).await?;
+            let pool = Arc::new(QueryConn::connect(url, use_tls).await?);
             let es_url = a.es_url.as_deref().unwrap_or("http://localhost:9200");
             let index = a.index.as_deref().unwrap_or("pgx");
             let schema_dir = a.schema_dir.as_ref().map(PathBuf::from);
+
+            let schema = match &schema_dir {
+                Some(p) => SchemaRegistry::load_from_dir(p)?,
+                None => {
+                    let home = dirs::home_dir().context("Cannot determine home directory")?;
+                    let p = home.join(".pgx").join("schema");
+                    SchemaRegistry::load_from_dir(&p)?
+                }
+            };
+            let queries = Arc::new(QueryLoader::load(&schema)?);
+
             let ds = ElasticsearchDownstream::new(
                 es_url,
                 index,
                 a.id_field.clone(),
                 8,
                 pool,
-                resolvers.clone(),
-                schema_dir,
+                queries,
+                Arc::new(resolvers.clone()),
             )?;
             Ok(Arc::new(ds))
         }

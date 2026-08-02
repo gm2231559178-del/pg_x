@@ -6,5 +6,6 @@ pub mod db;
 pub mod excel;
 pub mod format;
 pub mod json;
+pub mod session_loop;
 pub mod signal;
 pub mod tls;

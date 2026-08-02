@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use tracing::{debug, error};
 
 use super::sinks::WalSink;
-use crate::replication::event::{ColVal, WalEvent};
+use super::PGX_LSN;
+use crate::replication::event::{qualified_name, ColVal, WalEvent};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct IcebergArgs {
@@ -106,7 +107,7 @@ impl IcebergSink {
         };
 
         for ((schema, table), events) in buffers {
-            let full_name = format!("{schema}.{table}");
+            let full_name = qualified_name(&schema, &table);
             if let Err(e) = flush_table_to_iceberg(
                 &self.catalog,
                 &schema,
@@ -138,7 +139,7 @@ impl IcebergSink {
         };
 
         for ((schema, table), events) in buffers {
-            let full_name = format!("{schema}.{table}");
+            let full_name = qualified_name(&schema, &table);
             flush_table_to_iceberg(
                 &self.catalog,
                 &schema,
@@ -163,7 +164,7 @@ impl WalSink for IcebergSink {
     async fn send_wal(&self, event_json: &str, _env: &HashMap<String, String>) -> Result<()> {
         let event: WalEvent = serde_json::from_str(event_json)
             .with_context(|| "Failed to parse WAL event JSON in iceberg sink")?;
-        let lsn = _env.get("PGX_LSN").cloned().unwrap_or_default();
+        let lsn = _env.get(PGX_LSN).cloned().unwrap_or_default();
         self.accumulate(event, lsn);
         self.do_flush().await
     }
@@ -326,7 +327,7 @@ async fn flush_table_to_iceberg(
     let location_generator = DefaultLocationGenerator::new(iceberg_table.metadata().clone())
         .context("Failed to create location generator")?;
     let file_name_generator =
-        DefaultFileNameGenerator::new(format!("{schema}.{table}"), None, DataFileFormat::Parquet);
+        DefaultFileNameGenerator::new(qualified_name(schema, table), None, DataFileFormat::Parquet);
 
     let writer_props = if compression == "zstd" {
         WriterProperties::builder()
@@ -465,7 +466,7 @@ mod tests {
         let sink = IcebergSink::new(&args).await?;
 
         let mut env = HashMap::new();
-        env.insert("PGX_LSN".into(), "0/12345".into());
+        env.insert(PGX_LSN.into(), "0/12345".into());
 
         sink.send_wal(
             &make_insert("users", &[("name", "Alice"), ("city", "NYC")]),
@@ -548,7 +549,7 @@ mod tests {
         let sink = IcebergSink::new(&args).await?;
 
         let mut env = HashMap::new();
-        env.insert("PGX_LSN".into(), "0/AAA".into());
+        env.insert(PGX_LSN.into(), "0/AAA".into());
 
         sink.send_wal(
             &make_insert("orders", &[("id", "1"), ("amount", "100")]),

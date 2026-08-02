@@ -1,6 +1,7 @@
 #[cfg(feature = "elasticsearch")]
 pub mod bulk;
 pub mod contract;
+pub mod delivery;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 pub mod kafka;

@@ -104,6 +104,11 @@ impl Serialize for ColVal {
 
 pub type Row = HashMap<String, ColVal>;
 
+/// Qualified `schema.table` name used for filtering, file names, and tables.
+pub fn qualified_name(schema: &str, table: &str) -> String {
+    format!("{schema}.{table}")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WAL event enum
 // ─────────────────────────────────────────────────────────────────────────────

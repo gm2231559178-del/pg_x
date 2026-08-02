@@ -5,14 +5,14 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
-use crate::consumer::dedupe::{spawn_dedup_sweeper, DedupCache};
-use crate::consumer::r#trait::{BrokerMessage, ConsumeSink, Consumer};
-use crate::downstream::contract::ContractMessage;
-use crate::graphql::{executor, pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
+use crate::commands::consume_session::{Compose, ConsumeSession};
+use crate::consumer::r#trait::{ConsumeSink, Consumer};
+use crate::graphql::query::{NamedQuery, QueryLoader};
+use crate::graphql::{executor, pool::QueryConn, schema::SchemaRegistry};
 use crate::utils::config::{Connection, ConsumeSinkKind, ConsumeSourceKind, ResolverConfig};
+use crate::utils::session_loop::{self, ReconnectConfig, SessionExit};
 use crate::utils::signal::shutdown_signal;
 
 // ── CLI args ─────────────────────────────────────────────────────────────────
@@ -154,30 +154,11 @@ impl ConsumeSink for StdoutConsumeSink {
     }
 }
 
-/// Elasticsearch `_id` for a composed document.
-///
-/// The explicit `--id-field` string value wins when present; otherwise the
-/// message id is used when idempotent mode is active; otherwise `None` (ES
-/// auto-generates the id).
-#[cfg(feature = "elasticsearch")]
-fn es_doc_id(id_field: Option<&str>, doc: &Value, msg_id: Option<&str>) -> Option<String> {
-    let explicit = id_field.and_then(|idf| match doc {
-        Value::Object(m) => m.get(idf).and_then(|v| v.as_str().map(|s| s.to_string())),
-        _ => None,
-    });
-    explicit.or_else(|| msg_id.map(|s| s.to_string()))
-}
-
 #[cfg(feature = "elasticsearch")]
 struct ElasticsearchConsumeSink {
-    #[allow(dead_code)]
-    es_url: String,
     index: String,
     id_field: Option<String>,
-    #[allow(dead_code)]
-    client: reqwest::Client,
-    bulk_buffer: Arc<crate::downstream::bulk::BulkBuffer>,
-    _flush_shutdown: tokio::sync::watch::Sender<bool>,
+    es: crate::downstream::delivery::elasticsearch::Elasticsearch,
 }
 
 #[cfg(feature = "elasticsearch")]
@@ -188,20 +169,20 @@ impl ConsumeSink for ElasticsearchConsumeSink {
     }
 
     async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
-        let doc_id = es_doc_id(self.id_field.as_deref(), doc, msg_id);
+        let doc_id = crate::downstream::delivery::elasticsearch::Elasticsearch::doc_id(
+            self.id_field.as_deref(),
+            doc,
+            msg_id,
+        );
 
-        self.bulk_buffer
-            .push(&self.index, doc_id.as_deref(), doc)
-            .await?;
-
-        Ok(())
+        self.es.push(&self.index, doc_id.as_deref(), doc).await
     }
 }
 
 #[cfg(feature = "webhook")]
 struct WebhookConsumeSink {
     url: String,
-    client: reqwest::Client,
+    webhook: crate::downstream::delivery::webhook::Webhook,
 }
 
 #[cfg(feature = "webhook")]
@@ -212,23 +193,11 @@ impl ConsumeSink for WebhookConsumeSink {
     }
 
     async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
-        let mut request = self.client.post(&self.url).json(doc);
-        if let Some(id) = msg_id {
-            request = request.header("Idempotency-Key", id);
-        }
-
-        let response = request
-            .send()
+        // No retry here: the consume session nacks and redelivers via the
+        // broker when delivery fails. Idempotency-Key lets the receiver dedupe.
+        self.webhook
+            .post(&self.url, &HashMap::new(), doc, msg_id)
             .await
-            .with_context(|| format!("Webhook POST failed to {}", self.url))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Webhook failed (HTTP {}) at {}: {}", status, self.url, text);
-        }
-
-        Ok(())
     }
 }
 
@@ -246,27 +215,13 @@ async fn build_sink(args: &ConsumeArgs) -> Result<Arc<dyn ConsumeSink>> {
 
         #[cfg(feature = "elasticsearch")]
         ConsumeSinkType::Elasticsearch => {
-            let es_url = args
-                .es_url
-                .as_deref()
-                .unwrap_or("http://localhost:9200")
-                .trim_end_matches('/')
-                .to_string();
+            let es_url = args.es_url.as_deref().unwrap_or("http://localhost:9200");
             let index = args.index.as_deref().unwrap_or("pgx").to_string();
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?;
-            let bulk_buffer =
-                crate::downstream::bulk::BulkBuffer::new(client.clone(), es_url.clone(), 500);
-            let (flush_tx, flush_rx) = tokio::sync::watch::channel(false);
-            crate::downstream::bulk::spawn_bulk_flusher(Arc::clone(&bulk_buffer), 5, flush_rx);
+            let es = crate::downstream::delivery::elasticsearch::Elasticsearch::new(es_url)?;
             Ok(Arc::new(ElasticsearchConsumeSink {
-                es_url,
                 index,
                 id_field: args.id_field.clone(),
-                client,
-                bulk_buffer,
-                _flush_shutdown: flush_tx,
+                es,
             }))
         }
 
@@ -283,10 +238,10 @@ async fn build_sink(args: &ConsumeArgs) -> Result<Arc<dyn ConsumeSink>> {
                     "Webhook URL is required — provide --webhook-url or set WEBHOOK_URL env"
                 );
             }
-            let client = reqwest::Client::new();
+            let webhook = crate::downstream::delivery::webhook::Webhook::with_retries(0);
             Ok(Arc::new(WebhookConsumeSink {
                 url: url.to_string(),
-                client,
+                webhook,
             }))
         }
 
@@ -355,43 +310,32 @@ async fn build_consumer(args: &ConsumeArgs) -> Result<Arc<dyn Consumer>> {
     }
 }
 
-// ── Variable extraction helpers ──────────────────────────────────────────────
+// ── Composition ──────────────────────────────────────────────────────────────
 
-/// Whether `msg_id` was already seen by the dedupe cache.
-async fn is_duplicate(dedup: &Option<Arc<DedupCache>>, msg_id: Option<&str>) -> bool {
-    match (dedup, msg_id) {
-        (Some(cache), Some(id)) => cache.contains(id).await,
-        _ => false,
-    }
+/// Production wiring of the [`Compose`] seam: executes a named query against the
+/// GraphQL query pool with the configured resolvers and recursion depth.
+struct GraphqlCompose {
+    pool: Arc<QueryConn>,
+    resolvers: Arc<HashMap<String, ResolverConfig>>,
+    max_depth: u32,
 }
 
-/// Record `msg_id` as processed. Only call after a successful sink send, so a
-/// redelivered message whose first attempt failed is still processed.
-async fn record_processed(dedup: &Option<Arc<DedupCache>>, msg_id: Option<&str>) {
-    if let (Some(cache), Some(id)) = (dedup, msg_id) {
-        cache.record(id).await;
+#[async_trait]
+impl Compose for GraphqlCompose {
+    async fn compose(
+        &self,
+        query: &NamedQuery,
+        variables: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        executor::execute(
+            query,
+            variables,
+            &self.resolvers,
+            &self.pool,
+            self.max_depth,
+        )
+        .await
     }
-}
-
-/// Extract variables from a serde_json::Value (top-level object becomes variable map).
-fn data_to_variables(data: &Value) -> HashMap<String, Value> {
-    match data {
-        Value::Object(m) => m.clone().into_iter().collect(),
-        other => {
-            let mut h = HashMap::new();
-            h.insert("data".to_string(), other.clone());
-            h
-        }
-    }
-}
-
-/// Parse the entire message payload as a JSON object for variables.
-fn payload_to_variables(payload: &str) -> HashMap<String, Value> {
-    serde_json::from_str(payload).unwrap_or_else(|_| {
-        let mut h = HashMap::new();
-        h.insert("payload".to_string(), Value::String(payload.to_string()));
-        h
-    })
 }
 
 // ── Resolve schema dir ──────────────────────────────────────────────────────
@@ -463,7 +407,7 @@ pub async fn run(
     // ── Load schema and queries (once, outside reconnection loop) ────────────
     let schema_dir = resolve_schema_dir(args.schema_dir.as_deref())?;
     let schema = SchemaRegistry::load_from_dir(&schema_dir)?;
-    let queries = QueryLoader::load(&schema)?;
+    let queries = Arc::new(QueryLoader::load(&schema)?);
     info!(
         "Loaded {} type definitions, {} queries",
         schema.types.len(),
@@ -471,7 +415,7 @@ pub async fn run(
     );
 
     // ── Build GraphQL query pool (once) ──────────────────────────────────────
-    let pool = QueryConn::connect(&url, use_tls).await?;
+    let pool = Arc::new(QueryConn::connect(&url, use_tls).await?);
     info!("Connected GraphQL query pool to PostgreSQL");
 
     // ── Resolve default query name (contract mode fallback) ──────────────────
@@ -481,271 +425,62 @@ pub async fn run(
     let sink: Arc<dyn ConsumeSink> = build_sink(&args).await?;
     info!("Using {} sink", sink.name());
 
-    // ── Dedupe cache (idempotent mode only) ──────────────────────────────────
-    let dedup: Option<Arc<DedupCache>> = if args.idempotent {
-        let ttl = Duration::from_secs(args.dedup_ttl.unwrap_or(900));
-        let cache = DedupCache::new(ttl);
-        spawn_dedup_sweeper(Arc::clone(&cache), ttl);
-        info!(
-            "Idempotent mode on (dedup_ttl={}s)",
-            args.dedup_ttl.unwrap_or(900)
-        );
-        Some(cache)
-    } else {
-        None
-    };
+    // ── Wire the composition seam to the GraphQL executor ────────────────────
+    let compose: Arc<dyn Compose> = Arc::new(GraphqlCompose {
+        pool: pool.clone(),
+        resolvers: Arc::new(resolvers.clone()),
+        max_depth: args.max_depth,
+    });
 
-    // ── Consume loop with reconnection ───────────────────────────────────────
+    // ── Build the session (owns the dedupe lifecycle) ────────────────────────
+    let session = Arc::new(ConsumeSession::new(
+        args.query_mode.clone(),
+        args.on_error.clone(),
+        args.idempotent,
+        args.dedup_ttl,
+        default_query,
+        queries,
+        sink,
+        compose,
+    ));
+
     info!(
         "Starting consume loop (mode={:?}, error={:?})",
         args.query_mode, args.on_error
     );
 
-    tokio::pin!(let shutdown = shutdown_signal(););
+    let reconnect = ReconnectConfig {
+        max_attempts: args.max_reconnect_attempts,
+        base_ms: args.reconnect_base_ms,
+        max_ms: args.reconnect_max_ms,
+    };
 
-    let mut consecutive_failures: u32 = 0;
+    let args = Arc::new(args);
 
-    let max_reconnect_attempts = args.max_reconnect_attempts;
-    let reconnect_base_ms = args.reconnect_base_ms;
-    let reconnect_max_ms = args.reconnect_max_ms;
+    // ── Session-loop: reconnect with backoff until shutdown or a fatal error ─
+    session_loop::run(
+        move |shutdown| {
+            let session = session.clone();
+            let args = args.clone();
+            async move {
+                // ── Build consumer ───────────────────────────────────────────
+                let consumer: Arc<dyn Consumer> = match build_consumer(args.as_ref()).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(error = %e, "Failed to connect consumer");
+                        return SessionExit::Reconnect;
+                    }
+                };
+                info!("Connected to {} consumer", consumer.name());
 
-    loop {
-        // ── Backoff (skipped on first attempt) ────────────────────────────────
-        if consecutive_failures > 0 {
-            let infinite = max_reconnect_attempts == 0;
-
-            if !infinite && consecutive_failures >= max_reconnect_attempts {
-                error!(
-                    consecutive_failures,
-                    max = max_reconnect_attempts,
-                    "Max reconnect attempts reached"
-                );
-                return Err(anyhow::anyhow!(
-                    "Max reconnect attempts ({}) reached",
-                    max_reconnect_attempts
-                ));
+                let mut shutdown = shutdown;
+                session.run(consumer.as_ref(), &mut shutdown).await
             }
-
-            let delay = crate::utils::backoff::delay(
-                consecutive_failures,
-                reconnect_base_ms,
-                reconnect_max_ms,
-            );
-
-            warn!(
-                consecutive_failures,
-                delay_secs = delay.as_secs_f32(),
-                max_attempts = if infinite {
-                    "∞".to_string()
-                } else {
-                    max_reconnect_attempts.to_string()
-                },
-                "Reconnecting…"
-            );
-
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => {
-                    info!("Signal received during backoff, shutting down cleanly");
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(delay) => {}
-            }
-        }
-
-        // ── Build consumer ───────────────────────────────────────────────────
-        let consumer: Arc<dyn Consumer> = match build_consumer(&args).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!(error = %e, "Failed to connect consumer");
-                consecutive_failures += 1;
-                continue;
-            }
-        };
-        info!("Connected to {} consumer", consumer.name());
-
-        // ── Inner consume loop ────────────────────────────────────────────────
-        let mut session_failed = false;
-
-        let processing_result: Result<()> = loop {
-            let maybe_msg: Option<BrokerMessage> = loop {
-                tokio::select! {
-                    biased;
-
-                    _ = &mut shutdown => {
-                        info!("Signal received, shutting down cleanly");
-                        return Ok(());
-                    }
-
-                    maybe_msg = consumer.recv() => {
-                        match maybe_msg {
-                            Some(m) => break Some(m),
-                            None => {
-                                // recv returned None — channel may be closed
-                                // (e.g. broker ack timeout triggered PRECONDITION_FAILED).
-                                if !consumer.is_connected() {
-                                    warn!("Consumer disconnected (channel closed by broker)");
-                                    session_failed = true;
-                                    break None;
-                                }
-                                // Transient — brief pause then retry
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                continue;
-                            }
-                        }
-                    }
-                }
-            };
-
-            let msg = match maybe_msg {
-                Some(m) => m,
-                None if session_failed => break Ok(()),
-                None => unreachable!(),
-            };
-
-            let tag = msg.delivery_tag;
-            let topic = msg.topic.clone();
-            let msg_id = msg.message_id.as_deref();
-
-            // ── Dedupe: skip messages already processed ──────────────────────
-            if is_duplicate(&dedup, msg_id).await {
-                debug!(id = ?msg_id, topic = %topic, "Duplicate message, acking and skipping");
-                if let Err(e) = consumer.ack(tag).await {
-                    error!(error = %e, "Failed to ack duplicate message");
-                    if !consumer.is_connected() {
-                        session_failed = true;
-                        break Ok(());
-                    }
-                }
-                continue;
-            }
-
-            // ── Resolve query name and variables ─────────────────────────────
-            let (query_name, variables) = match args.query_mode {
-                ConsumeQueryMode::Contract => match ContractMessage::try_parse(&msg.payload) {
-                    Some(contract) => {
-                        let qn = contract
-                            .meta
-                            .event_type
-                            .unwrap_or_else(|| default_query.clone());
-                        let vars = data_to_variables(&contract.data);
-                        (qn, vars)
-                    }
-                    None => {
-                        let msg = "Message is not a valid ContractMessage";
-                        match args.on_error {
-                            ConsumeErrorMode::Lenient => {
-                                warn!("{}. Skipping message (topic={})", msg, topic);
-                                let _ = consumer.nack(tag, false).await;
-                                continue;
-                            }
-                            ConsumeErrorMode::Strict => {
-                                error!("{} (topic={})", msg, topic);
-                                let _ = consumer.nack(tag, true).await;
-                                break Err(anyhow::anyhow!("{}: topic={}", msg, topic));
-                            }
-                        }
-                    }
-                },
-                ConsumeQueryMode::Simple => {
-                    let qn = args
-                        .query
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("--query is required in simple mode"))?
-                        .to_string();
-                    let vars = payload_to_variables(&msg.payload);
-                    (qn, vars)
-                }
-            };
-
-            // ── Look up the query ────────────────────────────────────────────
-            let query = match queries.get(&query_name) {
-                Some(q) => q,
-                None => {
-                    let msg = format!("No named query '{}' found", query_name);
-                    match args.on_error {
-                        ConsumeErrorMode::Lenient => {
-                            warn!("{}. Skipping message (topic={})", msg, topic);
-                            let _ = consumer.nack(tag, false).await;
-                            continue;
-                        }
-                        ConsumeErrorMode::Strict => {
-                            error!("{} (topic={})", msg, topic);
-                            let _ = consumer.nack(tag, true).await;
-                            break Err(anyhow::anyhow!("{}", msg));
-                        }
-                    }
-                }
-            };
-
-            // ── Execute GraphQL composition ──────────────────────────────────
-            let doc = executor::execute(query, &variables, resolvers, &pool, args.max_depth).await;
-
-            match doc {
-                Ok(doc) => {
-                    // ── Send to sink ─────────────────────────────────────────
-                    let sink_msg_id = if args.idempotent { msg_id } else { None };
-                    if let Err(e) = sink.send(&doc, sink_msg_id).await {
-                        match args.on_error {
-                            ConsumeErrorMode::Lenient => {
-                                warn!(error = %e, topic = %topic, query = %query_name, "Sink failed, skipping message");
-                                let _ = consumer.nack(tag, false).await;
-                                continue;
-                            }
-                            ConsumeErrorMode::Strict => {
-                                error!(error = %e, topic = %topic, query = %query_name, "Sink failed");
-                                let _ = consumer.nack(tag, true).await;
-                                break Err(e);
-                            }
-                        }
-                    }
-
-                    // ── Record as processed (before ack, so a failed ack still
-                    //    causes the redelivered message to be skipped) ────────
-                    record_processed(&dedup, msg_id).await;
-
-                    // ── Acknowledge ──────────────────────────────────────────
-                    if let Err(e) = consumer.ack(tag).await {
-                        error!(error = %e, "Failed to ack message — channel may be closed");
-                        // Channel is likely dead after a failed ack.
-                        // Break so the outer loop can reconnect.
-                        if !consumer.is_connected() {
-                            session_failed = true;
-                            break Ok(());
-                        }
-                    }
-                }
-                Err(e) => match args.on_error {
-                    ConsumeErrorMode::Lenient => {
-                        warn!(error = %e, topic = %topic, query = %query_name, "GraphQL execution failed, skipping message");
-                        let _ = consumer.nack(tag, false).await;
-                    }
-                    ConsumeErrorMode::Strict => {
-                        error!(error = %e, topic = %topic, query = %query_name, "GraphQL execution failed");
-                        let _ = consumer.nack(tag, true).await;
-                        break Err(e);
-                    }
-                },
-            }
-        };
-
-        // ── Handle inner loop exit ────────────────────────────────────────────
-        match processing_result {
-            Ok(()) if session_failed => {
-                // Channel closed — reconnect with backoff
-                consecutive_failures += 1;
-                continue;
-            }
-            Ok(()) => {
-                // Clean shutdown signal
-                return Ok(());
-            }
-            Err(e) => {
-                // Fatal error in strict mode — abort
-                return Err(e);
-            }
-        }
-    }
+        },
+        shutdown_signal(),
+        &reconnect,
+    )
+    .await
 }
 
 fn merge_source_config(args: &mut ConsumeArgs, source: &ConsumeSourceKind) {
@@ -878,14 +613,14 @@ impl std::str::FromStr for ConsumeErrorMode {
 #[cfg(test)]
 #[cfg(feature = "elasticsearch")]
 mod tests {
-    use super::es_doc_id;
+    use crate::downstream::delivery::elasticsearch::Elasticsearch;
     use serde_json::json;
 
     #[test]
     fn es_id_explicit_field_wins() {
         let doc = json!({"mat_no": "M001", "name": "steel"});
         assert_eq!(
-            es_doc_id(Some("mat_no"), &doc, Some("msg-7")),
+            Elasticsearch::doc_id(Some("mat_no"), &doc, Some("msg-7")),
             Some("M001".into())
         );
     }
@@ -893,9 +628,12 @@ mod tests {
     #[test]
     fn es_id_falls_back_to_msg_id() {
         let doc = json!({"name": "steel"});
-        assert_eq!(es_doc_id(None, &doc, Some("msg-7")), Some("msg-7".into()));
         assert_eq!(
-            es_doc_id(Some("missing"), &doc, Some("msg-7")),
+            Elasticsearch::doc_id(None, &doc, Some("msg-7")),
+            Some("msg-7".into())
+        );
+        assert_eq!(
+            Elasticsearch::doc_id(Some("missing"), &doc, Some("msg-7")),
             Some("msg-7".into())
         );
     }
@@ -903,70 +641,15 @@ mod tests {
     #[test]
     fn es_id_none_without_idempotence() {
         let doc = json!({"name": "steel"});
-        assert_eq!(es_doc_id(None, &doc, None), None);
+        assert_eq!(Elasticsearch::doc_id(None, &doc, None), None);
     }
 
     #[test]
     fn es_id_ignores_non_string_field() {
         let doc = json!({"mat_no": 42});
         assert_eq!(
-            es_doc_id(Some("mat_no"), &doc, Some("msg-7")),
+            Elasticsearch::doc_id(Some("mat_no"), &doc, Some("msg-7")),
             Some("msg-7".into())
         );
-    }
-}
-
-#[cfg(test)]
-mod dedupe_ordering_tests {
-    use super::{is_duplicate, record_processed};
-    use crate::consumer::dedupe::DedupCache;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    fn cache() -> Option<Arc<DedupCache>> {
-        Some(DedupCache::new(Duration::from_secs(60)))
-    }
-
-    #[tokio::test]
-    async fn failed_send_is_not_recorded_so_redelivery_is_processed() {
-        let dedup = cache();
-
-        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
-
-        // First attempt fails (e.g. strict-mode sink error) — no record.
-        // The redelivered copy must therefore be processed again.
-
-        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
-    }
-
-    #[tokio::test]
-    async fn successful_send_is_recorded_and_redelivery_is_deduped() {
-        let dedup = cache();
-
-        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
-
-        // First attempt succeeds — record before ack.
-        record_processed(&dedup, Some("msg-1")).await;
-
-        // A redelivered copy is now a duplicate and gets acked + skipped.
-        assert!(is_duplicate(&dedup, Some("msg-1")).await);
-    }
-
-    #[tokio::test]
-    async fn no_msg_id_is_never_deduped() {
-        let dedup = cache();
-
-        assert!(!is_duplicate(&dedup, None).await);
-        record_processed(&dedup, None).await;
-        assert!(!is_duplicate(&dedup, None).await);
-    }
-
-    #[tokio::test]
-    async fn no_cache_is_never_deduped() {
-        let dedup: Option<Arc<DedupCache>> = None;
-
-        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
-        record_processed(&dedup, Some("msg-1")).await;
-        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
     }
 }

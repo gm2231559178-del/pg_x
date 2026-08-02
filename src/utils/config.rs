@@ -261,6 +261,13 @@ pub struct ConsumeConfig {
     pub schema_dir: Option<String>,
     /// Error mode: "lenient" or "strict".
     pub on_error: Option<String>,
+    /// Dedupe redelivered messages and derive stable sink keys from the
+    /// message id.
+    #[serde(default)]
+    pub idempotent: Option<bool>,
+    /// How long (seconds) to remember seen message ids for dedupe.
+    #[serde(default)]
+    pub dedup_ttl: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

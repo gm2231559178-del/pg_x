@@ -12,6 +12,10 @@ pub struct BrokerMessage {
     pub payload: String,
     /// Message headers/metadata.
     pub headers: HashMap<String, String>,
+    /// Stable identity for this message across redeliveries.
+    /// Kafka: record key or `<partition>:<offset>`. RabbitMQ: AMQP
+    /// `message_id` property or a payload hash.
+    pub message_id: Option<String>,
     /// Opaque handle for ack/nack (delivery tag, offset, etc.).
     pub delivery_tag: u64,
 }
@@ -38,5 +42,8 @@ pub trait Consumer: Send + Sync {
 #[async_trait]
 pub trait ConsumeSink: Send + Sync {
     fn name(&self) -> &str;
-    async fn send(&self, doc: &Value) -> Result<()>;
+    /// Deliver `doc` to the sink. `msg_id` is `Some` only when idempotent mode
+    /// is active, and lets the sink derive a stable key when it has no explicit
+    /// document field to key on.
+    async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()>;
 }

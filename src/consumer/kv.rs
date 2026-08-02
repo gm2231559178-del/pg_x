@@ -71,12 +71,17 @@ impl KvConsumeSink {
         })
     }
 
-    fn extract_key(&self, doc: &Value) -> String {
-        extract_key_impl(&self.key_prefix, self.key_field.as_deref(), doc)
+    fn extract_key(&self, doc: &Value, msg_id: Option<&str>) -> String {
+        extract_key_impl(&self.key_prefix, self.key_field.as_deref(), doc, msg_id)
     }
 }
 
-fn extract_key_impl(key_prefix: &str, key_field: Option<&str>, doc: &Value) -> String {
+fn extract_key_impl(
+    key_prefix: &str,
+    key_field: Option<&str>,
+    doc: &Value,
+    msg_id: Option<&str>,
+) -> String {
     let suffix = key_field.and_then(|kf| match doc {
         Value::Object(m) => m.get(kf).map(|v| match v {
             Value::String(s) => s.clone(),
@@ -84,7 +89,10 @@ fn extract_key_impl(key_prefix: &str, key_field: Option<&str>, doc: &Value) -> S
         }),
         _ => None,
     });
-    let suffix = suffix.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let suffix = suffix.unwrap_or_else(|| match msg_id {
+        Some(id) => id.to_string(),
+        None => uuid::Uuid::new_v4().to_string(),
+    });
     format!("{}{}", key_prefix, suffix)
 }
 
@@ -94,8 +102,8 @@ impl ConsumeSink for KvConsumeSink {
         "kv"
     }
 
-    async fn send(&self, doc: &Value) -> Result<()> {
-        let key = self.extract_key(doc);
+    async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
+        let key = self.extract_key(doc, msg_id);
         let value = serde_json::to_string(doc)?;
         let mut conn = self.conn.lock().await;
 
@@ -137,19 +145,22 @@ mod tests {
     #[test]
     fn extract_key_with_field_string() {
         let doc = json!({"id": "abc123", "name": "test"});
-        assert_eq!(extract_key_impl("pfx:", Some("id"), &doc), "pfx:abc123");
+        assert_eq!(
+            extract_key_impl("pfx:", Some("id"), &doc, None),
+            "pfx:abc123"
+        );
     }
 
     #[test]
     fn extract_key_with_field_number() {
         let doc = json!({"user_id": 42, "name": "test"});
-        assert_eq!(extract_key_impl("", Some("user_id"), &doc), "42");
+        assert_eq!(extract_key_impl("", Some("user_id"), &doc, None), "42");
     }
 
     #[test]
     fn extract_key_without_field_falls_back_to_uuid() {
         let doc = json!({"name": "test"});
-        let key = extract_key_impl("", None, &doc);
+        let key = extract_key_impl("", None, &doc, None);
         assert_eq!(key.len(), 36);
         uuid::Uuid::parse_str(&key).unwrap();
     }
@@ -157,8 +168,26 @@ mod tests {
     #[test]
     fn extract_key_with_missing_field() {
         let doc = json!({"id": "abc123"});
-        let key = extract_key_impl("pfx:", Some("missing_field"), &doc);
+        let key = extract_key_impl("pfx:", Some("missing_field"), &doc, None);
         assert!(key.starts_with("pfx:"));
         assert_eq!(key.len(), 40);
+    }
+
+    #[test]
+    fn extract_key_with_msg_id_falls_back_to_msg_id() {
+        let doc = json!({"name": "test"});
+        assert_eq!(
+            extract_key_impl("pfx:", None, &doc, Some("msg-7")),
+            "pfx:msg-7"
+        );
+    }
+
+    #[test]
+    fn extract_key_explicit_field_wins_over_msg_id() {
+        let doc = json!({"id": "abc123"});
+        assert_eq!(
+            extract_key_impl("pfx:", Some("id"), &doc, Some("msg-7")),
+            "pfx:abc123"
+        );
     }
 }

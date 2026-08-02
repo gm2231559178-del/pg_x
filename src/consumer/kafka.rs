@@ -69,6 +69,13 @@ pub mod kafka {
                 topic: self.topic.clone(),
                 payload,
                 headers,
+                message_id: Some(Self::kafka_message_id(
+                    msg.key()
+                        .map(|k| String::from_utf8_lossy(k).into_owned())
+                        .as_deref(),
+                    msg.partition(),
+                    msg.offset(),
+                )),
                 delivery_tag: Self::encode_tag(msg.partition(), msg.offset()),
             })
         }
@@ -79,6 +86,13 @@ pub mod kafka {
 
         fn decode_tag(tag: u64) -> (i32, i64) {
             ((tag >> 32) as i32, (tag & 0xFFFF_FFFF) as i64)
+        }
+
+        fn kafka_message_id(key: Option<&str>, partition: i32, offset: i64) -> String {
+            match key {
+                Some(k) if !k.is_empty() => k.to_string(),
+                _ => format!("{}:{}", partition, offset),
+            }
         }
     }
 
@@ -120,6 +134,29 @@ pub mod kafka {
                 self.ack(tag).await?;
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::KafkaConsumer;
+
+        #[test]
+        fn message_id_prefers_record_key() {
+            assert_eq!(
+                KafkaConsumer::kafka_message_id(Some("order-42"), 0, 17),
+                "order-42"
+            );
+        }
+
+        #[test]
+        fn message_id_falls_back_to_partition_offset() {
+            assert_eq!(KafkaConsumer::kafka_message_id(None, 3, 42), "3:42");
+        }
+
+        #[test]
+        fn message_id_ignores_empty_key() {
+            assert_eq!(KafkaConsumer::kafka_message_id(Some(""), 3, 42), "3:42");
         }
     }
 }

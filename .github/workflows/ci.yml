@@ -166,6 +166,10 @@ jobs:
       - name: Test consume KV command
         run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume_kv.sh
 
+      - name: Test consume idempotent command
+        run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_consume_idempotent.sh
+        timeout-minutes: 3
+
       - name: Test listen → rabbitmq → consume → elasticsearch
         run: DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" bash scripts/test_listen_consume_es.sh
         timeout-minutes: 3

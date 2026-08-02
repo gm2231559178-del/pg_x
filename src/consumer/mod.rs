@@ -4,3 +4,5 @@ pub mod r#trait;
 
 #[cfg(feature = "kv")]
 pub mod kv;
+
+pub mod dedupe;

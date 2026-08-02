@@ -5,8 +5,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
+use crate::consumer::dedupe::{spawn_dedup_sweeper, DedupCache};
 use crate::consumer::r#trait::{BrokerMessage, ConsumeSink, Consumer};
 use crate::downstream::contract::ContractMessage;
 use crate::graphql::{executor, pool::QueryConn, query::QueryLoader, schema::SchemaRegistry};
@@ -61,6 +63,15 @@ pub struct ConsumeArgs {
     /// Error mode: lenient (log + continue) or strict (nack + abort)
     #[arg(long, value_enum, default_value_t = ConsumeErrorMode::Lenient)]
     pub on_error: ConsumeErrorMode,
+
+    // ── Idempotence ──
+    /// Make redelivered messages harmless: dedupe recently seen message ids and
+    /// derive stable sink keys from the message id.
+    #[arg(long, default_value_t = false)]
+    pub idempotent: bool,
+    /// How long (seconds) to remember seen message ids for dedupe (default 900).
+    #[arg(long)]
+    pub dedup_ttl: Option<u64>,
 
     // ── Reconnection ──
     /// Max reconnect attempts (0 = infinite)
@@ -137,10 +148,24 @@ impl ConsumeSink for StdoutConsumeSink {
         "stdout"
     }
 
-    async fn send(&self, doc: &Value) -> Result<()> {
+    async fn send(&self, doc: &Value, _msg_id: Option<&str>) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(doc)?);
         Ok(())
     }
+}
+
+/// Elasticsearch `_id` for a composed document.
+///
+/// The explicit `--id-field` string value wins when present; otherwise the
+/// message id is used when idempotent mode is active; otherwise `None` (ES
+/// auto-generates the id).
+#[cfg(feature = "elasticsearch")]
+fn es_doc_id(id_field: Option<&str>, doc: &Value, msg_id: Option<&str>) -> Option<String> {
+    let explicit = id_field.and_then(|idf| match doc {
+        Value::Object(m) => m.get(idf).and_then(|v| v.as_str().map(|s| s.to_string())),
+        _ => None,
+    });
+    explicit.or_else(|| msg_id.map(|s| s.to_string()))
 }
 
 #[cfg(feature = "elasticsearch")]
@@ -162,11 +187,8 @@ impl ConsumeSink for ElasticsearchConsumeSink {
         "elasticsearch"
     }
 
-    async fn send(&self, doc: &Value) -> Result<()> {
-        let doc_id = self.id_field.as_ref().and_then(|idf| match doc {
-            Value::Object(m) => m.get(idf).and_then(|v| v.as_str().map(|s| s.to_string())),
-            _ => None,
-        });
+    async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
+        let doc_id = es_doc_id(self.id_field.as_deref(), doc, msg_id);
 
         self.bulk_buffer
             .push(&self.index, doc_id.as_deref(), doc)
@@ -189,11 +211,13 @@ impl ConsumeSink for WebhookConsumeSink {
         "webhook"
     }
 
-    async fn send(&self, doc: &Value) -> Result<()> {
-        let response = self
-            .client
-            .post(&self.url)
-            .json(doc)
+    async fn send(&self, doc: &Value, msg_id: Option<&str>) -> Result<()> {
+        let mut request = self.client.post(&self.url).json(doc);
+        if let Some(id) = msg_id {
+            request = request.header("Idempotency-Key", id);
+        }
+
+        let response = request
             .send()
             .await
             .with_context(|| format!("Webhook POST failed to {}", self.url))?;
@@ -333,6 +357,22 @@ async fn build_consumer(args: &ConsumeArgs) -> Result<Arc<dyn Consumer>> {
 
 // ── Variable extraction helpers ──────────────────────────────────────────────
 
+/// Whether `msg_id` was already seen by the dedupe cache.
+async fn is_duplicate(dedup: &Option<Arc<DedupCache>>, msg_id: Option<&str>) -> bool {
+    match (dedup, msg_id) {
+        (Some(cache), Some(id)) => cache.contains(id).await,
+        _ => false,
+    }
+}
+
+/// Record `msg_id` as processed. Only call after a successful sink send, so a
+/// redelivered message whose first attempt failed is still processed.
+async fn record_processed(dedup: &Option<Arc<DedupCache>>, msg_id: Option<&str>) {
+    if let (Some(cache), Some(id)) = (dedup, msg_id) {
+        cache.record(id).await;
+    }
+}
+
 /// Extract variables from a serde_json::Value (top-level object becomes variable map).
 fn data_to_variables(data: &Value) -> HashMap<String, Value> {
     match data {
@@ -405,6 +445,14 @@ pub async fn run(
                 args.on_error = em;
             }
         }
+        if !args.idempotent {
+            if let Some(true) = cfg.idempotent {
+                args.idempotent = true;
+            }
+        }
+        if args.dedup_ttl.is_none() {
+            args.dedup_ttl = cfg.dedup_ttl;
+        }
     }
 
     // Validate simple mode requires --query
@@ -432,6 +480,20 @@ pub async fn run(
     // ── Build sink (once) ────────────────────────────────────────────────────
     let sink: Arc<dyn ConsumeSink> = build_sink(&args).await?;
     info!("Using {} sink", sink.name());
+
+    // ── Dedupe cache (idempotent mode only) ──────────────────────────────────
+    let dedup: Option<Arc<DedupCache>> = if args.idempotent {
+        let ttl = Duration::from_secs(args.dedup_ttl.unwrap_or(900));
+        let cache = DedupCache::new(ttl);
+        spawn_dedup_sweeper(Arc::clone(&cache), ttl);
+        info!(
+            "Idempotent mode on (dedup_ttl={}s)",
+            args.dedup_ttl.unwrap_or(900)
+        );
+        Some(cache)
+    } else {
+        None
+    };
 
     // ── Consume loop with reconnection ───────────────────────────────────────
     info!(
@@ -543,6 +605,20 @@ pub async fn run(
 
             let tag = msg.delivery_tag;
             let topic = msg.topic.clone();
+            let msg_id = msg.message_id.as_deref();
+
+            // ── Dedupe: skip messages already processed ──────────────────────
+            if is_duplicate(&dedup, msg_id).await {
+                debug!(id = ?msg_id, topic = %topic, "Duplicate message, acking and skipping");
+                if let Err(e) = consumer.ack(tag).await {
+                    error!(error = %e, "Failed to ack duplicate message");
+                    if !consumer.is_connected() {
+                        session_failed = true;
+                        break Ok(());
+                    }
+                }
+                continue;
+            }
 
             // ── Resolve query name and variables ─────────────────────────────
             let (query_name, variables) = match args.query_mode {
@@ -608,7 +684,8 @@ pub async fn run(
             match doc {
                 Ok(doc) => {
                     // ── Send to sink ─────────────────────────────────────────
-                    if let Err(e) = sink.send(&doc).await {
+                    let sink_msg_id = if args.idempotent { msg_id } else { None };
+                    if let Err(e) = sink.send(&doc, sink_msg_id).await {
                         match args.on_error {
                             ConsumeErrorMode::Lenient => {
                                 warn!(error = %e, topic = %topic, query = %query_name, "Sink failed, skipping message");
@@ -622,6 +699,10 @@ pub async fn run(
                             }
                         }
                     }
+
+                    // ── Record as processed (before ack, so a failed ack still
+                    //    causes the redelivered message to be skipped) ────────
+                    record_processed(&dedup, msg_id).await;
 
                     // ── Acknowledge ──────────────────────────────────────────
                     if let Err(e) = consumer.ack(tag).await {
@@ -791,5 +872,101 @@ impl std::str::FromStr for ConsumeErrorMode {
                 "unknown error mode '{other}'; expected lenient|strict"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "elasticsearch")]
+mod tests {
+    use super::es_doc_id;
+    use serde_json::json;
+
+    #[test]
+    fn es_id_explicit_field_wins() {
+        let doc = json!({"mat_no": "M001", "name": "steel"});
+        assert_eq!(
+            es_doc_id(Some("mat_no"), &doc, Some("msg-7")),
+            Some("M001".into())
+        );
+    }
+
+    #[test]
+    fn es_id_falls_back_to_msg_id() {
+        let doc = json!({"name": "steel"});
+        assert_eq!(es_doc_id(None, &doc, Some("msg-7")), Some("msg-7".into()));
+        assert_eq!(
+            es_doc_id(Some("missing"), &doc, Some("msg-7")),
+            Some("msg-7".into())
+        );
+    }
+
+    #[test]
+    fn es_id_none_without_idempotence() {
+        let doc = json!({"name": "steel"});
+        assert_eq!(es_doc_id(None, &doc, None), None);
+    }
+
+    #[test]
+    fn es_id_ignores_non_string_field() {
+        let doc = json!({"mat_no": 42});
+        assert_eq!(
+            es_doc_id(Some("mat_no"), &doc, Some("msg-7")),
+            Some("msg-7".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod dedupe_ordering_tests {
+    use super::{is_duplicate, record_processed};
+    use crate::consumer::dedupe::DedupCache;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn cache() -> Option<Arc<DedupCache>> {
+        Some(DedupCache::new(Duration::from_secs(60)))
+    }
+
+    #[tokio::test]
+    async fn failed_send_is_not_recorded_so_redelivery_is_processed() {
+        let dedup = cache();
+
+        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
+
+        // First attempt fails (e.g. strict-mode sink error) — no record.
+        // The redelivered copy must therefore be processed again.
+
+        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
+    }
+
+    #[tokio::test]
+    async fn successful_send_is_recorded_and_redelivery_is_deduped() {
+        let dedup = cache();
+
+        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
+
+        // First attempt succeeds — record before ack.
+        record_processed(&dedup, Some("msg-1")).await;
+
+        // A redelivered copy is now a duplicate and gets acked + skipped.
+        assert!(is_duplicate(&dedup, Some("msg-1")).await);
+    }
+
+    #[tokio::test]
+    async fn no_msg_id_is_never_deduped() {
+        let dedup = cache();
+
+        assert!(!is_duplicate(&dedup, None).await);
+        record_processed(&dedup, None).await;
+        assert!(!is_duplicate(&dedup, None).await);
+    }
+
+    #[tokio::test]
+    async fn no_cache_is_never_deduped() {
+        let dedup: Option<Arc<DedupCache>> = None;
+
+        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
+        record_processed(&dedup, Some("msg-1")).await;
+        assert!(!is_duplicate(&dedup, Some("msg-1")).await);
     }
 }

@@ -135,11 +135,20 @@ pub mod rabbitmq {
                         "x-routing-key".to_string(),
                         delivery.routing_key.to_string(),
                     );
+                    let message_id = Some(rabbit_message_id(
+                        delivery
+                            .properties
+                            .message_id()
+                            .as_ref()
+                            .map(|s| s.as_str()),
+                        &payload,
+                    ));
 
                     Some(BrokerMessage {
                         topic: self.queue.clone(),
                         payload,
                         headers,
+                        message_id,
                         delivery_tag: delivery.delivery_tag,
                     })
                 }
@@ -174,6 +183,44 @@ pub mod rabbitmq {
                 )
                 .await
                 .context("Failed to nack message — channel may be closed by broker")
+        }
+    }
+
+    fn rabbit_message_id(property_id: Option<&str>, payload: &str) -> String {
+        match property_id {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(payload.as_bytes());
+                format!("{:x}", hasher.finalize())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::rabbit_message_id;
+
+        #[test]
+        fn message_id_prefers_amqp_property() {
+            assert_eq!(rabbit_message_id(Some("msg-1"), "anything"), "msg-1");
+        }
+
+        #[test]
+        fn message_id_hashes_payload_when_property_missing() {
+            assert_eq!(
+                rabbit_message_id(None, "hello"),
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            );
+        }
+
+        #[test]
+        fn message_id_ignores_empty_property() {
+            assert_eq!(
+                rabbit_message_id(Some(""), "hello"),
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+            );
         }
     }
 }

@@ -55,6 +55,8 @@ mode = "simple"
 # source = { type = "rabbitmq", amqp_url = "amqp://guest:guest@localhost:5672/%2F", queue = "pgx-events" }
 # sink = { type = "kv", url = "redis://localhost:6379", key_field = "id", key_prefix = "pgx:", ttl = 3600 }
 # query_mode = "contract"
+# idempotent = true
+# dedup_ttl = 900
 #
 # Consume and store in Memcached:
 #

@@ -210,6 +210,7 @@ pub mod rabbitmq {
                     BasicProperties::default()
                         .with_content_type("application/json".into())
                         .with_delivery_mode(2)
+                        .with_message_id(uuid::Uuid::new_v4().to_string().into())
                         .with_headers(amqp_headers),
                 )
                 .await

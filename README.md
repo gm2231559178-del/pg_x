@@ -602,6 +602,44 @@ pgx -U $DATABASE_URL consume \
 The key is constructed as `{key_prefix}{value_of_key_field}`. If `key_field` is
 not set or the field is missing, a random UUID is used as the suffix.
 
+#### Idempotent mode
+
+By default delivery is at-least-once: RabbitMQ redelivers unacked messages on
+crash or requeue, and Kafka redelivers any message whose offset was not
+committed before a crash. Redelivered messages are processed again, which can
+duplicate documents in the sink. Pass `--idempotent` (or set `idempotent = true`
+under `[connections.<name>.consume]`) to make redelivery harmless:
+
+```bash
+pgx -U $DATABASE_URL consume \
+  --source rabbitmq \
+  --queue pgx-events \
+  --sink elasticsearch \
+  --es-url http://localhost:9200 \
+  --idempotent
+```
+
+In idempotent mode `consume`:
+
+- **Dedupes in-process redeliveries.** A recently seen message is acked and
+  skipped before GraphQL composition. Message ids are remembered for
+  `--dedup-ttl <secs>` (default 900). The cache is in-memory and per-process.
+- **Derives stable sink keys from the message id.** When no explicit `--id-field`
+  (Elasticsearch) or `--key-field` (KV) is configured, the sink key falls back
+  to the message id instead of a random UUID — so ES and KV overwrite the same
+  document/key on redelivery even across restarts. Explicit key fields still
+  win when set.
+- **Webhook POSTs carry an `Idempotency-Key: <message-id>` header.**
+
+Message identity is stable across redelivery: Kafka records use the record key
+(or `partition:offset`), RabbitMQ messages use the AMQP `message_id` property
+(set automatically when publishing via `listen`) with a payload-hash fallback.
+
+| Flag           | Description                                            | Default |
+| -------------- | ------------------------------------------------------ | ------- |
+| `--idempotent` | Dedupe redelivered messages and derive stable sink keys | off     |
+| `--dedup-ttl`  | How long (seconds) to remember seen message ids        | `900`   |
+
 ---
 
 ## Other commands

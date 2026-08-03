@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{
-    ReplicateArgs, ReplicateDownstreamCommand, PGX_LSN, PGX_OP, PGX_PAYLOAD, PGX_SCHEMA, PGX_TABLE,
-};
+use super::{ReplicateArgs, ReplicateDownstreamCommand, PGX_PAYLOAD};
+#[cfg(feature = "rabbitmq")]
+use super::{PGX_LSN, PGX_OP, PGX_SCHEMA, PGX_TABLE};
 use crate::utils::config::DownstreamSinkKind;
 
 #[async_trait::async_trait]

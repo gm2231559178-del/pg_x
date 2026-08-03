@@ -5,6 +5,7 @@ pub enum NativeId {
     /// A broker-provided key/property (Kafka record key, AMQP `message_id`).
     Provided(String),
     /// Kafka's stable record position — rendered as `<partition>:<offset>`.
+    #[cfg(feature = "kafka")]
     KafkaPosition(i32, i64),
     /// No native identity available (e.g. an AMQP delivery without a
     /// `message_id` property).
@@ -21,6 +22,7 @@ pub fn derive_message_id(source: NativeId) -> Option<String> {
     match source {
         NativeId::Provided(id) if !id.is_empty() => Some(id),
         NativeId::Provided(_) => None,
+        #[cfg(feature = "kafka")]
         NativeId::KafkaPosition(partition, offset) => Some(format!("{partition}:{offset}")),
         NativeId::None => None,
     }
@@ -41,6 +43,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "kafka")]
     #[test]
     fn kafka_position_is_stable_across_redelivery() {
         let id = derive_message_id(NativeId::KafkaPosition(3, 42));

@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+#[cfg(feature = "elasticsearch")]
+use anyhow::Context;
+use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
 
 use std::collections::HashMap;

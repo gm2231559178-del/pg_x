@@ -29,26 +29,31 @@ pub struct DeliveryTag(u64);
 
 impl DeliveryTag {
     /// Wrap a broker-native tag that fits in a `u64` (e.g. an AMQP delivery tag).
+    #[cfg(any(feature = "kafka", feature = "rabbitmq", test))]
     pub fn from_u64(tag: u64) -> Self {
         Self(tag)
     }
 
+    #[cfg(any(feature = "kafka", feature = "rabbitmq"))]
     pub fn as_u64(&self) -> u64 {
         self.0
     }
 
     /// Encode a Kafka `(partition, offset)` record position.
+    #[cfg(feature = "kafka")]
     pub fn kafka(partition: i32, offset: i64) -> Self {
         Self(((partition as u64) << 32) | (offset as u64))
     }
 
     /// Decode a Kafka `(partition, offset)` record position.
+    #[cfg(feature = "kafka")]
     pub fn kafka_position(&self) -> (i32, i64) {
         ((self.0 >> 32) as i32, (self.0 & 0xFFFF_FFFF) as i64)
     }
 }
 
 /// Outcome of [`Consumer::recv`]: a message, or a closed consumer.
+#[allow(dead_code)]
 pub enum RecvOutcome {
     /// A message arrived.
     Message(BrokerMessage),

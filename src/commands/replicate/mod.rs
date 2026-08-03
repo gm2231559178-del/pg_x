@@ -76,7 +76,9 @@ mod sinks;
 mod table_prefix;
 mod transforms;
 
-pub(crate) use replicate_session::{PGX_LSN, PGX_OP, PGX_PAYLOAD, PGX_SCHEMA, PGX_TABLE};
+pub(crate) use replicate_session::PGX_PAYLOAD;
+#[cfg(any(feature = "rabbitmq", feature = "parquet"))]
+pub(crate) use replicate_session::{PGX_LSN, PGX_OP, PGX_SCHEMA, PGX_TABLE};
 
 mod replicate_session;
 

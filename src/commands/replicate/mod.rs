@@ -75,17 +75,18 @@ mod parquet;
 mod sinks;
 mod transforms;
 
+pub(crate) use replicate_session::{PGX_LSN, PGX_OP, PGX_PAYLOAD, PGX_SCHEMA, PGX_TABLE};
+
+mod replicate_session;
+
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::replication::{
-    client::{ReplicationClient, ReplicationConfig, ReplicationEvent},
-    decoder::{decode_pgoutput, RelationCache},
-    event::{qualified_name, WalEvent},
+    client::{ReplicationClient, ReplicationConfig},
     lsn::Lsn,
     slot,
 };
@@ -96,6 +97,7 @@ use crate::utils::tls;
 
 use self::applier::PostgresApplier;
 use self::filter::RowFilter;
+use self::replicate_session::{Applier, ReplicateSession, ReplicateSessionConfig};
 use self::sinks::build_fan_out_sink;
 use self::transforms::{parse_drop_cols_arg, parse_rename_arg, ColumnTransforms, TableTransform};
 
@@ -348,155 +350,6 @@ fn parse_postgres_url(url: &str) -> Result<(String, u16, String, String, String)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Filter helpers (table name, op)
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn table_matches(schema: &str, table: &str, filter: &[String]) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
-    let qualified = qualified_name(schema, table);
-    filter.iter().any(|f| f == table || f == &qualified)
-}
-
-fn op_matches(op: &str, filter: &[OpFilter]) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
-    filter.iter().any(|f| match f {
-        OpFilter::Insert => op == "insert",
-        OpFilter::Update => op == "update",
-        OpFilter::Delete => op == "delete",
-        OpFilter::Truncate => op == "truncate",
-    })
-}
-
-fn should_forward(event: &WalEvent, args: &ReplicateArgs, row_filter: &RowFilter) -> bool {
-    match event {
-        WalEvent::Insert { schema, table, .. }
-        | WalEvent::Update { schema, table, .. }
-        | WalEvent::Delete { schema, table, .. } => {
-            let op = event.op_label().to_lowercase();
-            table_matches(schema, table, &args.tables)
-                && op_matches(&op, &args.ops)
-                && row_filter.should_forward(event)
-        }
-        WalEvent::Truncate { tables, .. } => {
-            op_matches("truncate", &args.ops)
-                && (args.tables.is_empty()
-                    || tables.iter().any(|t| args.tables.iter().any(|f| f == t)))
-        }
-        WalEvent::Begin { .. } | WalEvent::Commit { .. } => args.emit_txn_boundaries,
-        WalEvent::Relation { .. } => args.emit_schema,
-        WalEvent::Keepalive { .. } => false,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Event → env-var map (for shell sinks)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Env-var keys used to pass WAL event fields to child processes (single
-/// source of truth; the shell/AMQP sinks and parquet/iceberg sinks read these).
-pub(crate) const PGX_OP: &str = "PGX_OP";
-pub(crate) const PGX_SCHEMA: &str = "PGX_SCHEMA";
-pub(crate) const PGX_TABLE: &str = "PGX_TABLE";
-pub(crate) const PGX_LSN: &str = "PGX_LSN";
-pub(crate) const PGX_NEW: &str = "PGX_NEW";
-pub(crate) const PGX_OLD: &str = "PGX_OLD";
-pub(crate) const PGX_XID: &str = "PGX_XID";
-pub(crate) const PGX_TABLES: &str = "PGX_TABLES";
-pub(crate) const PGX_PAYLOAD: &str = "PGX_PAYLOAD";
-
-fn json_or_dash(v: &impl serde::Serialize) -> String {
-    match serde_json::to_string(v) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize row for event_env");
-            String::new()
-        }
-    }
-}
-
-fn event_env(event: &WalEvent, lsn_str: &str) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-    env.insert(PGX_OP.to_string(), event.op_label().to_lowercase());
-    env.insert(PGX_LSN.to_string(), lsn_str.to_string());
-
-    match event {
-        WalEvent::Insert {
-            schema, table, new, ..
-        } => {
-            env.insert(PGX_SCHEMA.to_string(), schema.clone());
-            env.insert(PGX_TABLE.to_string(), table.clone());
-            env.insert(PGX_NEW.to_string(), json_or_dash(new));
-        }
-        WalEvent::Update {
-            schema,
-            table,
-            new,
-            old,
-            ..
-        } => {
-            env.insert(PGX_SCHEMA.to_string(), schema.clone());
-            env.insert(PGX_TABLE.to_string(), table.clone());
-            env.insert(PGX_NEW.to_string(), json_or_dash(new));
-            if let Some(o) = old {
-                env.insert(PGX_OLD.to_string(), json_or_dash(o));
-            }
-        }
-        WalEvent::Delete {
-            schema, table, old, ..
-        } => {
-            env.insert(PGX_SCHEMA.to_string(), schema.clone());
-            env.insert(PGX_TABLE.to_string(), table.clone());
-            env.insert(PGX_OLD.to_string(), json_or_dash(old));
-        }
-        WalEvent::Truncate { tables, .. } => {
-            env.insert(PGX_TABLES.to_string(), tables.join(","));
-        }
-        WalEvent::Begin { xid, .. } => {
-            env.insert(PGX_XID.to_string(), xid.to_string());
-        }
-        _ => {}
-    }
-    env
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Console log helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn log_event(event: &WalEvent, lsn_str: &str) {
-    match event {
-        WalEvent::Insert { schema, table, .. } => debug!(
-            op = "insert", schema = %schema, table = %table, lsn = %lsn_str, "WAL event"
-        ),
-        WalEvent::Update { schema, table, .. } => debug!(
-            op = "update", schema = %schema, table = %table, lsn = %lsn_str, "WAL event"
-        ),
-        WalEvent::Delete { schema, table, .. } => debug!(
-            op = "delete", schema = %schema, table = %table, lsn = %lsn_str, "WAL event"
-        ),
-        WalEvent::Truncate { tables, .. } => debug!(
-            op = "truncate", tables = %tables.join(", "), lsn = %lsn_str, "WAL event"
-        ),
-        WalEvent::Begin { xid, .. } => debug!(op = "begin", xid, "WAL event"),
-        WalEvent::Commit { .. } => debug!(op = "commit", lsn = %lsn_str, "WAL event"),
-        WalEvent::Relation {
-            schema,
-            table,
-            columns,
-            ..
-        } => debug!(
-            op = "relation", schema = %schema, table = %table,
-            col_count = columns.len(), "WAL schema event"
-        ),
-        WalEvent::Keepalive { .. } => {}
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Main entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -744,9 +597,16 @@ pub async fn run(
 
     // ── 4. Reconnection loop ──────────────────────────────────────────────────
 
-    let args = Arc::new(args);
+    let session_config = ReplicateSessionConfig {
+        emit_txn_boundaries: args.emit_txn_boundaries,
+        emit_schema: args.emit_schema,
+        tables: args.tables.clone(),
+        ops: args.ops.clone(),
+    };
     let resume_lsn = Arc::new(tokio::sync::Mutex::new(initial_lsn));
-    let pg_applier = Arc::new(tokio::sync::Mutex::new(pg_applier));
+    let pg_applier: Arc<tokio::sync::Mutex<Option<Box<dyn Applier>>>> = Arc::new(
+        tokio::sync::Mutex::new(pg_applier.map(|a| Box::new(a) as Box<dyn Applier>)),
+    );
 
     let reconnect = ReconnectConfig {
         max_attempts: max_reconnect_attempts,
@@ -758,7 +618,7 @@ pub async fn run(
 
     session_loop::run(
         move |shutdown| {
-            let args = args.clone();
+            let session_config = session_config.clone();
             let sink = sink_for_session.clone();
             let base_cfg = base_cfg.clone();
             let row_filter = row_filter.clone();
@@ -766,7 +626,6 @@ pub async fn run(
             let pub_names = pub_names.clone();
             let resume_lsn = resume_lsn.clone();
             let pg_applier = pg_applier.clone();
-            let initial_lsn = initial_lsn;
 
             async move {
                 let mut shutdown = shutdown;
@@ -788,156 +647,16 @@ pub async fn run(
                     }
                 };
 
-                // ── 5. Main event loop ────────────────────────────────────────
-                let mut rel_cache = RelationCache::new();
-                let mut clean_exit = false;
-                let mut applier_guard = pg_applier.lock().await;
-                let mut applier = applier_guard.as_mut();
-
-                const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-                loop {
-                    let ev = tokio::select! {
-                        biased;
-
-                        _ = shutdown.wait() => {
-                            info!("Signal received, stopping replication");
-                            repl_client.stop();
-                            clean_exit = true;
-                            break;
-                        }
-
-                        _ = tokio::time::sleep(RECV_TIMEOUT) => {
-                            warn!("Replication stream idle for 60s, reconnecting");
-                            repl_client.stop();
-                            break;
-                        }
-
-                        result = repl_client.recv() => result,
-                    };
-
-                    match ev {
-                        Ok(None) => {
-                            clean_exit = true;
-                            break;
-                        }
-
-                        Err(e) => {
-                            error!(error = %e, "Replication error");
-                            break;
-                        }
-
-                        Ok(Some(ev)) => match ev {
-                            ReplicationEvent::KeepAlive { wal_end } => {
-                                repl_client.update_applied_lsn(wal_end);
-                            }
-
-                            ReplicationEvent::Begin {
-                                final_lsn,
-                                xid,
-                                commit_time,
-                            } => {
-                                if let Some(applier) = applier.as_deref_mut() {
-                                    applier.handle_begin();
-                                }
-
-                                if args.emit_txn_boundaries {
-                                    let event = WalEvent::Begin {
-                                        lsn: final_lsn.to_string(),
-                                        commit_time,
-                                        xid,
-                                    };
-                                    log_event(&event, &final_lsn.to_string());
-                                    let env = event_env(&event, &final_lsn.to_string());
-                                    if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
-                                        error!(error = %e, "Downstream send failed (Begin); LSN not advanced");
-                                        continue;
-                                    }
-                                }
-                                repl_client.update_applied_lsn(final_lsn);
-                            }
-
-                            ReplicationEvent::Commit {
-                                lsn,
-                                end_lsn,
-                                commit_time,
-                            } => {
-                                if let Some(applier) = applier.as_deref_mut() {
-                                    if let Err(e) = applier.handle_commit().await {
-                                        error!(error = %e, "PG applier commit failed; LSN not advanced");
-                                        continue;
-                                    }
-                                }
-
-                                if args.emit_txn_boundaries {
-                                    let event = WalEvent::Commit {
-                                        lsn: lsn.to_string(),
-                                        end_lsn: end_lsn.to_string(),
-                                        commit_time,
-                                    };
-                                    log_event(&event, &end_lsn.to_string());
-                                    let env = event_env(&event, &end_lsn.to_string());
-                                    if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
-                                        error!(error = %e, "Downstream send failed (Commit); LSN not advanced");
-                                        continue;
-                                    }
-                                }
-                                repl_client.update_applied_lsn(end_lsn);
-                            }
-
-                            ReplicationEvent::XLogData { data, wal_end, .. } => {
-                                let lsn_str = wal_end.to_string();
-                                let is_pg_active = applier.is_some();
-
-                                match decode_pgoutput(&data, &mut rel_cache) {
-                                    Ok(Some(mut event)) => {
-                                        let forward = should_forward(&event, &args, &row_filter);
-
-                                        transforms.apply(&mut event);
-
-                                        log_event(&event, &lsn_str);
-
-                                        if let Some(applier) = applier.as_deref_mut() {
-                                            if let Err(e) = applier.handle_event(&event).await {
-                                                error!(error = %e, "PG applier event failed; LSN not advanced");
-                                                continue;
-                                            }
-                                        }
-
-                                        if forward {
-                                            let env = event_env(&event, &lsn_str);
-                                            if let Err(e) = sink.send_wal(&event.to_json(), &env).await {
-                                                error!(sink = sink.name(), error = %e, "Downstream send failed; LSN not advanced");
-                                                continue;
-                                            }
-                                        }
-
-                                        if !is_pg_active {
-                                            repl_client.update_applied_lsn(wal_end);
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        repl_client.update_applied_lsn(wal_end);
-                                    }
-                                    Err(e) => {
-                                        error!(error = %e, "WAL decode error; LSN not advanced");
-                                    }
-                                }
-                            }
-                        },
-                    }
-                }
-
-                let last_applied = repl_client.last_applied_lsn();
-                *resume_lsn.lock().await = last_applied;
-
-                if clean_exit {
-                    SessionExit::Shutdown
-                } else if last_applied != initial_lsn {
-                    SessionExit::ReconnectAfterHealthy
-                } else {
-                    SessionExit::Reconnect
-                }
+                // ── 5. Run one session (decode → filter → transform → deliver) ──
+                let mut session = ReplicateSession::new(
+                    session_config,
+                    row_filter,
+                    transforms,
+                    sink,
+                    pg_applier,
+                    resume_lsn,
+                );
+                session.run(&mut repl_client, &mut shutdown).await
             }
         },
         shutdown_signal(),

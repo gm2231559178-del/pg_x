@@ -35,6 +35,14 @@ pub struct ReconnectConfig {
 pub struct Shutdown(watch::Receiver<bool>);
 
 impl Shutdown {
+    /// Build a shutdown handle from a watch receiver. `run()` constructs the
+    /// shared handle internally; a constructor is exposed so tests can drive a
+    /// session directly.
+    #[cfg(test)]
+    pub(crate) fn from_receiver(rx: watch::Receiver<bool>) -> Self {
+        Self(rx)
+    }
+
     /// Resolves when shutdown is signalled (or the signal task is dropped).
     pub async fn wait(&mut self) {
         if *self.0.borrow() {

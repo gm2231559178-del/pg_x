@@ -86,7 +86,7 @@ impl Downstream for ElasticsearchDownstream {
             query,
             &variables,
             &self.resolvers,
-            &self.pool,
+            self.pool.as_ref(),
             self.max_depth,
         )
         .await?;

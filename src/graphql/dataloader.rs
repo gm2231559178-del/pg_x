@@ -3,9 +3,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::batch::batch_key;
 use super::pool::GlobalDataCache;
-use super::pool::QueryConn;
-use super::row::cell_as_string;
+use super::runner::QueryRunner;
 
 type Key = String;
 
@@ -50,15 +50,15 @@ impl DataLoader {
     }
 
     /// Add a key value from a parent row to the batch as a JSON Value.
-    /// Supports String, Number, Bool - converts to string representation for SQL ANY($1).
+    /// Supports String, Number, Bool - converted to string representation for SQL ANY($1).
     pub fn add_key(&mut self, key: &Value) {
-        let s = value_to_key(key);
+        let s = batch_key(key);
         self.keys.push(s);
     }
 
     /// Execute the batched SQL query and group results by key.
     /// Checks the global cache first; on cache miss, queries and caches.
-    pub async fn execute(&mut self, pool: &QueryConn) -> Result<()> {
+    pub async fn execute(&mut self, runner: &dyn QueryRunner) -> Result<()> {
         if self.resolved {
             return Ok(());
         }
@@ -71,8 +71,6 @@ impl DataLoader {
                 .cloned()
                 .collect()
         };
-
-        let unique_key_refs: Vec<&str> = unique_keys.iter().map(|s| s.as_str()).collect();
 
         if unique_keys.is_empty() {
             self.resolved = true;
@@ -88,14 +86,13 @@ impl DataLoader {
             }
         }
 
-        let rows = pool.query_cached(&self.sql, &[&unique_key_refs]).await?;
+        let rows = runner.run_rows(&self.sql, &unique_keys).await?;
 
         let result_key_col = self.result_key.as_deref().unwrap_or(&self.batch_by);
 
-        for row in &rows {
-            let key = cell_as_string(row, result_key_col).unwrap_or_default();
-            let json_row = super::row::row_to_json_value(row)?;
-            self.cached.entry(key).or_default().push(json_row);
+        for obj in &rows {
+            let key = obj.get(result_key_col).map(batch_key).unwrap_or_default();
+            self.cached.entry(key).or_default().push(obj.clone());
         }
 
         // Store in global cache
@@ -110,15 +107,5 @@ impl DataLoader {
     /// Get children for a specific parent key.
     pub fn get_children(&self, key: &str) -> Vec<Value> {
         self.cached.get(key).cloned().unwrap_or_default()
-    }
-}
-
-fn value_to_key(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => String::new(),
-        _ => v.to_string(),
     }
 }

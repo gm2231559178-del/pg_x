@@ -15,7 +15,8 @@ pub mod rabbitmq {
     use std::collections::HashMap;
     use tracing::warn;
 
-    use super::super::r#trait::{BrokerMessage, Consumer};
+    use super::super::message_id::{derive_message_id, NativeId};
+    use super::super::r#trait::{BrokerMessage, Consumer, DeliveryTag, RecvOutcome};
 
     pub struct RabbitMqConsumer {
         #[allow(dead_code)]
@@ -120,11 +121,7 @@ pub mod rabbitmq {
             "rabbitmq"
         }
 
-        fn is_connected(&self) -> bool {
-            self.channel.status().connected() && self.connection.status().connected()
-        }
-
-        async fn recv(&self) -> Option<BrokerMessage> {
+        async fn recv(&self) -> Result<RecvOutcome> {
             let mut guard = self.consumer.lock().await;
             match guard.next().await {
                 Some(Ok(delivery)) => {
@@ -135,47 +132,43 @@ pub mod rabbitmq {
                         "x-routing-key".to_string(),
                         delivery.routing_key.to_string(),
                     );
-                    let message_id = Some(rabbit_message_id(
+                    let message_id = rabbit_message_id(
                         delivery
                             .properties
                             .message_id()
                             .as_ref()
                             .map(|s| s.as_str()),
-                        &payload,
-                    ));
+                    );
 
-                    Some(BrokerMessage {
+                    Ok(RecvOutcome::Message(BrokerMessage {
                         topic: self.queue.clone(),
                         payload,
                         headers,
                         message_id,
-                        delivery_tag: delivery.delivery_tag,
-                    })
+                        delivery_tag: DeliveryTag::from_u64(delivery.delivery_tag),
+                    }))
                 }
-                Some(Err(e)) => {
-                    warn!(error = %e, "RabbitMQ consumer stream error");
-                    None
-                }
+                Some(Err(e)) => Err(e).context("RabbitMQ consumer stream error"),
                 None => {
                     // Stream ended — channel/connection closed by broker
                     // (e.g. PRECONDITION_FAILED ack timeout) or network failure.
                     warn!("RabbitMQ consumer stream ended (channel may be closed by broker)");
-                    None
+                    Ok(RecvOutcome::Closed)
                 }
             }
         }
 
-        async fn ack(&self, tag: u64) -> Result<()> {
+        async fn ack(&self, tag: DeliveryTag) -> Result<()> {
             self.channel
-                .basic_ack(tag, BasicAckOptions::default())
+                .basic_ack(tag.as_u64(), BasicAckOptions::default())
                 .await
                 .context("Failed to ack message — channel may be closed by broker (e.g. ack timeout exceeded)")
         }
 
-        async fn nack(&self, tag: u64, requeue: bool) -> Result<()> {
+        async fn nack(&self, tag: DeliveryTag, requeue: bool) -> Result<()> {
             self.channel
                 .basic_nack(
-                    tag,
+                    tag.as_u64(),
                     BasicNackOptions {
                         requeue,
                         multiple: false,
@@ -186,41 +179,45 @@ pub mod rabbitmq {
         }
     }
 
-    fn rabbit_message_id(property_id: Option<&str>, payload: &str) -> String {
-        match property_id {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => {
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                hasher.update(payload.as_bytes());
-                format!("{:x}", hasher.finalize())
-            }
-        }
+    /// Derive the stable identity for dedupe from the AMQP `message_id`
+    /// property. `None` when the property is missing or empty — there is
+    /// deliberately no payload-hash fallback, since two distinct messages with
+    /// identical bodies would otherwise falsely dedupe.
+    fn rabbit_message_id(property_id: Option<&str>) -> Option<String> {
+        let source = match property_id {
+            Some(id) if !id.is_empty() => NativeId::Provided(id.to_string()),
+            _ => NativeId::None,
+        };
+        derive_message_id(source)
     }
 
     #[cfg(test)]
     mod tests {
         use super::rabbit_message_id;
+        use crate::consumer::r#trait::DeliveryTag;
 
         #[test]
         fn message_id_prefers_amqp_property() {
-            assert_eq!(rabbit_message_id(Some("msg-1"), "anything"), "msg-1");
+            assert_eq!(rabbit_message_id(Some("msg-1")), Some("msg-1".to_string()));
         }
 
         #[test]
-        fn message_id_hashes_payload_when_property_missing() {
-            assert_eq!(
-                rabbit_message_id(None, "hello"),
-                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-            );
+        fn message_id_is_none_when_property_missing() {
+            // No payload hash: identical bodies must not share an identity.
+            assert_eq!(rabbit_message_id(None), None);
         }
 
         #[test]
         fn message_id_ignores_empty_property() {
-            assert_eq!(
-                rabbit_message_id(Some(""), "hello"),
-                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-            );
+            assert_eq!(rabbit_message_id(Some("")), None);
+        }
+
+        #[test]
+        fn delivery_tag_round_trips_u64() {
+            for tag in [0, 1, 42, u32::MAX as u64, u64::MAX] {
+                let t = DeliveryTag::from_u64(tag);
+                assert_eq!(t.as_u64(), tag);
+            }
         }
     }
 }

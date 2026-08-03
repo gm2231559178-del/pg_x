@@ -11,7 +11,9 @@ use crate::commands::consume_session::{Compose, ConsumeSession};
 use crate::consumer::r#trait::{ConsumeSink, Consumer};
 use crate::graphql::query::{NamedQuery, QueryLoader};
 use crate::graphql::{executor, pool::QueryConn, schema::SchemaRegistry};
-use crate::utils::config::{Connection, ConsumeSinkKind, ConsumeSourceKind, ResolverConfig};
+use crate::utils::config::{
+    Connection, ConsumeConfig, ConsumeSinkKind, ConsumeSourceKind, ResolverConfig,
+};
 use crate::utils::session_loop::{self, ReconnectConfig, SessionExit};
 use crate::utils::signal::shutdown_signal;
 
@@ -47,22 +49,22 @@ pub struct ConsumeArgs {
 
     // ── Query ──
     /// Query mode: contract (name from message event_type) or simple (fixed --query)
-    #[arg(long, value_enum, default_value_t = ConsumeQueryMode::Contract)]
-    pub query_mode: ConsumeQueryMode,
+    #[arg(long, value_enum)]
+    pub query_mode: Option<ConsumeQueryMode>,
     /// Query name (required in simple mode)
     #[arg(long)]
     pub query: Option<String>,
     /// Max resolver recursion depth
-    #[arg(long, default_value_t = 8)]
-    pub max_depth: u32,
+    #[arg(long)]
+    pub max_depth: Option<u32>,
     /// Schema directory (defaults to ~/.pgx/schema)
     #[arg(long)]
     pub schema_dir: Option<String>,
 
     // ── Error handling ──
     /// Error mode: lenient (log + continue) or strict (nack + abort)
-    #[arg(long, value_enum, default_value_t = ConsumeErrorMode::Lenient)]
-    pub on_error: ConsumeErrorMode,
+    #[arg(long, value_enum)]
+    pub on_error: Option<ConsumeErrorMode>,
 
     // ── Idempotence ──
     /// Make redelivered messages harmless: dedupe recently seen message ids and
@@ -104,11 +106,11 @@ pub struct ConsumeArgs {
     #[arg(long)]
     pub key_field: Option<String>,
     /// Prefix to prepend to the cache key
-    #[arg(long, default_value = "pgx:")]
-    pub key_prefix: String,
+    #[arg(long)]
+    pub key_prefix: Option<String>,
     /// TTL in seconds (0 = no expiry)
-    #[arg(long, default_value_t = 0)]
-    pub ttl: u64,
+    #[arg(long)]
+    pub ttl: Option<u64>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -126,16 +128,64 @@ pub enum ConsumeSinkType {
     Kv,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum ConsumeQueryMode {
     Simple,
     Contract,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum ConsumeErrorMode {
     Lenient,
     Strict,
+}
+
+/// The stage of the per-message pipeline where a failure occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorStage {
+    /// The payload did not parse as a contract message (contract mode only).
+    Parse,
+    /// No named query matched the message's event type.
+    Lookup,
+    /// GraphQL execution failed while composing the document.
+    Compose,
+    /// Delivery to the sink failed.
+    Sink,
+}
+
+/// The control-flow decision produced by the error policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorAction {
+    /// Nack without requeue and continue; the message is dropped.
+    Discard,
+    /// Nack with requeue and continue; the broker redelivers the message.
+    Requeue,
+    /// Nack with requeue and stop the session with the caller's error.
+    Abort,
+}
+
+impl ConsumeErrorMode {
+    /// One error policy for the consume session. Stage × mode → decision.
+    ///
+    /// | stage   | lenient | strict |
+    /// |---------|---------|--------|
+    /// | Parse   | Discard | Abort  |
+    /// | Lookup  | Discard | Abort  |
+    /// | Compose | Discard | Abort  |
+    /// | Sink    | Requeue | Abort  |
+    ///
+    /// Per-message failures (parse, lookup, compose) are dropped in lenient
+    /// mode: the message itself is unusable, so redelivering it would fail
+    /// identically. A sink failure is transient, so lenient mode requeues
+    /// rather than silently discarding a durable event. Strict mode aborts
+    /// the session on any failure so nothing is dropped unseen.
+    pub(crate) fn handle(&self, stage: ErrorStage) -> ErrorAction {
+        match (self, stage) {
+            (ConsumeErrorMode::Lenient, ErrorStage::Sink) => ErrorAction::Requeue,
+            (ConsumeErrorMode::Lenient, _) => ErrorAction::Discard,
+            (ConsumeErrorMode::Strict, _) => ErrorAction::Abort,
+        }
+    }
 }
 
 // ── Sink implementations ──────────────────────────────────────────────────────
@@ -253,9 +303,13 @@ async fn build_sink(args: &ConsumeArgs) -> Result<Arc<dyn ConsumeSink>> {
         #[cfg(feature = "kv")]
         ConsumeSinkType::Kv => {
             let url = args.kv_url.as_deref().unwrap_or("redis://localhost:6379");
-            let sink =
-                KvConsumeSink::connect(url, &args.key_prefix, args.key_field.clone(), args.ttl)
-                    .await?;
+            let sink = KvConsumeSink::connect(
+                url,
+                args.key_prefix.as_deref().unwrap_or("pgx:"),
+                args.key_field.clone(),
+                args.ttl.unwrap_or(0),
+            )
+            .await?;
             Ok(Arc::new(sink))
         }
 
@@ -349,6 +403,59 @@ fn resolve_schema_dir(override_dir: Option<&str>) -> Result<PathBuf> {
     Ok(home.join(".pgx").join("schema"))
 }
 
+// ── Effective consume config ─────────────────────────────────────────────────
+
+/// Consume settings after merging CLI flags with connection-level config, then
+/// built-in defaults. Produced once by explicit precedence rules (explicit CLI
+/// wins over config, which wins over defaults); no code compares against clap
+/// defaults, so a default can move without silently breaking the merge.
+struct EffectiveConsumeConfig {
+    query: Option<String>,
+    schema_dir: Option<String>,
+    max_depth: u32,
+    query_mode: ConsumeQueryMode,
+    on_error: ConsumeErrorMode,
+    idempotent: bool,
+    dedup_ttl: Option<u64>,
+}
+
+impl EffectiveConsumeConfig {
+    fn merge(cli: &ConsumeArgs, cfg: Option<&ConsumeConfig>) -> Self {
+        let max_depth = cli.max_depth.or(cfg.and_then(|c| c.max_depth)).unwrap_or(8);
+        let query_mode = cli
+            .query_mode
+            .clone()
+            .or_else(|| {
+                cfg.and_then(|c| c.query_mode.as_deref())
+                    .and_then(|m| m.parse::<ConsumeQueryMode>().ok())
+            })
+            .unwrap_or(ConsumeQueryMode::Contract);
+        let on_error = cli
+            .on_error
+            .clone()
+            .or_else(|| {
+                cfg.and_then(|c| c.on_error.as_deref())
+                    .and_then(|m| m.parse::<ConsumeErrorMode>().ok())
+            })
+            .unwrap_or(ConsumeErrorMode::Lenient);
+        Self {
+            query: cli
+                .query
+                .clone()
+                .or_else(|| cfg.and_then(|c| c.query.clone())),
+            schema_dir: cli
+                .schema_dir
+                .clone()
+                .or_else(|| cfg.and_then(|c| c.schema_dir.clone())),
+            max_depth,
+            query_mode,
+            on_error,
+            idempotent: cli.idempotent || cfg.is_some_and(|c| c.idempotent.unwrap_or(false)),
+            dedup_ttl: cli.dedup_ttl.or(cfg.and_then(|c| c.dedup_ttl)),
+        }
+    }
+}
+
 // ── Run ─────────────────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -358,8 +465,9 @@ pub async fn run(
     use_tls: bool,
     resolvers: &HashMap<String, ResolverConfig>,
 ) -> Result<()> {
-    // ── Merge connection-level defaults into CLI args ────────────────────────
-    if let Some(cfg) = conn.and_then(|c| c.consume.as_ref()) {
+    // ── Merge connection-level defaults into an effective config ────────────
+    let cfg = conn.and_then(|c| c.consume.as_ref());
+    if let Some(cfg) = cfg {
         // Source defaults
         args.source = match cfg.source {
             ConsumeSourceKind::Rabbitmq { .. } => ConsumeSourceType::Rabbitmq,
@@ -367,45 +475,16 @@ pub async fn run(
         };
         merge_source_config(&mut args, &cfg.source);
         merge_sink_config(&mut args, &cfg.sink);
-
-        if args.query.is_none() && cfg.query.is_some() {
-            args.query = cfg.query.clone();
-        }
-        if args.schema_dir.is_none() {
-            args.schema_dir = cfg.schema_dir.clone();
-        }
-        if args.max_depth == 8 {
-            if let Some(d) = cfg.max_depth {
-                args.max_depth = d;
-            }
-        }
-        if let Some(m) = &cfg.query_mode {
-            if let Ok(qm) = m.parse::<ConsumeQueryMode>() {
-                args.query_mode = qm;
-            }
-        }
-        if let Some(m) = &cfg.on_error {
-            if let Ok(em) = m.parse::<ConsumeErrorMode>() {
-                args.on_error = em;
-            }
-        }
-        if !args.idempotent {
-            if let Some(true) = cfg.idempotent {
-                args.idempotent = true;
-            }
-        }
-        if args.dedup_ttl.is_none() {
-            args.dedup_ttl = cfg.dedup_ttl;
-        }
     }
+    let eff = EffectiveConsumeConfig::merge(&args, cfg);
 
     // Validate simple mode requires --query
-    if matches!(args.query_mode, ConsumeQueryMode::Simple) && args.query.is_none() {
+    if matches!(eff.query_mode, ConsumeQueryMode::Simple) && eff.query.is_none() {
         anyhow::bail!("Simple query mode requires --query <name> or consume.query in config");
     }
 
     // ── Load schema and queries (once, outside reconnection loop) ────────────
-    let schema_dir = resolve_schema_dir(args.schema_dir.as_deref())?;
+    let schema_dir = resolve_schema_dir(eff.schema_dir.as_deref())?;
     let schema = SchemaRegistry::load_from_dir(&schema_dir)?;
     let queries = Arc::new(QueryLoader::load(&schema)?);
     info!(
@@ -419,7 +498,7 @@ pub async fn run(
     info!("Connected GraphQL query pool to PostgreSQL");
 
     // ── Resolve default query name (contract mode fallback) ──────────────────
-    let default_query = args.query.clone().unwrap_or_else(|| "default".to_string());
+    let default_query = eff.query.clone().unwrap_or_else(|| "default".to_string());
 
     // ── Build sink (once) ────────────────────────────────────────────────────
     let sink: Arc<dyn ConsumeSink> = build_sink(&args).await?;
@@ -429,15 +508,15 @@ pub async fn run(
     let compose: Arc<dyn Compose> = Arc::new(GraphqlCompose {
         pool: pool.clone(),
         resolvers: Arc::new(resolvers.clone()),
-        max_depth: args.max_depth,
+        max_depth: eff.max_depth,
     });
 
     // ── Build the session (owns the dedupe lifecycle) ────────────────────────
     let session = Arc::new(ConsumeSession::new(
-        args.query_mode.clone(),
-        args.on_error.clone(),
-        args.idempotent,
-        args.dedup_ttl,
+        eff.query_mode.clone(),
+        eff.on_error.clone(),
+        eff.idempotent,
+        eff.dedup_ttl,
         default_query,
         queries,
         sink,
@@ -446,7 +525,7 @@ pub async fn run(
 
     info!(
         "Starting consume loop (mode={:?}, error={:?})",
-        args.query_mode, args.on_error
+        eff.query_mode, eff.on_error
     );
 
     let reconnect = ReconnectConfig {
@@ -563,15 +642,11 @@ fn merge_sink_config(args: &mut ConsumeArgs, sink: &ConsumeSinkKind) {
             if args.key_field.is_none() {
                 args.key_field = key_field.clone();
             }
-            if args.key_prefix == "pgx:" {
-                if let Some(p) = key_prefix {
-                    args.key_prefix = p.clone();
-                }
+            if args.key_prefix.is_none() {
+                args.key_prefix = key_prefix.clone();
             }
-            if args.ttl == 0 {
-                if let Some(t) = ttl {
-                    args.ttl = *t;
-                }
+            if args.ttl.is_none() {
+                args.ttl = *ttl;
             }
         }
         #[cfg(not(feature = "kv"))]
@@ -651,5 +726,190 @@ mod tests {
             Elasticsearch::doc_id(Some("mat_no"), &doc, Some("msg-7")),
             Some("msg-7".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod error_policy_tests {
+    use super::{ConsumeErrorMode, ErrorAction, ErrorStage};
+
+    #[test]
+    fn lenient_discards_per_message_failures() {
+        for stage in [ErrorStage::Parse, ErrorStage::Lookup, ErrorStage::Compose] {
+            assert_eq!(
+                ConsumeErrorMode::Lenient.handle(stage),
+                ErrorAction::Discard
+            );
+        }
+    }
+
+    #[test]
+    fn lenient_requeues_transient_sink_failures() {
+        assert_eq!(
+            ConsumeErrorMode::Lenient.handle(ErrorStage::Sink),
+            ErrorAction::Requeue
+        );
+    }
+
+    #[test]
+    fn strict_aborts_on_every_failure() {
+        for stage in [
+            ErrorStage::Parse,
+            ErrorStage::Lookup,
+            ErrorStage::Compose,
+            ErrorStage::Sink,
+        ] {
+            assert_eq!(ConsumeErrorMode::Strict.handle(stage), ErrorAction::Abort);
+        }
+    }
+}
+
+#[cfg(test)]
+mod effective_config_tests {
+    use super::*;
+    use crate::utils::config::{ConsumeConfig, ConsumeSinkKind, ConsumeSourceKind};
+
+    fn cli() -> ConsumeArgs {
+        ConsumeArgs {
+            source: ConsumeSourceType::Rabbitmq,
+            sink: ConsumeSinkType::Stdout,
+            amqp_url: None,
+            queue: None,
+            exchange: None,
+            routing_key: None,
+            brokers: None,
+            topic: None,
+            group_id: None,
+            query_mode: None,
+            query: None,
+            max_depth: None,
+            schema_dir: None,
+            on_error: None,
+            idempotent: false,
+            dedup_ttl: None,
+            max_reconnect_attempts: 0,
+            reconnect_base_ms: 1000,
+            reconnect_max_ms: 30000,
+            es_url: None,
+            index: None,
+            id_field: None,
+            webhook_url: None,
+            kv_url: None,
+            key_field: None,
+            key_prefix: None,
+            ttl: None,
+        }
+    }
+
+    fn cfg() -> ConsumeConfig {
+        ConsumeConfig {
+            source: ConsumeSourceKind::Rabbitmq {
+                amqp_url: None,
+                queue: None,
+                exchange: None,
+                routing_key: None,
+            },
+            sink: ConsumeSinkKind::Stdout,
+            query_mode: Some("contract".to_string()),
+            query: Some("cfg-query".to_string()),
+            max_depth: Some(16),
+            schema_dir: Some("cfg-schema".to_string()),
+            on_error: Some("lenient".to_string()),
+            idempotent: Some(true),
+            dedup_ttl: Some(60),
+        }
+    }
+
+    #[test]
+    fn explicit_cli_wins_over_config() {
+        let mut c = cli();
+        c.query_mode = Some(ConsumeQueryMode::Simple);
+        c.on_error = Some(ConsumeErrorMode::Strict);
+        c.max_depth = Some(3);
+        c.query = Some("cli-query".to_string());
+        c.schema_dir = Some("cli-schema".to_string());
+        c.idempotent = true;
+        c.dedup_ttl = Some(5);
+
+        let eff = EffectiveConsumeConfig::merge(&c, Some(&cfg()));
+        assert_eq!(eff.query_mode, ConsumeQueryMode::Simple);
+        assert_eq!(eff.on_error, ConsumeErrorMode::Strict);
+        assert_eq!(eff.max_depth, 3);
+        assert_eq!(eff.query.as_deref(), Some("cli-query"));
+        assert_eq!(eff.schema_dir.as_deref(), Some("cli-schema"));
+        assert!(eff.idempotent);
+        assert_eq!(eff.dedup_ttl, Some(5));
+    }
+
+    #[test]
+    fn config_fills_when_cli_absent() {
+        let eff = EffectiveConsumeConfig::merge(&cli(), Some(&cfg()));
+        assert_eq!(eff.query_mode, ConsumeQueryMode::Contract);
+        assert_eq!(eff.on_error, ConsumeErrorMode::Lenient);
+        assert_eq!(eff.max_depth, 16);
+        assert_eq!(eff.query.as_deref(), Some("cfg-query"));
+        assert_eq!(eff.schema_dir.as_deref(), Some("cfg-schema"));
+        assert!(eff.idempotent);
+        assert_eq!(eff.dedup_ttl, Some(60));
+    }
+
+    #[test]
+    fn defaults_apply_when_nothing_provided() {
+        let eff = EffectiveConsumeConfig::merge(&cli(), None);
+        assert_eq!(eff.query_mode, ConsumeQueryMode::Contract);
+        assert_eq!(eff.on_error, ConsumeErrorMode::Lenient);
+        assert_eq!(eff.max_depth, 8);
+        assert_eq!(eff.query, None);
+        assert_eq!(eff.schema_dir, None);
+        assert!(!eff.idempotent);
+        assert_eq!(eff.dedup_ttl, None);
+    }
+
+    #[test]
+    fn explicit_cli_default_is_respected_over_config() {
+        // The regression this merge fixes: an explicit `--max-depth 8` used to
+        // be indistinguishable from the clap default, so config silently won.
+        let mut c = cli();
+        c.max_depth = Some(8);
+        let eff = EffectiveConsumeConfig::merge(&c, Some(&cfg()));
+        assert_eq!(eff.max_depth, 8);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_sink_explicit_cli_wins_over_config() {
+        let mut c = cli();
+        c.key_prefix = Some("cli:".to_string());
+        c.ttl = Some(0);
+        merge_sink_config(
+            &mut c,
+            &ConsumeSinkKind::Kv {
+                url: "redis://x".to_string(),
+                key_field: None,
+                key_prefix: Some("cfg:".to_string()),
+                ttl: Some(60),
+            },
+        );
+        // Explicit `--ttl 0` / `--key-prefix cli:` are no longer mistaken for
+        // the clap defaults and silently overridden by config.
+        assert_eq!(c.key_prefix.as_deref(), Some("cli:"));
+        assert_eq!(c.ttl, Some(0));
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn kv_sink_config_fills_when_cli_absent() {
+        let mut c = cli();
+        merge_sink_config(
+            &mut c,
+            &ConsumeSinkKind::Kv {
+                url: "redis://x".to_string(),
+                key_field: None,
+                key_prefix: Some("cfg:".to_string()),
+                ttl: Some(60),
+            },
+        );
+        assert_eq!(c.key_prefix.as_deref(), Some("cfg:"));
+        assert_eq!(c.ttl, Some(60));
     }
 }

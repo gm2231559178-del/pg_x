@@ -12,30 +12,63 @@ pub struct BrokerMessage {
     pub payload: String,
     /// Message headers/metadata.
     pub headers: HashMap<String, String>,
-    /// Stable identity for this message across redeliveries.
-    /// Kafka: record key or `<partition>:<offset>`. RabbitMQ: AMQP
-    /// `message_id` property or a payload hash.
+    /// Stable identity for this message across redeliveries, when the broker
+    /// provides one (Kafka record key or `<partition>:<offset>`; RabbitMQ AMQP
+    /// `message_id` property). `None` means no native identity — the payload is
+    /// deliberately not hashed, since two distinct identical-bodied messages
+    /// would falsely dedupe.
     pub message_id: Option<String>,
     /// Opaque handle for ack/nack (delivery tag, offset, etc.).
-    pub delivery_tag: u64,
+    pub delivery_tag: DeliveryTag,
+}
+
+/// Opaque handle for ack/nack. Brokers encode their native tag into this, so
+/// the packed `(partition, offset)` convention stays out of the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryTag(u64);
+
+impl DeliveryTag {
+    /// Wrap a broker-native tag that fits in a `u64` (e.g. an AMQP delivery tag).
+    pub fn from_u64(tag: u64) -> Self {
+        Self(tag)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    /// Encode a Kafka `(partition, offset)` record position.
+    pub fn kafka(partition: i32, offset: i64) -> Self {
+        Self(((partition as u64) << 32) | (offset as u64))
+    }
+
+    /// Decode a Kafka `(partition, offset)` record position.
+    pub fn kafka_position(&self) -> (i32, i64) {
+        ((self.0 >> 32) as i32, (self.0 & 0xFFFF_FFFF) as i64)
+    }
+}
+
+/// Outcome of [`Consumer::recv`]: a message, or a closed consumer.
+pub enum RecvOutcome {
+    /// A message arrived.
+    Message(BrokerMessage),
+    /// The consumer ended (connection/channel closed); no more messages.
+    Closed,
 }
 
 /// Consumer pulls messages from a broker.
 #[async_trait]
 pub trait Consumer: Send + Sync {
     fn name(&self) -> &str;
-    /// Receive the next message, blocking until one arrives.
-    /// Returns `None` when the connection/channel is lost or shutting down.
-    async fn recv(&self) -> Option<BrokerMessage>;
+    /// Receive the next message, blocking until one arrives. `Err` and
+    /// [`RecvOutcome::Closed`] both mean no more messages will come and the
+    /// session should escalate to reconnect; `Err` additionally carries the
+    /// broker error.
+    async fn recv(&self) -> Result<RecvOutcome>;
     /// Acknowledge successful processing.
-    async fn ack(&self, tag: u64) -> Result<()>;
+    async fn ack(&self, tag: DeliveryTag) -> Result<()>;
     /// Negative acknowledgement (requeue = true to redeliver, false to discard/dead-letter).
-    async fn nack(&self, tag: u64, requeue: bool) -> Result<()>;
-    /// Whether the underlying connection/channel is still alive.
-    /// Defaults to `true` for consumers that don't track connection state.
-    fn is_connected(&self) -> bool {
-        true
-    }
+    async fn nack(&self, tag: DeliveryTag, requeue: bool) -> Result<()>;
 }
 
 /// Sink receives a fully composed GraphQL document.

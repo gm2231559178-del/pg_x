@@ -10,7 +10,8 @@ pub mod kafka {
     };
     use std::collections::HashMap;
 
-    use super::super::r#trait::{BrokerMessage, Consumer};
+    use super::super::message_id::{derive_message_id, NativeId};
+    use super::super::r#trait::{BrokerMessage, Consumer, DeliveryTag, RecvOutcome};
 
     pub struct KafkaConsumer {
         consumer: StreamConsumer,
@@ -40,7 +41,7 @@ pub mod kafka {
             })
         }
 
-        fn msg_to_broker(&self, msg: &BorrowedMessage) -> Option<BrokerMessage> {
+        fn msg_to_broker(&self, msg: &BorrowedMessage) -> BrokerMessage {
             let payload = msg
                 .payload()
                 .map(|d| String::from_utf8_lossy(d).to_string())
@@ -65,7 +66,7 @@ pub mod kafka {
                 }
             }
 
-            Some(BrokerMessage {
+            BrokerMessage {
                 topic: self.topic.clone(),
                 payload,
                 headers,
@@ -76,22 +77,16 @@ pub mod kafka {
                     msg.partition(),
                     msg.offset(),
                 )),
-                delivery_tag: Self::encode_tag(msg.partition(), msg.offset()),
-            })
-        }
-
-        fn encode_tag(partition: i32, offset: i64) -> u64 {
-            ((partition as u64) << 32) | (offset as u64)
-        }
-
-        fn decode_tag(tag: u64) -> (i32, i64) {
-            ((tag >> 32) as i32, (tag & 0xFFFF_FFFF) as i64)
+                delivery_tag: DeliveryTag::kafka(msg.partition(), msg.offset()),
+            }
         }
 
         fn kafka_message_id(key: Option<&str>, partition: i32, offset: i64) -> String {
             match key {
-                Some(k) if !k.is_empty() => k.to_string(),
-                _ => format!("{}:{}", partition, offset),
+                Some(k) if !k.is_empty() => {
+                    derive_message_id(NativeId::Provided(k.to_string())).unwrap()
+                }
+                _ => derive_message_id(NativeId::KafkaPosition(partition, offset)).unwrap(),
             }
         }
     }
@@ -102,18 +97,15 @@ pub mod kafka {
             "kafka"
         }
 
-        async fn recv(&self) -> Option<BrokerMessage> {
+        async fn recv(&self) -> Result<RecvOutcome> {
             match self.consumer.recv().await {
-                Ok(msg) => self.msg_to_broker(&msg),
-                Err(e) => {
-                    tracing::error!(error = %e, "Kafka recv error");
-                    None
-                }
+                Ok(msg) => Ok(RecvOutcome::Message(self.msg_to_broker(&msg))),
+                Err(e) => Err(e).context("Kafka recv failed"),
             }
         }
 
-        async fn ack(&self, tag: u64) -> Result<()> {
-            let (partition, offset) = Self::decode_tag(tag);
+        async fn ack(&self, tag: DeliveryTag) -> Result<()> {
+            let (partition, offset) = tag.kafka_position();
 
             let mut offsets = self.last_offsets.lock().await;
             let last = offsets.entry(partition).or_insert(0i64);
@@ -129,7 +121,7 @@ pub mod kafka {
                 .context("Failed to commit Kafka offset")
         }
 
-        async fn nack(&self, tag: u64, requeue: bool) -> Result<()> {
+        async fn nack(&self, tag: DeliveryTag, requeue: bool) -> Result<()> {
             if !requeue {
                 self.ack(tag).await?;
             }
@@ -140,6 +132,7 @@ pub mod kafka {
     #[cfg(test)]
     mod tests {
         use super::KafkaConsumer;
+        use crate::consumer::r#trait::DeliveryTag;
 
         #[test]
         fn message_id_prefers_record_key() {
@@ -157,6 +150,17 @@ pub mod kafka {
         #[test]
         fn message_id_ignores_empty_key() {
             assert_eq!(KafkaConsumer::kafka_message_id(Some(""), 3, 42), "3:42");
+        }
+
+        #[test]
+        fn delivery_tag_round_trips_partition_offset() {
+            // The packed convention splits the u64 as (partition << 32) | offset,
+            // so offsets must fit in 32 bits — mirroring the original encoding.
+            let cases = [(0, 0), (3, 42), (1024, u32::MAX as i64), (i32::MAX, 5)];
+            for (partition, offset) in cases {
+                let tag = DeliveryTag::kafka(partition, offset);
+                assert_eq!(tag.kafka_position(), (partition, offset));
+            }
         }
     }
 }

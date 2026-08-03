@@ -11,12 +11,12 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::consumer::dedupe::{spawn_dedup_sweeper, DedupCache};
-use crate::consumer::r#trait::{BrokerMessage, ConsumeSink, Consumer};
+use crate::consumer::r#trait::{BrokerMessage, ConsumeSink, Consumer, DeliveryTag, RecvOutcome};
 use crate::downstream::contract::ContractMessage;
 use crate::graphql::query::{NamedQuery, QueryLoader};
 use crate::utils::session_loop::{SessionExit, Shutdown};
 
-use super::consume::{ConsumeErrorMode, ConsumeQueryMode};
+use super::consume::{ConsumeErrorMode, ConsumeQueryMode, ErrorAction, ErrorStage};
 
 /// Composition seam: turns a named query and its variables into the document
 /// the sink receives. Injected so the session pipeline is testable without a
@@ -89,30 +89,26 @@ impl ConsumeSession {
         let mut session_failed = false;
 
         let processing_result: Result<()> = loop {
-            let maybe_msg: Option<BrokerMessage> = loop {
-                tokio::select! {
-                    biased;
+            let maybe_msg: Option<BrokerMessage> = tokio::select! {
+                biased;
 
-                    _ = shutdown.wait() => {
-                        info!("Signal received, shutting down cleanly");
-                        return SessionExit::Shutdown;
-                    }
+                _ = shutdown.wait() => {
+                    info!("Signal received, shutting down cleanly");
+                    return SessionExit::Shutdown;
+                }
 
-                    maybe_msg = consumer.recv() => {
-                        match maybe_msg {
-                            Some(m) => break Some(m),
-                            None => {
-                                // recv returned None — channel may be closed
-                                // (e.g. broker ack timeout triggered PRECONDITION_FAILED).
-                                if !consumer.is_connected() {
-                                    warn!("Consumer disconnected (channel closed by broker)");
-                                    session_failed = true;
-                                    break None;
-                                }
-                                // Transient — brief pause then retry
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                continue;
-                            }
+                outcome = consumer.recv() => {
+                    match outcome {
+                        Ok(RecvOutcome::Message(m)) => Some(m),
+                        Ok(RecvOutcome::Closed) => {
+                            warn!("Consumer ended — no more messages (channel may be closed by broker)");
+                            session_failed = true;
+                            None
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Consumer recv failed — escalating to reconnect");
+                            session_failed = true;
+                            None
                         }
                     }
                 }
@@ -132,11 +128,9 @@ impl ConsumeSession {
             if is_duplicate(&self.dedup, msg_id).await {
                 debug!(id = ?msg_id, topic = %topic, "Duplicate message, acking and skipping");
                 if let Err(e) = consumer.ack(tag).await {
-                    error!(error = %e, "Failed to ack duplicate message");
-                    if !consumer.is_connected() {
-                        session_failed = true;
-                        break Ok(());
-                    }
+                    error!(error = %e, "Failed to ack duplicate message — escalating to reconnect");
+                    session_failed = true;
+                    break Ok(());
                 }
                 continue;
             }
@@ -153,19 +147,21 @@ impl ConsumeSession {
                         (qn, vars)
                     }
                     None => {
-                        let msg = "Message is not a valid ContractMessage";
-                        match self.on_error {
-                            ConsumeErrorMode::Lenient => {
-                                warn!("{}. Skipping message (topic={})", msg, topic);
-                                let _ = consumer.nack(tag, false).await;
-                                continue;
-                            }
-                            ConsumeErrorMode::Strict => {
-                                error!("{} (topic={})", msg, topic);
-                                let _ = consumer.nack(tag, true).await;
-                                break Err(anyhow!("{}: topic={}", msg, topic));
-                            }
+                        let message =
+                            format!("Message is not a valid ContractMessage (topic={})", topic);
+                        if let Err(e) = fail(
+                            &self.on_error,
+                            consumer,
+                            tag,
+                            ErrorStage::Parse,
+                            &message,
+                            anyhow!(message.clone()),
+                        )
+                        .await
+                        {
+                            break Err(e);
                         }
+                        continue;
                     }
                 },
                 ConsumeQueryMode::Simple => {
@@ -179,19 +175,21 @@ impl ConsumeSession {
             let query = match self.queries.get(&query_name) {
                 Some(q) => q,
                 None => {
-                    let msg = format!("No named query '{}' found", query_name);
-                    match self.on_error {
-                        ConsumeErrorMode::Lenient => {
-                            warn!("{}. Skipping message (topic={})", msg, topic);
-                            let _ = consumer.nack(tag, false).await;
-                            continue;
-                        }
-                        ConsumeErrorMode::Strict => {
-                            error!("{} (topic={})", msg, topic);
-                            let _ = consumer.nack(tag, true).await;
-                            break Err(anyhow!("{}", msg));
-                        }
+                    let message =
+                        format!("No named query '{}' found (topic={})", query_name, topic);
+                    if let Err(e) = fail(
+                        &self.on_error,
+                        consumer,
+                        tag,
+                        ErrorStage::Lookup,
+                        &message,
+                        anyhow!(message.clone()),
+                    )
+                    .await
+                    {
+                        break Err(e);
                     }
+                    continue;
                 }
             };
 
@@ -203,18 +201,14 @@ impl ConsumeSession {
                     // ── Send to sink ─────────────────────────────────────────
                     let sink_msg_id = if self.idempotent { msg_id } else { None };
                     if let Err(e) = self.sink.send(&doc, sink_msg_id).await {
-                        match self.on_error {
-                            ConsumeErrorMode::Lenient => {
-                                warn!(error = %e, topic = %topic, query = %query_name, "Sink failed, skipping message");
-                                let _ = consumer.nack(tag, false).await;
-                                continue;
-                            }
-                            ConsumeErrorMode::Strict => {
-                                error!(error = %e, topic = %topic, query = %query_name, "Sink failed");
-                                let _ = consumer.nack(tag, true).await;
-                                break Err(e);
-                            }
+                        let message =
+                            format!("Sink failed (topic={}, query={})", topic, query_name);
+                        if let Err(e) =
+                            fail(&self.on_error, consumer, tag, ErrorStage::Sink, &message, e).await
+                        {
+                            break Err(e);
                         }
+                        continue;
                     }
 
                     // ── Record as processed (before ack, so a failed ack still
@@ -223,26 +217,31 @@ impl ConsumeSession {
 
                     // ── Acknowledge ──────────────────────────────────────────
                     if let Err(e) = consumer.ack(tag).await {
-                        error!(error = %e, "Failed to ack message — channel may be closed");
+                        error!(error = %e, "Failed to ack message — escalating to reconnect");
                         // Channel is likely dead after a failed ack.
                         // Break so the session-loop can reconnect.
-                        if !consumer.is_connected() {
-                            session_failed = true;
-                            break Ok(());
-                        }
+                        session_failed = true;
+                        break Ok(());
                     }
                 }
-                Err(e) => match self.on_error {
-                    ConsumeErrorMode::Lenient => {
-                        warn!(error = %e, topic = %topic, query = %query_name, "GraphQL execution failed, skipping message");
-                        let _ = consumer.nack(tag, false).await;
-                    }
-                    ConsumeErrorMode::Strict => {
-                        error!(error = %e, topic = %topic, query = %query_name, "GraphQL execution failed");
-                        let _ = consumer.nack(tag, true).await;
+                Err(e) => {
+                    let message = format!(
+                        "GraphQL execution failed (topic={}, query={})",
+                        topic, query_name
+                    );
+                    if let Err(e) = fail(
+                        &self.on_error,
+                        consumer,
+                        tag,
+                        ErrorStage::Compose,
+                        &message,
+                        e,
+                    )
+                    .await
+                    {
                         break Err(e);
                     }
-                },
+                }
             }
         };
 
@@ -259,6 +258,36 @@ impl ConsumeSession {
 }
 
 // ── Variable extraction helpers ──────────────────────────────────────────────
+
+/// Fail the current message through the error policy: log, settle with the
+/// consumer (nack), and return `Err` when the policy aborts the session. The
+/// caller resumes the loop on `Ok`.
+async fn fail(
+    on_error: &ConsumeErrorMode,
+    consumer: &dyn Consumer,
+    tag: DeliveryTag,
+    stage: ErrorStage,
+    message: &str,
+    err: anyhow::Error,
+) -> Result<()> {
+    match on_error.handle(stage) {
+        ErrorAction::Discard => {
+            warn!(error = %err, "{message} — discarded per lenient policy");
+            let _ = consumer.nack(tag, false).await;
+            Ok(())
+        }
+        ErrorAction::Requeue => {
+            warn!(error = %err, "{message} — requeued per lenient policy");
+            let _ = consumer.nack(tag, true).await;
+            Ok(())
+        }
+        ErrorAction::Abort => {
+            error!(error = %err, "{message}");
+            let _ = consumer.nack(tag, true).await;
+            Err(err)
+        }
+    }
+}
 
 /// Whether `msg_id` was already seen by the dedupe cache.
 async fn is_duplicate(dedup: &Option<Arc<DedupCache>>, msg_id: Option<&str>) -> bool {
@@ -349,5 +378,332 @@ mod dedupe_ordering_tests {
         assert!(!is_duplicate(&dedup, Some("msg-1")).await);
         record_processed(&dedup, Some("msg-1")).await;
         assert!(!is_duplicate(&dedup, Some("msg-1")).await);
+    }
+}
+
+#[cfg(test)]
+mod error_policy_seam_tests {
+    // Drives the session through `run()` with a scripted consumer to assert the
+    // settle protocol each failure stage × error mode produces: nack with or
+    // without requeue, and the resulting session outcome.
+    use super::*;
+    use crate::graphql::query::{FieldSelection, NamedQuery, QueryLoader};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use tokio::sync::watch;
+
+    struct ScriptedConsumer {
+        queue: Mutex<VecDeque<BrokerMessage>>,
+        nacks: Mutex<Vec<(DeliveryTag, bool)>>,
+        acks: Mutex<Vec<DeliveryTag>>,
+    }
+
+    #[async_trait]
+    impl Consumer for ScriptedConsumer {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+
+        async fn recv(&self) -> anyhow::Result<RecvOutcome> {
+            Ok(self
+                .queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(RecvOutcome::Message)
+                .unwrap_or(RecvOutcome::Closed))
+        }
+
+        async fn ack(&self, tag: DeliveryTag) -> anyhow::Result<()> {
+            self.acks.lock().unwrap().push(tag);
+            Ok(())
+        }
+
+        async fn nack(&self, tag: DeliveryTag, requeue: bool) -> anyhow::Result<()> {
+            self.nacks.lock().unwrap().push((tag, requeue));
+            Ok(())
+        }
+    }
+
+    struct OkSink;
+
+    #[async_trait]
+    impl ConsumeSink for OkSink {
+        fn name(&self) -> &str {
+            "ok"
+        }
+
+        async fn send(&self, _doc: &Value, _msg_id: Option<&str>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingSink;
+
+    #[async_trait]
+    impl ConsumeSink for FailingSink {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        async fn send(&self, _doc: &Value, _msg_id: Option<&str>) -> anyhow::Result<()> {
+            Err(anyhow!("sink down"))
+        }
+    }
+
+    struct OkCompose;
+
+    #[async_trait]
+    impl Compose for OkCompose {
+        async fn compose(
+            &self,
+            _query: &NamedQuery,
+            _variables: &HashMap<String, Value>,
+        ) -> anyhow::Result<Value> {
+            Ok(json!({"ok": true}))
+        }
+    }
+
+    struct FailingCompose;
+
+    #[async_trait]
+    impl Compose for FailingCompose {
+        async fn compose(
+            &self,
+            _query: &NamedQuery,
+            _variables: &HashMap<String, Value>,
+        ) -> anyhow::Result<Value> {
+            Err(anyhow!("graphql down"))
+        }
+    }
+
+    fn loader_with(name: &str) -> Arc<QueryLoader> {
+        let mut queries = HashMap::new();
+        queries.insert(
+            name.to_string(),
+            NamedQuery {
+                name: name.to_string(),
+                operation_name: "Op".to_string(),
+                variables: vec![],
+                selection: FieldSelection {
+                    field_name: "id".to_string(),
+                    children: vec![],
+                    is_leaf: true,
+                },
+            },
+        );
+        Arc::new(QueryLoader { queries })
+    }
+
+    fn session(
+        query_mode: ConsumeQueryMode,
+        on_error: ConsumeErrorMode,
+        sink: Arc<dyn ConsumeSink>,
+        compose: Arc<dyn Compose>,
+    ) -> Arc<ConsumeSession> {
+        Arc::new(ConsumeSession::new(
+            query_mode,
+            on_error,
+            false,
+            None,
+            "default".to_string(),
+            loader_with("default"),
+            sink,
+            compose,
+        ))
+    }
+
+    fn msg(tag: u64, payload: &str) -> BrokerMessage {
+        BrokerMessage {
+            topic: "events".to_string(),
+            payload: payload.to_string(),
+            headers: HashMap::new(),
+            message_id: Some("m1".to_string()),
+            delivery_tag: DeliveryTag::from_u64(tag),
+        }
+    }
+
+    fn scripted(messages: Vec<BrokerMessage>) -> ScriptedConsumer {
+        ScriptedConsumer {
+            queue: Mutex::new(VecDeque::from(messages)),
+            nacks: Mutex::new(Vec::new()),
+            acks: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn run_session(
+        sess: Arc<ConsumeSession>,
+        consumer: ScriptedConsumer,
+    ) -> (SessionExit, Vec<(DeliveryTag, bool)>) {
+        let (tx, rx) = watch::channel(false);
+        let _tx = tx;
+        let mut shutdown = Shutdown::from_receiver(rx);
+        let exit = sess.run(&consumer, &mut shutdown).await;
+        let nacks = consumer.nacks.lock().unwrap().clone();
+        (exit, nacks)
+    }
+
+    #[tokio::test]
+    async fn lenient_requeues_sink_failures() {
+        let sess = session(
+            ConsumeQueryMode::Simple,
+            ConsumeErrorMode::Lenient,
+            Arc::new(FailingSink),
+            Arc::new(OkCompose),
+        );
+        let (exit, nacks) = run_session(sess, scripted(vec![msg(7, "{}")])).await;
+
+        assert_eq!(nacks, vec![(DeliveryTag::from_u64(7), true)]);
+        assert!(matches!(exit, SessionExit::ReconnectAfterHealthy));
+    }
+
+    #[tokio::test]
+    async fn strict_sink_failure_aborts() {
+        let sess = session(
+            ConsumeQueryMode::Simple,
+            ConsumeErrorMode::Strict,
+            Arc::new(FailingSink),
+            Arc::new(OkCompose),
+        );
+        let (exit, nacks) = run_session(sess, scripted(vec![msg(7, "{}")])).await;
+
+        assert_eq!(nacks, vec![(DeliveryTag::from_u64(7), true)]);
+        assert!(matches!(exit, SessionExit::Fatal(_)));
+    }
+
+    #[tokio::test]
+    async fn lenient_discards_compose_failures() {
+        let sess = session(
+            ConsumeQueryMode::Simple,
+            ConsumeErrorMode::Lenient,
+            Arc::new(OkSink),
+            Arc::new(FailingCompose),
+        );
+        let (exit, nacks) = run_session(sess, scripted(vec![msg(7, "{}")])).await;
+
+        assert_eq!(nacks, vec![(DeliveryTag::from_u64(7), false)]);
+        assert!(matches!(exit, SessionExit::ReconnectAfterHealthy));
+    }
+
+    #[tokio::test]
+    async fn strict_compose_failure_aborts() {
+        let sess = session(
+            ConsumeQueryMode::Simple,
+            ConsumeErrorMode::Strict,
+            Arc::new(OkSink),
+            Arc::new(FailingCompose),
+        );
+        let (exit, nacks) = run_session(sess, scripted(vec![msg(7, "{}")])).await;
+
+        assert_eq!(nacks, vec![(DeliveryTag::from_u64(7), true)]);
+        assert!(matches!(exit, SessionExit::Fatal(_)));
+    }
+
+    #[tokio::test]
+    async fn lenient_discards_lookup_failures() {
+        // Simple mode + missing query name → Lookup stage.
+        let sess = Arc::new(ConsumeSession::new(
+            ConsumeQueryMode::Simple,
+            ConsumeErrorMode::Lenient,
+            false,
+            None,
+            "missing".to_string(),
+            loader_with("default"),
+            Arc::new(OkSink),
+            Arc::new(OkCompose),
+        ));
+        let (exit, nacks) = run_session(sess, scripted(vec![msg(7, "{}")])).await;
+
+        assert_eq!(nacks, vec![(DeliveryTag::from_u64(7), false)]);
+        assert!(matches!(exit, SessionExit::ReconnectAfterHealthy));
+    }
+
+    #[tokio::test]
+    async fn strict_lookup_failure_aborts() {
+        let sess = Arc::new(ConsumeSession::new(
+            ConsumeQueryMode::Simple,
+            ConsumeErrorMode::Strict,
+            false,
+            None,
+            "missing".to_string(),
+            loader_with("default"),
+            Arc::new(OkSink),
+            Arc::new(OkCompose),
+        ));
+        let (exit, nacks) = run_session(sess, scripted(vec![msg(7, "{}")])).await;
+
+        assert_eq!(nacks, vec![(DeliveryTag::from_u64(7), true)]);
+        assert!(matches!(exit, SessionExit::Fatal(_)));
+    }
+
+    #[tokio::test]
+    async fn lenient_discards_parse_failures() {
+        // Contract mode with an unparseable payload → Parse stage.
+        let sess = session(
+            ConsumeQueryMode::Contract,
+            ConsumeErrorMode::Lenient,
+            Arc::new(OkSink),
+            Arc::new(OkCompose),
+        );
+        let (exit, nacks) = run_session(sess, scripted(vec![msg(7, "not-json")])).await;
+
+        assert_eq!(nacks, vec![(DeliveryTag::from_u64(7), false)]);
+        assert!(matches!(exit, SessionExit::ReconnectAfterHealthy));
+    }
+
+    #[tokio::test]
+    async fn strict_parse_failure_aborts() {
+        let sess = session(
+            ConsumeQueryMode::Contract,
+            ConsumeErrorMode::Strict,
+            Arc::new(OkSink),
+            Arc::new(OkCompose),
+        );
+        let (exit, nacks) = run_session(sess, scripted(vec![msg(7, "not-json")])).await;
+
+        assert_eq!(nacks, vec![(DeliveryTag::from_u64(7), true)]);
+        assert!(matches!(exit, SessionExit::Fatal(_)));
+    }
+
+    struct FailingRecvConsumer;
+
+    #[async_trait]
+    impl Consumer for FailingRecvConsumer {
+        fn name(&self) -> &str {
+            "failing-recv"
+        }
+
+        async fn recv(&self) -> anyhow::Result<RecvOutcome> {
+            Err(anyhow!("broker unreachable"))
+        }
+
+        async fn ack(&self, _tag: DeliveryTag) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn nack(&self, _tag: DeliveryTag, _requeue: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_error_escalates_to_reconnect() {
+        let sess = session(
+            ConsumeQueryMode::Simple,
+            ConsumeErrorMode::Lenient,
+            Arc::new(OkSink),
+            Arc::new(OkCompose),
+        );
+        let (tx, rx) = watch::channel(false);
+        let _tx = tx;
+        let mut shutdown = Shutdown::from_receiver(rx);
+        let exit = sess.run(&FailingRecvConsumer, &mut shutdown).await;
+
+        // A broker error reaches the session-loop reconnect path instead of
+        // being swallowed by a retry-forever loop (the old is_connected=default-true
+        // behavior for consumers that didn't track connection state).
+        assert!(matches!(exit, SessionExit::ReconnectAfterHealthy));
     }
 }

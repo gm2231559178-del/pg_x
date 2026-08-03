@@ -73,6 +73,7 @@ mod iceberg;
 #[cfg(feature = "parquet")]
 mod parquet;
 mod sinks;
+mod table_prefix;
 mod transforms;
 
 pub(crate) use replicate_session::{PGX_LSN, PGX_OP, PGX_PAYLOAD, PGX_SCHEMA, PGX_TABLE};
@@ -99,7 +100,7 @@ use self::applier::PostgresApplier;
 use self::filter::RowFilter;
 use self::replicate_session::{Applier, ReplicateSession, ReplicateSessionConfig};
 use self::sinks::build_fan_out_sink;
-use self::transforms::{parse_drop_cols_arg, parse_rename_arg, ColumnTransforms, TableTransform};
+use self::transforms::ColumnTransforms;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI argument structs
@@ -328,7 +329,9 @@ pub struct PostgresArgs {
     #[arg(long = "schema-map")]
     pub schema_map: Vec<String>,
 
-    /// Maximum statements per transaction batch.
+    /// Target buffer pre-allocation per source transaction (statements).
+    /// Target transactions follow source WAL transaction boundaries, so this
+    /// only bounds memory, never splits a transaction.
     #[arg(long, default_value = "1000")]
     pub batch_size: u32,
 }
@@ -470,48 +473,17 @@ pub async fn run(
         config_rename = cfg.rename.clone();
     }
 
-    let row_filter = {
-        let mut all: Vec<String> = Vec::new();
-        all.extend(config_filters);
-        all.extend(args.filters.clone());
-        RowFilter::from_cli_args(&all)?
-    };
+    let row_filter = RowFilter::from_sources(&config_filters, &args.filters)?;
     if !row_filter.is_empty() {
         info!("Row-level WHERE filters active");
     }
 
-    let transforms = {
-        let mut t = ColumnTransforms::new();
-        for arg in config_drop_cols.iter().chain(args.drop_cols.iter()) {
-            let (key, cols) = parse_drop_cols_arg(arg)?;
-            let entry = t.entries.iter_mut().find(|(k, _)| k == &key);
-            match entry {
-                Some((_, tt)) => tt.drop_cols.extend(cols),
-                None => t.entries.push((
-                    key,
-                    TableTransform {
-                        drop_cols: cols,
-                        renames: Vec::new(),
-                    },
-                )),
-            }
-        }
-        for arg in config_rename.iter().chain(args.rename.iter()) {
-            let (key, pairs) = parse_rename_arg(arg)?;
-            let entry = t.entries.iter_mut().find(|(k, _)| k == &key);
-            match entry {
-                Some((_, tt)) => tt.renames.extend(pairs),
-                None => t.entries.push((
-                    key,
-                    TableTransform {
-                        drop_cols: Vec::new(),
-                        renames: pairs,
-                    },
-                )),
-            }
-        }
-        t
-    };
+    let transforms = ColumnTransforms::from_sources(
+        &config_drop_cols,
+        &config_rename,
+        &args.drop_cols,
+        &args.rename,
+    )?;
     if !transforms.is_empty() {
         info!("Column transforms active");
     }

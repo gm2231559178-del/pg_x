@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use super::filter::TableKey;
+use super::table_prefix::{split_table_prefix, TableKey};
 use crate::replication::event::WalEvent;
 
 #[derive(Debug, Clone, Default)]
@@ -11,12 +11,48 @@ pub(crate) struct TableTransform {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ColumnTransforms {
-    pub(crate) entries: Vec<(Option<(String, String)>, TableTransform)>,
+    pub(crate) entries: Vec<(TableKey, TableTransform)>,
 }
 
 impl ColumnTransforms {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Assemble the column transforms from config then CLI sources.
+    ///
+    /// Deterministic ordering: config rules are merged first, CLI rules second.
+    /// A global rule (`None` key) and a table-specific rule (`Some` key) stay
+    /// distinct entries and both apply, with drops and renames accumulated in
+    /// first-seen order.
+    pub(crate) fn from_sources(
+        config_drop_cols: &[String],
+        config_rename: &[String],
+        cli_drop_cols: &[String],
+        cli_rename: &[String],
+    ) -> Result<Self> {
+        let mut t = ColumnTransforms::new();
+        for arg in config_drop_cols.iter().chain(cli_drop_cols) {
+            let (key, cols) = parse_drop_cols_arg(arg)?;
+            t.merge(key, cols, Vec::new());
+        }
+        for arg in config_rename.iter().chain(cli_rename) {
+            let (key, pairs) = parse_rename_arg(arg)?;
+            t.merge(key, Vec::new(), pairs);
+        }
+        Ok(t)
+    }
+
+    fn merge(&mut self, key: TableKey, drop_cols: Vec<String>, renames: Vec<(String, String)>) {
+        match self.entries.iter_mut().find(|(k, _)| k == &key) {
+            Some((_, tt)) => {
+                tt.drop_cols.extend(drop_cols);
+                tt.renames.extend(renames);
+            }
+            None => self
+                .entries
+                .push((key, TableTransform { drop_cols, renames })),
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -46,7 +82,7 @@ impl ColumnTransforms {
 }
 
 pub(crate) fn parse_drop_cols_arg(arg: &str) -> Result<(TableKey, Vec<String>)> {
-    let (table_key, rest) = parse_table_prefix(arg)?;
+    let (table_key, rest) = split_table_prefix(arg)?;
     let cols: Vec<String> = rest
         .split(',')
         .map(|s| s.trim().to_string())
@@ -59,7 +95,7 @@ pub(crate) fn parse_drop_cols_arg(arg: &str) -> Result<(TableKey, Vec<String>)> 
 }
 
 pub(crate) fn parse_rename_arg(arg: &str) -> Result<(TableKey, Vec<(String, String)>)> {
-    let (table_key, rest) = parse_table_prefix(arg)?;
+    let (table_key, rest) = split_table_prefix(arg)?;
     let mut pairs = Vec::new();
     for part in rest.split(',') {
         let part = part.trim();
@@ -84,22 +120,90 @@ pub(crate) fn parse_rename_arg(arg: &str) -> Result<(TableKey, Vec<(String, Stri
     Ok((table_key, pairs))
 }
 
-fn parse_table_prefix(arg: &str) -> Result<(TableKey, &str)> {
-    if let Some(pos) = arg.find(':') {
-        let prefix = &arg[..pos];
-        if prefix.is_empty() {
-            bail!("empty table prefix before ':'");
-        }
-        let table_key = if let Some(dot) = prefix.find('.') {
-            Some((prefix[..dot].to_string(), prefix[dot + 1..].to_string()))
-        } else {
-            return Err(anyhow::anyhow!(
-                "prefix must be schema-qualified (e.g. public.orders:...), \
-                 got '{prefix}' — use 'public.{prefix}:...' or omit the prefix for global rules"
-            ));
-        };
-        Ok((table_key, &arg[pos + 1..]))
-    } else {
-        Ok((None, arg))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn from_sources_accumulates_drops_for_the_same_key() {
+        let t = ColumnTransforms::from_sources(
+            &[s("public.orders:a,b")],
+            &[],
+            &[s("public.orders:c")],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(t.entries.len(), 1);
+        let (key, tt) = &t.entries[0];
+        assert_eq!(key, &Some((s("public"), s("orders"))));
+        assert_eq!(tt.drop_cols, vec![s("a"), s("b"), s("c")]);
+        assert!(tt.renames.is_empty());
+    }
+
+    #[test]
+    fn from_sources_merges_drop_and_rename_for_the_same_key() {
+        let t = ColumnTransforms::from_sources(
+            &[s("public.orders:a")],
+            &[s("public.orders:x=y")],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(t.entries.len(), 1);
+        let (_, tt) = &t.entries[0];
+        assert_eq!(tt.drop_cols, vec![s("a")]);
+        assert_eq!(tt.renames, vec![(s("x"), s("y"))]);
+    }
+
+    #[test]
+    fn global_and_specific_rules_stay_distinct_and_in_order() {
+        let t = ColumnTransforms::from_sources(&[s("public.orders:a")], &[], &[s("secret")], &[])
+            .unwrap();
+        assert_eq!(t.entries.len(), 2);
+        assert_eq!(
+            t.entries[0].0,
+            Some((s("public"), s("orders"))),
+            "config first"
+        );
+        assert_eq!(t.entries[1].0, None, "CLI second");
+    }
+
+    #[test]
+    fn cli_drops_come_after_config_drops() {
+        let t = ColumnTransforms::from_sources(
+            &[s("public.orders:config_col")],
+            &[],
+            &[s("public.orders:cli_col")],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            t.entries[0].1.drop_cols,
+            vec![s("config_col"), s("cli_col")]
+        );
+    }
+
+    #[test]
+    fn from_sources_rejects_bad_args() {
+        assert!(
+            ColumnTransforms::from_sources(&[s("orders:a")], &[], &[], &[]).is_err(),
+            "bare table prefix rejected"
+        );
+        assert!(
+            ColumnTransforms::from_sources(&[], &[], &[s(":a")], &[]).is_err(),
+            "empty prefix rejected"
+        );
+        assert!(
+            ColumnTransforms::from_sources(&[], &[], &[s(",")], &[]).is_err(),
+            "empty cols rejected"
+        );
+        assert!(
+            ColumnTransforms::from_sources(&[], &[], &[], &[s("no-equals")]).is_err(),
+            "missing '=' rejected"
+        );
     }
 }

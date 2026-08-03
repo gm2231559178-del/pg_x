@@ -1,6 +1,6 @@
 # Spec: Idempotent `consume`
 
-Status: ready-for-agent
+Status: done
 
 ## Problem Statement
 
@@ -82,6 +82,9 @@ When `--idempotent` is off, behavior is unchanged. Default is off.
 12. As an operator of a RabbitMQ-sourced pipeline whose producers do not set
     `message_id`, I want a payload hash fallback, so that the feature still
     works without a producer change.
+    **Superseded by architecture-deepening D6.3:** a payload hash can falsely
+    dedupe two distinct identical-bodied messages, so the fallback was removed.
+    Producers must set `message_id` (as `listen` does) for dedupe to apply.
 13. As a user of `listen → RabbitMQ → consume`, I want `listen` to set the AMQP
     `message_id` property when it publishes contract messages, so that the
     end-to-end path gets stable message identity for free.
@@ -112,14 +115,15 @@ When `--idempotent` is off, behavior is unchanged. Default is off.
 
 ## Implementation Decisions
 
-- **Message identity.** A new `message_id: Option<String>` field on
+- **Message identity.** A `message_id: Option<String>` field on
   `BrokerMessage`, populated by each consumer:
-  - Kafka: the record key if present, else `"<partition>:<offset>"` (already
-    recoverable from the delivery tag encoding).
-  - RabbitMQ: the AMQP `message_id` property if present, else SHA-256 of the
-    payload bytes.
-  The identity is a decision point, not an implementation detail; the fallback
-  order is contract.
+  - Kafka: the record key if present, else `"<partition>:<offset>"` (recovered
+    from the delivery tag encoding).
+  - RabbitMQ: the AMQP `message_id` property if present, else `None`.
+  Amended by architecture-deepening D6.3: the SHA-256 payload fallback was
+  removed because it can falsely dedupe two distinct identical-bodied messages.
+  When the property is absent the message has no stable identity — no dedupe,
+  and the non-idempotent sink key fallbacks apply.
 - **Producer change.** `listen`'s contract RabbitMQ downstream sets the AMQP
   `message_id` property (a per-event UUID) on publish, so end-to-end
   redeliveries carry a stable identity. In scope.
@@ -168,9 +172,9 @@ implemented.
   document carrying the derived id; assert the webhook `Idempotency-Key` header
   is present; assert a strict-mode requeued message is still processed after its
   first attempt failed.
-- **Unit seams — inline `#[cfg(test)]` modules** in the established style (prior
+- **Unit seams — inline `#[cfg(test)]` modules** in   the established style (prior
   art: `src/consumer/kv.rs`'s `extract_key_impl` tests): message-id derivation
-  for Kafka (key vs offset) and RabbitMQ (property vs hash fallback); dedupe
+  for Kafka (key vs offset) and RabbitMQ (property present vs absent); dedupe
   cache record/check and TTL expiry; sink key-fallback derivation for ES `_id`
   and KV keys (with and without explicit fields).
 
@@ -192,9 +196,10 @@ implemented.
   idempotent sinks ≈ exactly-once" for ES and KV. For webhook it is exactly-once
   only if the endpoint honors the `Idempotency-Key` header; in-process
   redeliveries are covered by the dedupe layer regardless.
-- The RabbitMQ payload-hash fallback collapses two genuinely distinct events
-  with byte-identical payloads; setting `message_id` (as `listen` now does)
-  avoids this.
+- D6.3 removed the RabbitMQ payload-hash fallback: without a `message_id`
+  property the message has no stable identity, so it is not deduped and the
+  non-idempotent sink key fallbacks apply. Producers should set `message_id`
+  (as `listen` now does).
 - The dedupe cache is bounded by TTL, not capacity; operators running very high
   message rates should size `--dedup-ttl` to their broker's redelivery window to
   bound memory.

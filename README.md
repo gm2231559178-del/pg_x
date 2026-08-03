@@ -633,7 +633,10 @@ In idempotent mode `consume`:
 
 Message identity is stable across redelivery: Kafka records use the record key
 (or `partition:offset`), RabbitMQ messages use the AMQP `message_id` property
-(set automatically when publishing via `listen`) with a payload-hash fallback.
+(set automatically when publishing via `listen`). When RabbitMQ's property is
+absent the message has no stable identity, so it is not deduped and the
+non-idempotent key fallbacks apply (random UUID for KV, no `_id` for
+Elasticsearch, no `Idempotency-Key` header for webhook).
 
 | Flag           | Description                                            | Default |
 | -------------- | ------------------------------------------------------ | ------- |

@@ -1,6 +1,6 @@
 # Spec: Deepen the edges the architecture review missed
 
-Status: ready-for-agent
+Status: done
 
 ## Problem Statement
 

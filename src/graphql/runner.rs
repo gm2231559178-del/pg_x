@@ -17,6 +17,8 @@ use tokio_postgres::types::ToSql;
 pub trait QueryRunner: Send + Sync {
     /// Execute `sql` bound to `params`, returning each row as a JSON object.
     async fn run_rows(&self, sql: &str, params: &[String]) -> Result<Vec<Value>>;
+    /// Execute `sql` binding `values` as a single array parameter (`ANY($1)`).
+    async fn run_rows_array(&self, sql: &str, values: &[String]) -> Result<Vec<Value>>;
     /// Optional shared cross-message cache for batched child results.
     fn global_cache(&self) -> Option<Arc<GlobalDataCache>>;
 }
@@ -27,6 +29,12 @@ impl QueryRunner for QueryConn {
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         let rows = self.query_cached(sql, &param_refs).await?;
+        rows.iter().map(row_to_json_value).collect()
+    }
+
+    async fn run_rows_array(&self, sql: &str, values: &[String]) -> Result<Vec<Value>> {
+        let keys: Vec<String> = values.to_vec();
+        let rows = self.query_cached(sql, &[&keys]).await?;
         rows.iter().map(row_to_json_value).collect()
     }
 

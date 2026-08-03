@@ -213,7 +213,7 @@ async fn resolve_field_for_parents(
                 let children = child_fields.clone();
                 async move {
                     let rows = runner
-                        .run_rows(&resolver.sql, &[batch_key(&param_value)])
+                        .run_rows_array(&resolver.sql, &[batch_key(&param_value)])
                         .await
                         .with_context(|| {
                             format!("Child resolver SQL failed for '{}'", field_name)
@@ -413,6 +413,10 @@ mod tests {
     impl QueryRunner for FakeRunner {
         async fn run_rows(&self, sql: &str, params: &[String]) -> Result<Vec<Value>> {
             (self.respond)(sql, params)
+        }
+
+        async fn run_rows_array(&self, sql: &str, values: &[String]) -> Result<Vec<Value>> {
+            (self.respond)(sql, values)
         }
 
         fn global_cache(&self) -> Option<Arc<GlobalDataCache>> {

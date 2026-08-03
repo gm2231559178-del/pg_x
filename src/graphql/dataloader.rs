@@ -86,7 +86,7 @@ impl DataLoader {
             }
         }
 
-        let rows = runner.run_rows(&self.sql, &unique_keys).await?;
+        let rows = runner.run_rows_array(&self.sql, &unique_keys).await?;
 
         let result_key_col = self.result_key.as_deref().unwrap_or(&self.batch_by);
 

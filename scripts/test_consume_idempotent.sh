@@ -14,7 +14,11 @@ PGX="${PGX_BINARY:-./target/release/pgx}"
 AMQP_URL="${AMQP_URL:-amqp://guest:guest@localhost:5672/%2F}"
 
 PAYLOAD='{"meta":{"event_type":"MaterialFull","schema_version":"1"},"data":{"mat_no":"M001"}}'
-EXPECTED_KEY="pgx:$(python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$PAYLOAD")"
+# The broker's native AMQP message_id is the stable identity for idempotent
+# mode (per spec D6.3 there is no payload-hash fallback), so both publishes
+# must carry the same property for the dedupe to collapse them.
+MESSAGE_ID="idem-msg"
+EXPECTED_KEY="pgx:${MESSAGE_ID}"
 
 cleanup() {
   local pid=$1
@@ -25,10 +29,10 @@ cleanup() {
 # Publish `$PAYLOAD` to the `pgx` exchange under `pgx.idem`.
 publish_once() {
   local body
-  body=$(python3 - "$PAYLOAD" <<'PY'
+  body=$(python3 - "$PAYLOAD" "$MESSAGE_ID" <<'PY'
 import json, sys
 print(json.dumps({
-    "properties": {},
+    "properties": {"message_id": sys.argv[2]},
     "routing_key": "pgx.idem",
     "payload": sys.argv[1],
     "payload_encoding": "string",
@@ -119,14 +123,21 @@ rm -f "$HOOK_LOG"
 python3 - "$HOOK_LOG" <<'PY' &
 import http.server, json, sys
 log = sys.argv[1]
+attempts = {"count": 0}
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
+        attempts["count"] += 1
         with open(log, "a") as f:
             f.write(json.dumps({
                 "idempotency_key": self.headers.get("Idempotency-Key", "<none>"),
                 "path": self.path,
             }) + "\n")
-        self.send_response(500)
+        # First attempt fails so the message is requeued and retried (lenient
+        # policy requeues transient sink failures); later attempts succeed.
+        if attempts["count"] == 1:
+            self.send_response(500)
+        else:
+            self.send_response(200)
         self.end_headers()
     def log_message(self, *a):
         pass
@@ -148,7 +159,7 @@ $PGX -U "$PGURL" consume \
 CONSUME_PID=$!
 sleep 3
 
-echo "==> consume-idempotent: publishing the same ContractMessage twice (endpoint returns 500)"
+echo "==> consume-idempotent: publishing the same ContractMessage twice (endpoint fails once, then succeeds)"
 publish_once
 publish_once
 
@@ -157,7 +168,7 @@ sleep 4
 echo "==> consume-idempotent: verifying webhook attempts"
 REQUESTS=$(cat "$HOOK_LOG")
 if [ "$(echo -n "$REQUESTS" | grep -c '^' || true)" -eq 2 ]; then
-  echo "==> consume-idempotent: both messages were attempted (failures not deduped)"
+  echo "==> consume-idempotent: failed POST was requeued and retried, duplicate collapsed (2 attempts)"
 else
   cleanup $CONSUME_PID
   cleanup $HOOK_PID
@@ -167,12 +178,12 @@ else
   exit 1
 fi
 
-if echo "$REQUESTS" | grep -q '"idempotency_key": "[^"]\+"'; then
+if echo "$REQUESTS" | grep -q '"idempotency_key": "idem-msg"'; then
   echo "==> consume-idempotent: Idempotency-Key header present on every attempt"
 else
   cleanup $CONSUME_PID
   cleanup $HOOK_PID
-  echo "==> consume-idempotent: FAIL — Idempotency-Key header missing"
+  echo "==> consume-idempotent: FAIL — Idempotency-Key header missing or not the native message id"
   echo "$REQUESTS"
   cat /tmp/pgx_consume_idem_wh.log
   exit 1

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde_json::Value;
+use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::Row;
 
 /// A serializable, format-agnostic result set.
@@ -99,6 +100,105 @@ impl RowSet {
     }
 }
 
+/// A PostgreSQL `numeric` column decoded from its binary wire format into an
+/// exact decimal string. `postgres-types` ships no `FromSql` impl for the
+/// NUMERIC oid — its `f64` only accepts DOUBLE PRECISION and its `String` only
+/// accepts text-like types — so without this the generic fallback would emit a
+/// literal `<numeric>` for every such column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Numeric(pub String);
+
+impl<'a> FromSql<'a> for Numeric {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        pg_numeric_to_string(raw)
+            .map(Numeric)
+            .ok_or_else(|| "cannot decode Postgres numeric".into())
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
+/// Decode PostgreSQL's binary `numeric` wire format (see `numeric_send` in
+/// backend/utils/adt/numeric.c): int16 `ndigits`, int16 `weight`, int16
+/// `sign`, int16 `dscale`, then `ndigits` base-10000 digits (int16 each, most
+/// significant first). The value is `sum(digits[i] * 10000^(weight - i))`, and
+/// `dscale` is the display scale used to pad or trim the fractional part.
+fn pg_numeric_to_string(raw: &[u8]) -> Option<String> {
+    if raw.len() < 8 {
+        return None;
+    }
+    let read_i16 = |off: usize| -> Option<i16> {
+        Some(i16::from_be_bytes(raw.get(off..off + 2)?.try_into().ok()?))
+    };
+
+    let ndigits = read_i16(0)?;
+    let weight = read_i16(2)?;
+    let sign = read_i16(4)?;
+    let dscale = read_i16(6)?;
+
+    if ndigits < 0 || dscale < 0 || raw.len() < 8 + ndigits as usize * 2 {
+        return None;
+    }
+
+    // Sign codes (NUMERIC_POS/NEG/NAN/PINF/NINF) do not fit in i16, so compare
+    // the u16 view of the wire bytes.
+    let sign = sign as u16;
+    match sign {
+        0xC000 => return Some("NaN".to_string()),
+        0xD000 => return Some("Infinity".to_string()),
+        0xF000 => return Some("-Infinity".to_string()),
+        0x0000 | 0x4000 => {}
+        _ => return None,
+    }
+
+    let mut digits = String::with_capacity(ndigits as usize * 4);
+    for i in 0..ndigits as usize {
+        digits.push_str(&format!("{:04}", read_i16(8 + i * 2)?));
+    }
+
+    // Decimal digits before the point; negative means leading fractional zeros.
+    let int_chars = (weight as i32 + 1) * 4;
+    let (mut integer, mut frac) = if int_chars <= 0 {
+        let mut frac = "0".repeat((-int_chars) as usize);
+        frac.push_str(&digits);
+        ("0".to_string(), frac)
+    } else if (int_chars as usize) >= digits.len() {
+        // Trailing integer zeros are omitted from the digit array.
+        let mut ip = digits;
+        ip.push_str(&"0".repeat(int_chars as usize - ip.len()));
+        (ip.trim_start_matches('0').to_string(), String::new())
+    } else {
+        let (ip, fp) = digits.split_at(int_chars as usize);
+        (ip.trim_start_matches('0').to_string(), fp.to_string())
+    };
+    if integer.is_empty() {
+        integer = "0".to_string();
+    }
+
+    let dscale = dscale as usize;
+    if frac.len() > dscale {
+        frac.truncate(dscale);
+    } else if frac.len() < dscale {
+        frac.push_str(&"0".repeat(dscale - frac.len()));
+    }
+
+    let mut out = String::new();
+    if sign == 0x4000 {
+        out.push('-');
+    }
+    out.push_str(&integer);
+    if dscale > 0 {
+        out.push('.');
+        out.push_str(&frac);
+    }
+    Some(out)
+}
+
 /// Convert a Postgres cell to a `serde_json::Value`, preserving type information.
 /// Numeric types become JSON numbers, NULL becomes `Value::Null`.
 pub fn pg_cell_to_json(row: &Row, idx: usize) -> Value {
@@ -120,7 +220,15 @@ pub fn pg_cell_to_json(row: &Row, idx: usize) -> Value {
         "int4" => get!(i32),
         "int8" | "oid" => get!(i64),
         "float4" => get!(f32),
-        "float8" | "numeric" => get!(f64),
+        "float8" => get!(f64),
+        "numeric" => match row.try_get::<_, Option<Numeric>>(idx) {
+            Ok(Some(v)) => match v.0.parse::<f64>() {
+                Ok(n) if n.is_finite() => return Value::from(n),
+                _ => return Value::String(v.0),
+            },
+            Ok(None) => return Value::Null,
+            Err(e) => tracing::debug!(error = %e, col_type, "try_get failed for numeric"),
+        },
         "text" | "varchar" | "char" | "bpchar" | "name" | "citext" => get!(String),
         "json" | "jsonb" => match row.try_get::<_, Option<Value>>(idx) {
             Ok(Some(v)) => return v,
@@ -194,9 +302,14 @@ pub fn pg_cell_to_string(row: &Row, idx: usize) -> String {
         "float4" => {
             try_get!(f32);
         }
-        "float8" | "numeric" => {
+        "float8" => {
             try_get!(f64);
         }
+        "numeric" => match row.try_get::<_, Option<Numeric>>(idx) {
+            Ok(Some(v)) => return v.0,
+            Ok(None) => return NULL_SENTINEL.to_owned(),
+            Err(e) => tracing::debug!(error = %e, col_type, "try_get failed for numeric"),
+        },
         "text" | "varchar" | "char" | "bpchar" | "name" | "citext" => {
             try_get!(String);
         }
@@ -293,5 +406,89 @@ mod tests {
         };
         let v = rs.to_json_value();
         assert_eq!(v[0]["val"], serde_json::Value::Null);
+    }
+
+    /// Build a `numeric` binary payload from its logical fields.
+    fn numeric_raw(ndigits: i16, weight: i16, sign: i16, dscale: i16, digits: &[i16]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for v in [ndigits, weight, sign, dscale] {
+            raw.extend_from_slice(&v.to_be_bytes());
+        }
+        for d in digits {
+            raw.extend_from_slice(&d.to_be_bytes());
+        }
+        raw
+    }
+
+    #[test]
+    fn pg_numeric_decodes_integer_and_fractional() {
+        // 123.45 -> digits [123, 4500], weight 0, dscale 2
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(2, 0, 0x0000, 2, &[123, 4500])).as_deref(),
+            Some("123.45")
+        );
+        // 1000
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(1, 0, 0x0000, 0, &[1000])).as_deref(),
+            Some("1000")
+        );
+        // 0.00123
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(2, -1, 0x0000, 5, &[12, 3000])).as_deref(),
+            Some("0.00123")
+        );
+        // 1,000,000 -> digits [100], weight 1 (trailing integer zeros implied)
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(1, 1, 0x0000, 0, &[100])).as_deref(),
+            Some("1000000")
+        );
+        // -0.5
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(1, -1, 0x4000, 1, &[5000])).as_deref(),
+            Some("-0.5")
+        );
+        // 123.456 with dscale 3
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(2, 0, 0x0000, 3, &[123, 4560])).as_deref(),
+            Some("123.456")
+        );
+    }
+
+    #[test]
+    fn pg_numeric_decodes_zero_and_specials() {
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(0, 0, 0x0000, 0, &[])).as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(0, 0, 0x0000, 2, &[])).as_deref(),
+            Some("0.00")
+        );
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(0, 0, 0xC000u16 as i16, 0, &[])).as_deref(),
+            Some("NaN")
+        );
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(0, 0, 0xD000u16 as i16, 0, &[])).as_deref(),
+            Some("Infinity")
+        );
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(0, 0, 0xF000u16 as i16, 0, &[])).as_deref(),
+            Some("-Infinity")
+        );
+    }
+
+    #[test]
+    fn pg_numeric_rejects_malformed_payloads() {
+        assert_eq!(pg_numeric_to_string(&[0, 1, 0]), None);
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(-1, 0, 0x0000, 0, &[])),
+            None
+        );
+        assert_eq!(
+            pg_numeric_to_string(&numeric_raw(3, 0, 0x0000, 0, &[1, 2])),
+            None,
+            "digit array shorter than ndigits"
+        );
     }
 }

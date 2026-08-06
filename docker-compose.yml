@@ -46,6 +46,31 @@ services:
       timeout: 5s
       retries: 10
 
+  # Periodic Elasticsearch index refresh — rebuilds an index from a SQL query.
+  # Opt-in: start with `docker compose --profile refresh up` or
+  #         `docker compose up index-refresh`.
+  # Tune the query/index/interval via the REFRESH_* env vars (or a .env file).
+  index-refresh:
+    build: .
+    container_name: pgx_index_refresh
+    profiles: ["refresh"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+      ES_URL: http://elasticsearch:9200
+      REFRESH_QUERY: ${REFRESH_QUERY:-SELECT mat_no, name, status FROM materials}
+      REFRESH_INDEX: ${REFRESH_INDEX:-materials}
+      REFRESH_ID_FIELD: ${REFRESH_ID_FIELD:-mat_no}
+      REFRESH_INTERVAL: ${REFRESH_INTERVAL:-30}
+    volumes:
+      - ./scripts/index-refresh.sh:/scripts/index-refresh.sh:ro
+    entrypoint: ["/bin/sh", "/scripts/index-refresh.sh"]
+
   redis:
     image: redis:7-alpine
     container_name: pgx_redis

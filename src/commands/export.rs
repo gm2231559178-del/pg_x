@@ -45,6 +45,8 @@ pub enum OutputFormat {
     #[default]
     Csv,
     Json,
+    #[cfg(feature = "elasticsearch")]
+    Elasticsearch,
     #[cfg(feature = "iceberg")]
     Iceberg,
 }
@@ -110,6 +112,20 @@ pub struct ExportArgs {
     #[cfg(feature = "iceberg")]
     #[arg(long, default_value = "snappy")]
     pub compression: String,
+
+    // ── Sink: Elasticsearch ──
+    #[cfg(feature = "elasticsearch")]
+    #[arg(long, env = "ES_URL")]
+    pub es_url: Option<String>,
+    #[cfg(feature = "elasticsearch")]
+    #[arg(long)]
+    pub index: Option<String>,
+    #[cfg(feature = "elasticsearch")]
+    #[arg(long)]
+    pub id_field: Option<String>,
+    #[cfg(feature = "elasticsearch")]
+    #[arg(long, default_value_t = 500)]
+    pub es_batch_size: usize,
 }
 
 pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
@@ -176,6 +192,17 @@ pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
             "✔".green().bold(),
             table_name
         );
+        return Ok(());
+    }
+
+    // ── 3b. Elasticsearch export path (early return) ──────────────────────────
+    #[cfg(feature = "elasticsearch")]
+    if matches!(args.format, OutputFormat::Elasticsearch) {
+        if blocks.len() > 1 {
+            anyhow::bail!("Elasticsearch export supports only a single query; use --query or a .sql file with one statement");
+        }
+        let block = &blocks[0];
+        export_to_elasticsearch(&client, &block.sql, &args).await?;
         return Ok(());
     }
 
@@ -254,6 +281,8 @@ pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
             let (_, rowset) = &results[0];
             write_json(rowset, &out_path)?;
         }
+        #[cfg(feature = "elasticsearch")]
+        OutputFormat::Elasticsearch => unreachable!(), // handled before output
         #[cfg(feature = "iceberg")]
         OutputFormat::Iceberg => unreachable!(), // handled before output
     }
@@ -328,6 +357,71 @@ fn parse_sql_file(content: &str, default_sheet: &str) -> Vec<QueryBlock> {
     blocks.retain(|b| !b.sql.trim().is_empty());
 
     blocks
+}
+
+// ── Elasticsearch export ─────────────────────────────────────────────────────
+
+/// Run the query and bulk-index every row into Elasticsearch.
+#[cfg(feature = "elasticsearch")]
+async fn export_to_elasticsearch(
+    pg_client: &tokio_postgres::Client,
+    sql: &str,
+    args: &ExportArgs,
+) -> Result<()> {
+    use crate::downstream::bulk::BulkBuffer;
+    use crate::utils::format::pg_cell_to_json;
+
+    let rows = pg_client
+        .query(sql, &[])
+        .await
+        .with_context(|| "Query failed")?;
+    if rows.is_empty() {
+        println!(
+            "  {} Query returned no rows — nothing to index",
+            "ℹ".yellow()
+        );
+        return Ok(());
+    }
+
+    let es_url = args
+        .es_url
+        .as_deref()
+        .unwrap_or("http://localhost:9200")
+        .trim_end_matches('/')
+        .to_string();
+    let index = args.index.as_deref().unwrap_or("pgx");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let bulk_buffer = BulkBuffer::new(client, es_url, args.es_batch_size);
+
+    let col_count = rows[0].columns().len();
+    for row in &rows {
+        let doc: serde_json::Map<String, serde_json::Value> = (0..col_count)
+            .map(|i| (row.columns()[i].name().to_owned(), pg_cell_to_json(row, i)))
+            .collect();
+        let doc = serde_json::Value::Object(doc);
+
+        let doc_id = args.id_field.as_deref().and_then(|idf| {
+            doc.get(idf).and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+        });
+
+        bulk_buffer.push(index, doc_id.as_deref(), &doc).await?;
+    }
+
+    bulk_buffer.flush().await?;
+
+    println!(
+        "  {} {} documents indexed into «{}»",
+        "✔ Indexed".green().bold(),
+        rows.len().to_string().yellow(),
+        index
+    );
+    Ok(())
 }
 
 // ── Iceberg export ───────────────────────────────────────────────────────────
@@ -705,6 +799,8 @@ fn resolve_output_path(args: &ExportArgs) -> Result<PathBuf> {
         OutputFormat::Excel => "xlsx",
         OutputFormat::Csv => "csv",
         OutputFormat::Json => "json",
+        #[cfg(feature = "elasticsearch")]
+        OutputFormat::Elasticsearch => unreachable!(), // handled before output
         #[cfg(feature = "iceberg")]
         OutputFormat::Iceberg => unreachable!(), // handled before output
     };

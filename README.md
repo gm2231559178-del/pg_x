@@ -664,6 +664,51 @@ pgx -U $DATABASE_URL export -q "SELECT * FROM orders" -m csv -o orders.csv
 pgx -U $DATABASE_URL export -q "SELECT * FROM orders" -m iceberg \
   --iceberg-table public.orders_snapshot --warehouse-path ./wh
 
+# Index query results directly into Elasticsearch
+pgx -U $DATABASE_URL export -q "SELECT * FROM orders" -m elasticsearch \
+  --es-url http://localhost:9200 \
+  --index orders \
+  --id-field id
+
+# Publish query results to RabbitMQ (feeds the consume → GraphQL → ES pipeline)
+pgx -U $DATABASE_URL export -q "SELECT * FROM materials" -m rabbitmq \
+  --amqp-url amqp://guest:guest@localhost:5672/%2F \
+  --exchange pgx --routing-key pgx.notify --event-type MaterialFull
+```
+
+With `--event-type`, each row is published as a `ContractMessage`
+(`{"meta":{"event_type":...},"data":{row}}`), so the same `consume --query-mode contract`
+invocation used for the incremental trigger path picks it up — backfills and
+live changes flow through the same GraphQL resolvers and produce identical
+Elasticsearch documents. Without `--event-type`, raw row JSON is published
+(use `consume --query-mode simple --query <Name>`).
+
+### Periodic index refresh (docker compose)
+
+The `docker-compose.yml` ships an opt-in `index-refresh` service that re-runs
+the SQL → Elasticsearch export on a loop, keeping an index fresh. It builds the
+pgx image and runs `scripts/index-refresh.sh`.
+
+```bash
+# Tune the query/index/interval via env vars (or a .env file), then start:
+REFRESH_QUERY="SELECT id, customer, total, status FROM orders" \
+REFRESH_INDEX="orders" REFRESH_ID_FIELD="id" REFRESH_INTERVAL="60" \
+docker compose --profile refresh up index-refresh
+```
+
+| Env var           | Description                                        | Default |
+| ----------------- | -------------------------------------------------- | ------- |
+| `DATABASE_URL`    | PostgreSQL connection URL                          | local compose Postgres |
+| `ES_URL`          | Elasticsearch base URL                             | `http://elasticsearch:9200` |
+| `REFRESH_QUERY`   | SQL SELECT whose rows become the indexed documents | `SELECT mat_no, name, status FROM materials` |
+| `REFRESH_INDEX`   | Destination index name                             | `materials` |
+| `REFRESH_ID_FIELD`| Row column used as the document `_id` (upsert key) | `mat_no` |
+| `REFRESH_INTERVAL`| Seconds between refreshes                          | `30` |
+
+Because `--id-field` keys documents by row value, each cycle upserts rows rather
+than duplicating them — the index converges to the query result.
+
+```bash
 # Multi-sheet Excel from a .sql file (each `-- sheet:` starts a new sheet)
 pgx -U $DATABASE_URL export -f reports.sql -o report.xlsx
 # reports.sql:

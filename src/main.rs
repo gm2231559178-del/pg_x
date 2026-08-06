@@ -52,7 +52,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Export SQL query results to Excel (.xlsx), CSV, or JSON
+    /// Export SQL query results to Excel (.xlsx), CSV, JSON, Iceberg, or Elasticsearch
     Export(export::ExportArgs),
 
     /// Run a SQL query and display results in the terminal

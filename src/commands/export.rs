@@ -47,6 +47,8 @@ pub enum OutputFormat {
     Json,
     #[cfg(feature = "elasticsearch")]
     Elasticsearch,
+    #[cfg(feature = "rabbitmq")]
+    Rabbitmq,
     #[cfg(feature = "iceberg")]
     Iceberg,
 }
@@ -126,6 +128,20 @@ pub struct ExportArgs {
     #[cfg(feature = "elasticsearch")]
     #[arg(long, default_value_t = 500)]
     pub es_batch_size: usize,
+
+    // ── Sink: RabbitMQ ──
+    #[cfg(feature = "rabbitmq")]
+    #[arg(long, env = "AMQP_URL")]
+    pub amqp_url: Option<String>,
+    #[cfg(feature = "rabbitmq")]
+    #[arg(long, default_value = "pgx")]
+    pub exchange: String,
+    #[cfg(feature = "rabbitmq")]
+    #[arg(long, default_value = "pgx.notify")]
+    pub routing_key: String,
+    #[cfg(feature = "rabbitmq")]
+    #[arg(long)]
+    pub event_type: Option<String>,
 }
 
 pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
@@ -206,6 +222,17 @@ pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
         return Ok(());
     }
 
+    // ── 3c. RabbitMQ export path (early return) ───────────────────────────────
+    #[cfg(feature = "rabbitmq")]
+    if matches!(args.format, OutputFormat::Rabbitmq) {
+        if blocks.len() > 1 {
+            anyhow::bail!("RabbitMQ export supports only a single query; use --query or a .sql file with one statement");
+        }
+        let block = &blocks[0];
+        export_to_rabbitmq(&client, &block.sql, &args).await?;
+        return Ok(());
+    }
+
     // ── 4. Execute all queries (file formats) ─────────────────────────────────
     let mut results: Vec<(String, RowSet)> = Vec::with_capacity(blocks.len());
 
@@ -283,6 +310,8 @@ pub async fn run(url: String, args: ExportArgs, use_tls: bool) -> Result<()> {
         }
         #[cfg(feature = "elasticsearch")]
         OutputFormat::Elasticsearch => unreachable!(), // handled before output
+        #[cfg(feature = "rabbitmq")]
+        OutputFormat::Rabbitmq => unreachable!(), // handled before output
         #[cfg(feature = "iceberg")]
         OutputFormat::Iceberg => unreachable!(), // handled before output
     }
@@ -420,6 +449,72 @@ async fn export_to_elasticsearch(
         "✔ Indexed".green().bold(),
         rows.len().to_string().yellow(),
         index
+    );
+    Ok(())
+}
+
+// ── RabbitMQ export ──────────────────────────────────────────────────────────
+
+/// Run the query and publish every row as an AMQP message.
+/// With `--event-type` each message is wrapped as a ContractMessage
+/// (`{meta:{event_type},data:{row}}`) so the `consume` pipeline can run in
+/// contract mode against the exact same queue as the incremental trigger path.
+#[cfg(feature = "rabbitmq")]
+async fn export_to_rabbitmq(
+    pg_client: &tokio_postgres::Client,
+    sql: &str,
+    args: &ExportArgs,
+) -> Result<()> {
+    use crate::downstream::delivery::rabbitmq::Rabbitmq;
+    use crate::utils::format::pg_cell_to_json;
+    use serde_json::{json, Value};
+
+    let rows = pg_client
+        .query(sql, &[])
+        .await
+        .with_context(|| "Query failed")?;
+    if rows.is_empty() {
+        println!(
+            "  {} Query returned no rows — nothing to publish",
+            "ℹ".yellow()
+        );
+        return Ok(());
+    }
+
+    let amqp_url = args
+        .amqp_url
+        .as_deref()
+        .unwrap_or("amqp://guest:guest@localhost:5672/%2F");
+    let rabbitmq = Rabbitmq::connect(amqp_url).await?;
+    rabbitmq.declare_exchange(&args.exchange).await?;
+
+    let col_count = rows[0].columns().len();
+    let mut published = 0usize;
+    for row in &rows {
+        let doc: serde_json::Map<String, Value> = (0..col_count)
+            .map(|i| (row.columns()[i].name().to_owned(), pg_cell_to_json(row, i)))
+            .collect();
+
+        let body = match &args.event_type {
+            Some(event_type) => serde_json::to_vec(&json!({
+                "meta": { "event_type": event_type, "schema_version": "1" },
+                "data": Value::Object(doc),
+            }))?,
+            None => serde_json::to_vec(&Value::Object(doc))?,
+        };
+
+        rabbitmq
+            .publish(&args.exchange, &args.routing_key, &[], &body)
+            .await?;
+        published += 1;
+    }
+
+    println!(
+        "  {} {} messages published to «{}» / {}",
+        "✔ Published".green().bold(),
+        published.to_string().yellow(),
+        args.exchange,
+        args.routing_key,
     );
     Ok(())
 }
@@ -801,6 +896,8 @@ fn resolve_output_path(args: &ExportArgs) -> Result<PathBuf> {
         OutputFormat::Json => "json",
         #[cfg(feature = "elasticsearch")]
         OutputFormat::Elasticsearch => unreachable!(), // handled before output
+        #[cfg(feature = "rabbitmq")]
+        OutputFormat::Rabbitmq => unreachable!(), // handled before output
         #[cfg(feature = "iceberg")]
         OutputFormat::Iceberg => unreachable!(), // handled before output
     };

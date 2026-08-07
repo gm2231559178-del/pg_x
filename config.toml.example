@@ -34,7 +34,7 @@ mode = "simple"
 # Consume from RabbitMQ, GraphQL compose, index to Elasticsearch:
 #
 # [connections.local.consume]
-# source = { type = "rabbitmq", amqp_url = "amqp://guest:guest@localhost:5672/%2F", queue = "pgx-events" }
+# source = { type = "rabbitmq", amqp_url = "amqp://guest:guest@localhost:5672/%2F", queue = "pgx-events", prefetch_count = 300 }
 # sink = { type = "elasticsearch", url = "http://localhost:9200", index = "materials", id_field = "mat_no" }
 # query_mode = "contract"
 # max_depth = 8

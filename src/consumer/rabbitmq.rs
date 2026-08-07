@@ -6,8 +6,8 @@ pub mod rabbitmq {
     use futures::StreamExt;
     use lapin::{
         options::{
-            BasicAckOptions, BasicConsumeOptions, BasicNackOptions, QueueBindOptions,
-            QueueDeclareOptions,
+            BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions,
+            QueueBindOptions, QueueDeclareOptions,
         },
         types::FieldTable,
         Channel, Connection, ConnectionProperties, Consumer as LapinConsumer, Queue,
@@ -38,6 +38,7 @@ pub mod rabbitmq {
             queue: &str,
             exchange: Option<&str>,
             routing_key: Option<&str>,
+            prefetch_count: u16,
         ) -> Result<Self> {
             let conn = Connection::connect(amqp_url, ConnectionProperties::default())
                 .await
@@ -49,6 +50,15 @@ pub mod rabbitmq {
                 .context("Failed to open AMQP channel")?;
 
             Self::declare_and_consume(&channel, queue, exchange, routing_key).await?;
+
+            // Limit unacknowledged messages per consumer so a slow/long-running
+            // consumer cannot be flooded with an unbounded backlog (which
+            // exhausts broker memory and eventually trips the ack timeout).
+            // 0 means no limit.
+            channel
+                .basic_qos(prefetch_count, BasicQosOptions::default())
+                .await
+                .context("Failed to set consumer prefetch count")?;
 
             let lapin_consumer = channel
                 .basic_consume(

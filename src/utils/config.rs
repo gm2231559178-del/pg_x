@@ -278,6 +278,8 @@ pub enum ConsumeSourceKind {
         queue: Option<String>,
         exchange: Option<String>,
         routing_key: Option<String>,
+        /// Per-consumer prefetch: max unacknowledged messages (0 = no limit).
+        prefetch_count: Option<u16>,
     },
     Kafka {
         brokers: Option<String>,

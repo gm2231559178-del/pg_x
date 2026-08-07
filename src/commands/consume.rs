@@ -38,6 +38,11 @@ pub struct ConsumeArgs {
     pub exchange: Option<String>,
     #[arg(long)]
     pub routing_key: Option<String>,
+    /// Max unacknowledged messages per consumer (0 = no limit). Limits how many
+    /// messages RabbitMQ delivers before awaiting an ack, preventing an
+    /// unbounded unacked backlog when processing is slower than publishing.
+    #[arg(long)]
+    pub prefetch_count: Option<u16>,
 
     // ── Source: Kafka ──
     #[arg(long, env = "KAFKA_BROKERS")]
@@ -337,6 +342,7 @@ async fn build_consumer(args: &ConsumeArgs) -> Result<Arc<dyn Consumer>> {
                 queue,
                 exchange,
                 routing_key,
+                args.prefetch_count.unwrap_or(0),
             )
             .await?;
             Ok(Arc::new(c))
@@ -569,6 +575,7 @@ fn merge_source_config(args: &mut ConsumeArgs, source: &ConsumeSourceKind) {
             queue,
             exchange,
             routing_key,
+            prefetch_count,
         } => {
             if args.amqp_url.is_none() && amqp_url.is_some() {
                 args.amqp_url = amqp_url.clone();
@@ -581,6 +588,9 @@ fn merge_source_config(args: &mut ConsumeArgs, source: &ConsumeSourceKind) {
             }
             if args.routing_key.is_none() && routing_key.is_some() {
                 args.routing_key = routing_key.clone();
+            }
+            if args.prefetch_count.is_none() && prefetch_count.is_some() {
+                args.prefetch_count = *prefetch_count;
             }
         }
         ConsumeSourceKind::Kafka {
@@ -777,6 +787,7 @@ mod effective_config_tests {
             queue: None,
             exchange: None,
             routing_key: None,
+            prefetch_count: None,
             brokers: None,
             topic: None,
             group_id: None,
@@ -808,6 +819,7 @@ mod effective_config_tests {
                 queue: None,
                 exchange: None,
                 routing_key: None,
+                prefetch_count: None,
             },
             sink: ConsumeSinkKind::Stdout,
             query_mode: Some("contract".to_string()),
